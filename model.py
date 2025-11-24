@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import einops
 
 
 class MLP(nn.Module):
@@ -233,5 +234,29 @@ class DiscretePixelCNN(nn.Module):
         self.hparams = hparams
         self.device = device
 
-        self.channel = 1
-        self.augment_channels = 1
+        self.channel = 1            # Single channel for lattice
+        self.category = 2           # Spin up/down
+        self.augment_channels = 1   # Temperature
+
+        self.fix_first = hparams["fix_first"]
+
+    def sample(self, batch_size, T=None):
+        sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(self.device)
+        if T is not None:
+            # (B, C) -> (B, C, H, W)
+            T = T.to(self.device)
+            if T.dim() == 1:
+                T = T.unsqueeze(1)
+
+            T_expanded = einops.repeat(T, "b c -> b c h w", h=self.size[0], w=self.size[1])
+            sample = torch.cat([sample, T_expanded], dim=1)
+
+        for i in range(self.size[0]):
+            for j in range(self.size[1]):
+                # Fix the first element of the samples to be a fixed value
+                if self.fix_first is not None and i == 0 and j == 0:
+                    if T is not None:
+                        sample[:, :-1, 0, 0] = self.fix_first
+                    else:
+                        sample[:, :, 0, 0] = self.fix_first
+                    continue
