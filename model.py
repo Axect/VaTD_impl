@@ -290,4 +290,48 @@ class DiscretePixelCNN(nn.Module):
         return sample
 
     def log_prob(self, sample, T=None):
-        pass
+        # sample to {0,1}
+        sample = self.reverse_mapping(sample)
+
+        if self.fix_first is not None:
+            assert (
+                sample[:, :, 0, 0] == self.fix_first
+            ).all(), "The first element of the sample does not match fix_first value."
+
+        if T is not None:
+            # (B, C) -> (B, C, H, W)
+            T = T.to(self.device)
+            if T.dim() == 1:
+                T = T.unsqueeze(1)
+
+            T_expanded = einops.repeat(
+                T, "b c -> b c h w", h=sample.shape[2], w=sample.shape[3]
+            )
+            sample = torch.cat([sample, T_expanded], dim=1)
+
+        unnormalized = self.masked_conv.forward(sample)  # (B, Cat, C, H, W)
+        prob = torch.softmax(unnormalized, dim=1)
+
+        if T is not None:
+            # Caution: original code has potential bug here, fixed it.
+            sample = sample[:, : self.channel, :, :]
+
+        # (B, 1, C, H, W)
+        log_prob_selected = torch.log(
+            prob.gather(
+                1, sample.long().unsqueeze(1)
+            )  # Find the probabilities of the selected categories
+        )
+
+        # (B, C, H * W)
+        log_prob_selected = einops.rearrange(
+            log_prob_selected, "b 1 c h w -> b c (h w)"
+        )
+
+        if self.fix_first is not None:
+            log_prob_selected = log_prob_selected[..., 1:]  # Remove the first element
+
+        # (B, 1)
+        log_prob_sum = einops.reduce(log_prob_selected, "b c hw -> b 1", "sum")
+
+        return log_prob_sum
