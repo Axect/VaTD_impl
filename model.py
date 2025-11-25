@@ -239,10 +239,15 @@ class DiscretePixelCNN(nn.Module):
         self.augment_channels = 1  # Temperature
 
         self.fix_first = hparams["fix_first"]
+        self.batch_size = hparams["batch_size"]
+        self.num_beta = hparams["num_beta"]
+        self.beta_min = hparams["beta_min"]
+        self.beta_max = hparams["beta_max"]
         self.mapping = lambda x: 2 * x - 1  # Map {0,1} to {-1,1}
         self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
 
-    def sample(self, batch_size, T=None):
+    def sample(self, batch_size=None, T=None):
+        batch_size = batch_size if batch_size is not None else self.batch_size
         sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(
             self.device
         )

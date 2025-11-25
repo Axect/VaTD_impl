@@ -15,13 +15,16 @@ import math
 from math import pi
 
 
+BATCH_SIZE = 512
+
+
 def load_data(n=10000, split_ratio=0.8, seed=42):
     # Fix random seed for reproducibility
     torch.manual_seed(seed)
 
     x_noise = torch.rand(n) * 0.02
     x = torch.linspace(0, 1, n) + x_noise
-    x = x.clamp(0, 1) # Fix x to be in [0, 1]
+    x = x.clamp(0, 1)  # Fix x to be in [0, 1]
 
     noise_level = 0.05
     y = (
@@ -148,53 +151,87 @@ class Trainer:
         else:
             self.early_stopping = None
 
-    def step(self, x):
-        return self.model(x)
+    def step(self, batch_size, T):
+        with torch.no_grad():
+            samples = self.model.sample(batch_size=batch_size, T=T)
+        log_prob = self.model.log_prob(samples, T=T)
+        return log_prob, samples
 
-    def train_epoch(self, dl_train):
+    def train_epoch(self, energy_fn):
+        batch_size = self.model.batch_size
+        beta_min = self.model.beta_min
+        beta_max = self.model.beta_max
+        num_beta = self.model.num_beta
+        beta_samples = (
+            torch.rand(num_beta, device=self.device) * (beta_max - beta_min) + beta_min
+        )
+        T_samples = 1.0 / beta_samples
+        T_expanded = T_samples.repeat_interleave(batch_size)
+        total_size = num_beta * batch_size
+
         self.model.train()
         # ScheduleFree Optimizer or SPlus
-        if any(keyword in self.optimizer.__class__.__name__ for keyword in ["ScheduleFree", "SPlus"]):
+        if any(
+            keyword in self.optimizer.__class__.__name__
+            for keyword in ["ScheduleFree", "SPlus"]
+        ):
             self.optimizer.train()
-        train_loss = 0
-        total_size = 0
-        for x, y in dl_train:
-            x = x.to(self.device)
-            y = y.to(self.device)
-            y_pred = self.step(x)
-            loss = self.criterion(y_pred, y)
-            train_loss += loss.item() * x.shape[0]
-            total_size += x.shape[0]
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-        train_loss /= total_size
+
+        log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
+        energy = energy_fn(samples, T=T_expanded)
+        loss_raw = log_prob + energy
+        loss_view = loss_raw.view(num_beta, batch_size)
+        log_prob_view = log_prob.view(num_beta, batch_size)
+
+        baselines = loss_view.mean(dim=1, keepdim=True)
+        advantage = loss_view - baselines
+
+        self.optimizer.zero_grad()
+        loss_REINFORCE = torch.mean(advantage * log_prob_view)
+        train_loss = loss_REINFORCE.item()
+        loss_REINFORCE.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
         return train_loss
 
-    def val_epoch(self, dl_val):
+    def val_epoch(self, energy_fn):
+        batch_size = self.model.batch_size
+        beta_min = self.model.beta_min
+        beta_max = self.model.beta_max
+        num_beta = self.model.num_beta
+        beta_samples = (
+            torch.rand(num_beta, device=self.device) * (beta_max - beta_min) + beta_min
+        )
+        T_samples = 1.0 / beta_samples
+        T_expanded = T_samples.repeat_interleave(batch_size)
+        total_size = num_beta * batch_size
+
         self.model.eval()
         # ScheduleFree Optimizer or SPlus
-        if any(keyword in self.optimizer.__class__.__name__ for keyword in ["ScheduleFree", "SPlus"]):
+        if any(
+            keyword in self.optimizer.__class__.__name__
+            for keyword in ["ScheduleFree", "SPlus"]
+        ):
             self.optimizer.eval()
-        val_loss = 0
-        total_size = 0
-        for x, y in dl_val:
-            x = x.to(self.device)
-            y = y.to(self.device)
-            y_pred = self.step(x)
-            loss = self.criterion(y_pred, y)
-            val_loss += loss.item() * x.shape[0]
-            total_size += x.shape[0]
-        val_loss /= total_size
+
+        with torch.no_grad():
+            log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
+            energy = energy_fn(samples, T=T_expanded)
+            loss_raw = log_prob + energy
+            val_loss = loss_raw.mean().item()
+
         return val_loss
 
-    def train(self, dl_train, dl_val, epochs):
+    def train(self, energy_fn, epochs):
         val_loss = 0
         val_losses = []
 
         for epoch in range(epochs):
-            train_loss = self.train_epoch(dl_train)
-            val_loss = self.val_epoch(dl_val)
+            train_loss = self.train_epoch(energy_fn)
+            val_loss = self.val_epoch(energy_fn)
             val_losses.append(val_loss)
 
             # Early stopping if loss becomes NaN
@@ -246,9 +283,7 @@ class Trainer:
         return val_loss
 
 
-def run(
-    run_config: RunConfig, dl_train, dl_val, group_name=None, trial=None, pruner=None
-):
+def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=None):
     project = run_config.project
     device = run_config.device
     seeds = run_config.seeds
@@ -296,7 +331,7 @@ def run(
                 pruner=pruner,
             )
 
-            val_loss = trainer.train(dl_train, dl_val, epochs=run_config.epochs)
+            val_loss = trainer.train(energy_fn, epochs=run_config.epochs)
             total_loss += val_loss
             complete_seeds += 1
 
