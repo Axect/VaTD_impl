@@ -234,21 +234,27 @@ class DiscretePixelCNN(nn.Module):
         self.hparams = hparams
         self.device = device
 
-        self.channel = 1            # Single channel for lattice
-        self.category = 2           # Spin up/down
-        self.augment_channels = 1   # Temperature
+        self.channel = 1  # Single channel for lattice
+        self.category = 2  # Spin up/down
+        self.augment_channels = 1  # Temperature
 
         self.fix_first = hparams["fix_first"]
+        self.mapping = lambda x: 2 * x - 1  # Map {0,1} to {-1,1}
+        self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
 
     def sample(self, batch_size, T=None):
-        sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(self.device)
+        sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(
+            self.device
+        )
         if T is not None:
             # (B, C) -> (B, C, H, W)
             T = T.to(self.device)
             if T.dim() == 1:
                 T = T.unsqueeze(1)
 
-            T_expanded = einops.repeat(T, "b c -> b c h w", h=self.size[0], w=self.size[1])
+            T_expanded = einops.repeat(
+                T, "b c -> b c h w", h=self.size[0], w=self.size[1]
+            )
             sample = torch.cat([sample, T_expanded], dim=1)
 
         for i in range(self.size[0]):
@@ -256,7 +262,32 @@ class DiscretePixelCNN(nn.Module):
                 # Fix the first element of the samples to be a fixed value
                 if self.fix_first is not None and i == 0 and j == 0:
                     if T is not None:
-                        sample[:, :-1, 0, 0] = self.fix_first
+                        # Caution: original code has potential bug here, fixed it.
+                        sample[:, : self.channel, 0, 0] = self.fix_first
                     else:
                         sample[:, :, 0, 0] = self.fix_first
                     continue
+
+                for k in range(self.channel):
+                    # (B, Cat, C, H, W)
+                    unnormalized = self.masked_conv.forward(sample)
+                    # Use multinomial instead of argmax to allow stochastic sampling
+                    sample[:, k, i, j] = (
+                        torch.multinomial(
+                            torch.softmax(unnormalized[:, :, k, i, j], dim=1),
+                            1,  # num_samples=1
+                        )
+                        .squeeze()
+                        .float()
+                    )
+
+        if T is not None:
+            # Caution: original code has potential bug here, fixed it.
+            sample = sample[:, : self.channel, :, :]
+
+        sample = self.mapping(sample)  # Map {0,1} to {-1,1}
+
+        return sample
+
+    def log_prob(self, sample, T=None):
+        pass
