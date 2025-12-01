@@ -116,6 +116,38 @@ def main():
 
     energy_fn = create_ising_energy_fn(L=L, d=2, device=base_config.device)
 
+    # Import exact partition function for validation
+    from vatd_exact_partition import logZ as exact_logZ, CRITICAL_TEMPERATURE
+    from util import generate_fixed_betas
+
+    # Get model config for beta range
+    model_config_dict = base_config.gen_config().get("model_config", {})
+    beta_min = model_config_dict.get("beta_min", 0.1)
+    beta_max = model_config_dict.get("beta_max", 2.0)
+    num_beta = model_config_dict.get("num_beta", 8)
+
+    # Generate fixed validation betas (same ones used in validation)
+    fixed_val_betas = generate_fixed_betas(beta_min, beta_max, num_beta)
+
+    # Compute exact logZ for each validation beta
+    print(f"\nComputing exact partition function for {num_beta} validation temperatures...")
+    print(f"Beta range: [{beta_min:.3f}, {beta_max:.3f}]")
+    print(f"Critical temperature: Tc = {CRITICAL_TEMPERATURE:.6f} (βc = {1.0/CRITICAL_TEMPERATURE:.6f})")
+
+    exact_logz_values = []
+    for i, beta in enumerate(fixed_val_betas):
+        exact_logz = exact_logZ(n=L, j=1.0, beta=beta.item())
+        exact_logz_values.append(exact_logz.item())
+        T = 1.0 / beta.item()
+        print(f"  β_{i} = {beta.item():.4f} (T = {T:.4f}): log Z = {exact_logz.item():.6f}")
+
+    # Attach to energy_fn as attributes (for trainer access)
+    energy_fn.exact_logz_values = exact_logz_values
+    energy_fn.fixed_val_betas = fixed_val_betas.tolist()
+    energy_fn.lattice_size = L
+    energy_fn.critical_temperature = CRITICAL_TEMPERATURE
+    print("Exact partition function values attached to energy_fn\n")
+
     # Run
     if args.optimize_config:
         optimize_config = OptimizeConfig.from_yaml(args.optimize_config)

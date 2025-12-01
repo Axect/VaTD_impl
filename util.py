@@ -183,6 +183,7 @@ class Trainer:
         trial=None,
         seed=None,
         pruner=None,
+        energy_fn=None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -199,6 +200,16 @@ class Trainer:
             model.beta_max,
             model.num_beta
         ).to(device)
+
+        # Store exact partition function values for validation (if available)
+        if energy_fn is not None:
+            self.exact_logz_values = getattr(energy_fn, 'exact_logz_values', None)
+            self.lattice_size = getattr(energy_fn, 'lattice_size', None)
+            self.critical_temperature = getattr(energy_fn, 'critical_temperature', None)
+        else:
+            self.exact_logz_values = None
+            self.lattice_size = None
+            self.critical_temperature = None
 
         if early_stopping_config and early_stopping_config.enabled:
             self.early_stopping = EarlyStopping(
@@ -307,6 +318,19 @@ class Trainer:
             for i in range(num_beta):
                 val_dict[f'val_loss_beta_{i}'] = loss_per_beta[i].item()
 
+            # Compute exact errors if available
+            if self.exact_logz_values is not None:
+                for i in range(num_beta):
+                    # Exact log partition function (negative of exact loss)
+                    exact_logz = self.exact_logz_values[i]
+                    # Model loss approximates: -log Z + beta * <E>
+                    # At equilibrium, this should equal -log Z
+                    # Error = model_loss - (-exact_logz) = model_loss + exact_logz
+                    model_loss = val_dict[f'val_loss_beta_{i}']
+                    error_vs_exact = model_loss + exact_logz
+                    val_dict[f'val_error_exact_beta_{i}'] = error_vs_exact
+                    val_dict[f'val_exact_logz_beta_{i}'] = exact_logz
+
         return val_dict
 
     def train(self, energy_fn, epochs):
@@ -348,6 +372,23 @@ class Trainer:
             for i in range(self.model.num_beta):
                 loss_val = val_dict[f'val_loss_beta_{i}']
                 log_dict[f'val_loss_beta_{i}_signlog'] = sign_log_transform(loss_val)
+
+            # Add exact error metrics
+            if self.exact_logz_values is not None:
+                for i in range(self.model.num_beta):
+                    if f'val_error_exact_beta_{i}' in val_dict:
+                        log_dict[f'val_error_exact_beta_{i}'] = val_dict[f'val_error_exact_beta_{i}']
+                        log_dict[f'val_error_exact_beta_{i}_signlog'] = sign_log_transform(
+                            val_dict[f'val_error_exact_beta_{i}']
+                        )
+                    if f'val_exact_logz_beta_{i}' in val_dict:
+                        log_dict[f'val_exact_logz_beta_{i}'] = val_dict[f'val_exact_logz_beta_{i}']
+
+                # Add mean absolute error across all betas
+                errors = [val_dict[f'val_error_exact_beta_{i}'] for i in range(self.model.num_beta)]
+                log_dict['val_error_exact_mean'] = sum(errors) / len(errors)
+                log_dict['val_error_exact_abs_mean'] = sum(abs(e) for e in errors) / len(errors)
+                log_dict['val_error_exact_abs_mean_signlog'] = sign_log_transform(log_dict['val_error_exact_abs_mean'])
 
             if epoch >= 10:
                 log_dict["predicted_final_loss"] = predict_final_loss(
@@ -424,6 +465,7 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 trial=trial,
                 seed=seed,
                 pruner=pruner,
+                energy_fn=energy_fn,
             )
 
             val_loss = trainer.train(energy_fn, epochs=run_config.epochs)
