@@ -65,8 +65,19 @@ class RunConfig:
 
     def gen_group_name(self):
         name = f"{self.net.split('.')[-1]}"
-        for k, v in self.net_config.items():
-            name += f"_{k[0]}_{v}"
+
+        # For DiscretePixelCNN, only include key architecture parameters to keep name short
+        if "DiscretePixelCNN" in self.net:
+            key_params = ["size", "hidden_channels", "hidden_conv_layers", "hidden_width"]
+            for k in key_params:
+                if k in self.net_config:
+                    v = self.net_config[k]
+                    name += f"_{k[0]}_{v}"
+        else:
+            # For other models, include all net_config parameters
+            for k, v in self.net_config.items():
+                name += f"_{k[0]}_{v}"
+
         name += f"_{abbreviate(self.optimizer.split('.')[-1])}"
         for k, v in self.optimizer_config.items():
             name += f"_{k[0]}_{v:.4e}" if isinstance(v, float) else f"_{k[0]}_{v}"

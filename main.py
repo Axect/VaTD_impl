@@ -1,10 +1,90 @@
-from torch.utils.data import DataLoader
+import torch
 import wandb
+import numpy as np
 
-from util import load_data, run
+from util import run
 from config import RunConfig, OptimizeConfig
 
 import argparse
+
+
+def create_adjacency_matrix(L, d=2):
+    """
+    Create adjacency matrix for a d-dimensional hypercube lattice with periodic boundary conditions.
+
+    Args:
+        L: lattice size (L^d total sites)
+        d: dimension (default 2)
+
+    Returns:
+        adjacency matrix of shape (L^d, L^d)
+    """
+    N_site = L ** d
+    Adj = np.zeros((N_site, N_site), dtype=np.float32)
+
+    def index2coord(idx, L, d):
+        coord = []
+        for _ in range(d):
+            coord.append(idx % L)
+            idx //= L
+        return coord[::-1]
+
+    def coord2index(coord, L):
+        idx = coord[0]
+        for i in range(1, len(coord)):
+            idx = idx * L + coord[i]
+        return idx
+
+    # Build adjacency matrix
+    for i in range(N_site):
+        coord = index2coord(i, L, d)
+        for dim in range(d):
+            # Move in positive direction
+            new_coord = coord.copy()
+            new_coord[dim] = (new_coord[dim] + 1) % L  # periodic boundary
+            j = coord2index(new_coord, L)
+            Adj[i, j] = 1.0
+            Adj[j, i] = 1.0
+
+    return Adj
+
+
+def create_ising_energy_fn(L, d=2, device='cpu'):
+    """
+    Create Ising energy function for a d-dimensional lattice.
+
+    Args:
+        L: lattice size
+        d: dimension (default 2)
+        device: torch device
+
+    Returns:
+        energy function that takes samples (B, 1, H, W) and returns (B, 1)
+    """
+    # Create adjacency matrix and convert to torch
+    Adj = create_adjacency_matrix(L, d)
+    N = torch.from_numpy(Adj).float().to(device) * -1  # multiply by -1 like VanillaIsing
+
+    def energy_fn(samples):
+        """
+        Calculate Ising energy for batch of samples.
+
+        Args:
+            samples: (B, 1, H, W) tensor with values in {-1, 1}
+
+        Returns:
+            (B, 1) energy values
+        """
+        # Flatten spatial dimensions: (B, 1, H, W) -> (B, H*W)
+        flat_samples = samples.flatten(-2)  # (B, 1, H*W)
+
+        # Energy calculation: E = sum_ij J_ij * s_i * s_j / 2
+        # = (s @ N) * s / 2 where N is adjacency matrix * -J
+        energy = ((flat_samples @ N) * flat_samples).sum([-2, -1]).unsqueeze(-1) / 2
+
+        return energy
+
+    return energy_fn
 
 
 def main():
@@ -27,17 +107,21 @@ def main():
     if args.device:
         base_config.device = args.device
 
-    # Load data
-    ds_train, ds_val = load_data()  # pyright: ignore
-    dl_train = DataLoader(ds_train, batch_size=base_config.batch_size, shuffle=True)
-    dl_val = DataLoader(ds_val, batch_size=base_config.batch_size, shuffle=False)
+    # Create Ising energy function
+    # Get lattice size from model config
+    model_config = base_config.gen_config().get("model_config", {})
+    L = model_config.get("size", 16)
+    if isinstance(L, (list, tuple)):
+        L = L[0]  # assume square lattice
+
+    energy_fn = create_ising_energy_fn(L=L, d=2, device=base_config.device)
 
     # Run
     if args.optimize_config:
         optimize_config = OptimizeConfig.from_yaml(args.optimize_config)
         pruner = optimize_config.create_pruner()
 
-        def objective(trial, base_config, optimize_config, dl_train, dl_val):
+        def objective(trial, base_config, optimize_config, energy_fn):
             params = optimize_config.suggest_params(trial)
 
             config = base_config.gen_config()
@@ -52,13 +136,13 @@ def main():
             trial.set_user_attr("group_name", group_name)
 
             return run(
-                run_config, dl_train, dl_val, group_name, trial=trial, pruner=pruner
+                run_config, energy_fn, group_name, trial=trial, pruner=pruner
             )
 
         study = optimize_config.create_study(project=f"{base_config.project}_Opt")
         study.optimize(
             lambda trial: objective(
-                trial, base_config, optimize_config, dl_train, dl_val
+                trial, base_config, optimize_config, energy_fn
             ),
             n_trials=optimize_config.trials,
         )
@@ -74,7 +158,7 @@ def main():
         )
 
     else:
-        run(base_config, dl_train, dl_val)
+        run(base_config, energy_fn)
 
 
 if __name__ == "__main__":

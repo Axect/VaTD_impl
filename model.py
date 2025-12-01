@@ -141,7 +141,7 @@ class MaskedResConv2D(nn.Module):
                         in_channels=2 * hidden_channels,
                         out_channels=hidden_channels,
                         kernel_size=1,
-                        padding=(hidden_kernel_size - 1) // 2,
+                        padding=0,
                         mask_type="B",
                         data_channels=channel,
                         augment_channels=augment_channels,
@@ -163,6 +163,7 @@ class MaskedResConv2D(nn.Module):
                         in_channels=hidden_channels,
                         out_channels=2 * hidden_channels,
                         kernel_size=1,
+                        padding=0,
                         mask_type="B",
                         data_channels=channel,
                         augment_channels=augment_channels,
@@ -225,7 +226,7 @@ class MaskedResConv2D(nn.Module):
 
         x = self.final_fc(x)
 
-        return x.reshape(size[0], self.channel, self.category, size[-2], size[-1])
+        return x.reshape(size[0], self.category, self.channel, size[-2], size[-1])
 
 
 class DiscretePixelCNN(nn.Module):
@@ -238,13 +239,33 @@ class DiscretePixelCNN(nn.Module):
         self.category = 2  # Spin up/down
         self.augment_channels = 1  # Temperature
 
-        self.fix_first = hparams["fix_first"]
+        # Lattice size
+        size = hparams.get("size", 16)
+        if isinstance(size, int):
+            self.size = (size, size)
+        else:
+            self.size = tuple(size)
+
+        self.fix_first = hparams.get("fix_first", 1)
         self.batch_size = hparams["batch_size"]
         self.num_beta = hparams["num_beta"]
         self.beta_min = hparams["beta_min"]
         self.beta_max = hparams["beta_max"]
         self.mapping = lambda x: 2 * x - 1  # Map {0,1} to {-1,1}
         self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
+
+        # Initialize MaskedResConv2D
+        self.masked_conv = MaskedResConv2D(
+            channel=self.channel,
+            kernel_size=hparams.get("kernel_size", 7),
+            hidden_channels=hparams.get("hidden_channels", 64),
+            hidden_conv_layers=hparams.get("hidden_conv_layers", 5),
+            hidden_kernel_size=hparams.get("hidden_kernel_size", 3),
+            hidden_width=hparams.get("hidden_width", 128),
+            hidden_fc_layers=hparams.get("hidden_fc_layers", 2),
+            category=self.category,
+            augment_channels=self.augment_channels,
+        )
 
     def sample(self, batch_size=None, T=None):
         batch_size = batch_size if batch_size is not None else self.batch_size

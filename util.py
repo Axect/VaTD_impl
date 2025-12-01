@@ -18,6 +18,57 @@ from math import pi
 BATCH_SIZE = 512
 
 
+def generate_fixed_betas(beta_min, beta_max, num_beta):
+    """
+    Generate log-spaced beta values for fixed validation.
+
+    Args:
+        beta_min (float): Minimum beta (1/T_max)
+        beta_max (float): Maximum beta (1/T_min)
+        num_beta (int): Number of beta values
+
+    Returns:
+        torch.Tensor: shape (num_beta,) with log-spaced beta values
+
+    Example:
+        >>> generate_fixed_betas(0.1, 2.0, 8)
+        tensor([0.1000, 0.1468, 0.2154, 0.3162, 0.4642, 0.6813, 1.0000, 1.4678])
+    """
+    betas = np.logspace(np.log10(beta_min), np.log10(beta_max), num_beta)
+    return torch.tensor(betas, dtype=torch.float32)
+
+
+def sign_log_transform(x):
+    """
+    Apply sign-log transform: sign(x) * log10(1 + |x|)
+
+    This transform preserves sign while compressing the magnitude using log scale.
+    Useful for visualizing negative losses on log-scale plots.
+
+    Args:
+        x (float or torch.Tensor): Input value(s)
+
+    Returns:
+        float: Transformed value
+
+    Examples:
+        >>> sign_log_transform(99)  # log10(100) = 2
+        2.0
+        >>> sign_log_transform(-99)  # -log10(100) = -2
+        -2.0
+        >>> sign_log_transform(0)
+        0.0
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.item()
+
+    if x == 0:
+        return 0.0
+
+    sign = 1 if x > 0 else -1
+    return sign * math.log10(1 + abs(x))
+
+
 def load_data(n=10000, split_ratio=0.8, seed=42):
     # Fix random seed for reproducibility
     torch.manual_seed(seed)
@@ -142,6 +193,13 @@ class Trainer:
         self.seed = seed
         self.pruner = pruner
 
+        # Pre-compute fixed betas for validation
+        self.fixed_val_betas = generate_fixed_betas(
+            model.beta_min,
+            model.beta_max,
+            model.num_beta
+        ).to(device)
+
         if early_stopping_config and early_stopping_config.enabled:
             self.early_stopping = EarlyStopping(
                 patience=early_stopping_config.patience,
@@ -178,8 +236,9 @@ class Trainer:
             self.optimizer.train()
 
         log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
-        energy = energy_fn(samples, T=T_expanded)
-        loss_raw = log_prob + energy
+        energy = energy_fn(samples)
+        beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
+        loss_raw = log_prob + beta * energy
         loss_view = loss_raw.view(num_beta, batch_size)
         log_prob_view = log_prob.view(num_beta, batch_size)
 
@@ -198,13 +257,24 @@ class Trainer:
         return train_loss
 
     def val_epoch(self, energy_fn):
+        """
+        Validation epoch with fixed beta values.
+
+        Returns:
+            dict: Contains 'val_loss' (mean) and individual beta losses
+                  {
+                      'val_loss': float,
+                      'val_loss_beta_0': float,
+                      'val_loss_beta_1': float,
+                      ...
+                      'val_loss_beta_7': float
+                  }
+        """
         batch_size = self.model.batch_size
-        beta_min = self.model.beta_min
-        beta_max = self.model.beta_max
         num_beta = self.model.num_beta
-        beta_samples = (
-            torch.rand(num_beta, device=self.device) * (beta_max - beta_min) + beta_min
-        )
+
+        # Use fixed betas instead of random sampling
+        beta_samples = self.fixed_val_betas  # shape: (num_beta,)
         T_samples = 1.0 / beta_samples
         T_expanded = T_samples.repeat_interleave(batch_size)
         total_size = num_beta * batch_size
@@ -219,11 +289,25 @@ class Trainer:
 
         with torch.no_grad():
             log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
-            energy = energy_fn(samples, T=T_expanded)
-            loss_raw = log_prob + energy
-            val_loss = loss_raw.mean().item()
+            energy = energy_fn(samples)
+            beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
+            loss_raw = log_prob + beta * energy
 
-        return val_loss
+            # Reshape to separate beta dimensions: (num_beta, batch_size)
+            loss_view = loss_raw.view(num_beta, batch_size)
+
+            # Compute mean loss per beta
+            loss_per_beta = loss_view.mean(dim=1)  # shape: (num_beta,)
+
+            # Compute overall mean
+            val_loss = loss_per_beta.mean().item()
+
+            # Create result dictionary with individual beta losses
+            val_dict = {'val_loss': val_loss}
+            for i in range(num_beta):
+                val_dict[f'val_loss_beta_{i}'] = loss_per_beta[i].item()
+
+        return val_dict
 
     def train(self, energy_fn, epochs):
         val_loss = 0
@@ -231,7 +315,8 @@ class Trainer:
 
         for epoch in range(epochs):
             train_loss = self.train_epoch(energy_fn)
-            val_loss = self.val_epoch(energy_fn)
+            val_dict = self.val_epoch(energy_fn)
+            val_loss = val_dict['val_loss']
             val_losses.append(val_loss)
 
             # Early stopping if loss becomes NaN
@@ -251,6 +336,18 @@ class Trainer:
                 "val_loss": val_loss,
                 "lr": self.optimizer.param_groups[0]["lr"],
             }
+
+            # Add individual beta losses and beta values
+            for i in range(self.model.num_beta):
+                log_dict[f'val_loss_beta_{i}'] = val_dict[f'val_loss_beta_{i}']
+                log_dict[f'val_beta_{i}'] = self.fixed_val_betas[i].item()
+
+            # Add sign-log transforms
+            log_dict["train_loss_signlog"] = sign_log_transform(train_loss)
+            log_dict["val_loss_signlog"] = sign_log_transform(val_loss)
+            for i in range(self.model.num_beta):
+                loss_val = val_dict[f'val_loss_beta_{i}']
+                log_dict[f'val_loss_beta_{i}_signlog'] = sign_log_transform(loss_val)
 
             if epoch >= 10:
                 log_dict["predicted_final_loss"] = predict_final_loss(
@@ -275,10 +372,8 @@ class Trainer:
             self.scheduler.step()
             wandb.log(log_dict)
             if epoch % 10 == 0 or epoch == epochs - 1:
-                print_str = f"epoch: {epoch}"
-                for key, value in log_dict.items():
-                    print_str += f", {key}: {value:.4e}"
-                print(print_str)
+                lr = self.optimizer.param_groups[0]["lr"]
+                print(f"epoch: {epoch}, train_loss: {train_loss:.4e}, val_loss: {val_loss:.4e}, lr: {lr:.4e}")
 
         return val_loss
 
