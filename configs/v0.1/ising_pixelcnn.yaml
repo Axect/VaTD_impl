@@ -13,7 +13,7 @@ net_config:
   fix_first: 1  # Fix first spin to break symmetry (1 = spin up)
 
   # Temperature sampling configuration
-  batch_size: 64  # Samples per temperature
+  batch_size: 256  # Samples per temperature
   num_beta: 8     # Number of temperature samples per batch
   beta_min: 0.1   # 1/T_max (T_max = 10)
   beta_max: 2.0   # 1/T_min (T_min = 0.5)
