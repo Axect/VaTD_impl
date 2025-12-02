@@ -350,3 +350,319 @@ class DiscretePixelCNN(nn.Module):
         log_prob_sum = einops.reduce(log_prob_selected, "b c hw -> b 1", "sum")
 
         return log_prob_sum
+
+
+# ============================================================================
+# RealNVP (Normalizing Flow) Implementation
+# ============================================================================
+
+
+class ResidualBlock(nn.Module):
+    """
+    Simple Residual Block used inside the Scale and Translation networks.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
+class STNetwork(nn.Module):
+    """
+    Scale (s) and Translation (t) Network.
+    It predicts the affine transformation parameters based on the input.
+    """
+
+    def __init__(
+        self, in_channels, hidden_channels, num_layers, augment_channels=0
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.augment_channels = augment_channels
+
+        # Input layer: takes split data + conditional channels (if any)
+        self.in_conv = nn.Conv2d(
+            in_channels + augment_channels, hidden_channels, kernel_size=3, padding=1
+        )
+
+        # Hidden layers (Residual blocks)
+        self.res_blocks = nn.ModuleList(
+            [ResidualBlock(hidden_channels) for _ in range(num_layers)]
+        )
+
+        # Output layer: predicts both scale (s) and translation (t)
+        # We output 2 * in_channels (first half for s, second half for t)
+        self.out_conv = nn.Conv2d(
+            hidden_channels, 2 * in_channels, kernel_size=3, padding=1
+        )
+
+        # Initialize output layer with zeros for identity mapping at the start
+        self.out_conv.weight.data.zero_()
+        self.out_conv.bias.data.zero_()
+
+    def forward(self, x, T_cond=None):
+        """
+        x: Input feature map
+        T_cond: Conditional input (e.g., Temperature), shape (B, C, H, W)
+        """
+        if self.augment_channels > 0 and T_cond is not None:
+            # Concatenate conditional information along channel dimension
+            x = torch.cat([x, T_cond], dim=1)
+
+        x = F.gelu(self.in_conv(x))
+        for block in self.res_blocks:
+            x = block(x)
+
+        st = self.out_conv(x)
+        s, t = st.chunk(2, dim=1)
+
+        # Apply tanh to scale factor to prevent numerical instability
+        s = torch.tanh(s)
+        return s, t
+
+
+class AffineCouplingLayer(nn.Module):
+    """
+    Affine Coupling Layer.
+    Splits the input into two parts (A and B).
+    A is kept constant, B is transformed based on A.
+    """
+
+    def __init__(
+        self, in_channels, hidden_channels, num_layers, augment_channels=0
+    ):
+        super().__init__()
+        # We process half of the channels
+        self.split_len = in_channels // 2
+
+        # The network that predicts s and t from x_a
+        self.st_net = STNetwork(
+            in_channels=self.split_len,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            augment_channels=augment_channels,
+        )
+
+    def forward(self, x, log_det, T_cond=None, reverse=False):
+        # Split input into x_a (frozen) and x_b (transformed)
+        x_a = x[:, : self.split_len, :, :]
+        x_b = x[:, self.split_len :, :, :]
+
+        # Get scale and translation parameters from x_a
+        s, t = self.st_net(x_a, T_cond)
+
+        if not reverse:
+            # Forward: z = f(x) -> Used for likelihood calculation (training)
+            # y_b = x_b * exp(s) + t
+            y_b = x_b * torch.exp(s) + t
+            y_a = x_a
+
+            # Update log-determinant of Jacobian
+            # log_det += sum(s)
+            log_det = log_det + torch.sum(s, dim=[1, 2, 3])
+        else:
+            # Inverse: x = f^-1(z) -> Used for sampling (generation)
+            # x_b = (y_b - t) * exp(-s)
+            y_b = (x_b - t) * torch.exp(-s)
+            y_a = x_a
+
+            # Inverse doesn't strictly need log_det for sampling,
+            # but we keep consistency if needed.
+
+        return torch.cat([y_a, y_b], dim=1), log_det
+
+
+class RealNVP(nn.Module):
+    def __init__(self, hparams, device="cpu"):
+        super().__init__()
+        self.hparams = hparams
+        self.device = device
+
+        # --- Compatibility with PixelCNN setup ---
+        self.channel = 1
+        self.size = hparams.get("size", 16)
+        if isinstance(self.size, int):
+            self.size = (self.size, self.size)
+
+        self.batch_size = hparams.get("batch_size", 64)
+
+        # FIXED: Add required attributes for Trainer compatibility
+        self.beta_min = hparams.get("beta_min", 0.2)
+        self.beta_max = hparams.get("beta_max", 1.0)
+        self.num_beta = hparams.get("num_beta", 8)
+
+        # Flow Hyperparameters
+        hidden_channels = hparams.get("hidden_channels", 64)
+        num_blocks = hparams.get(
+            "hidden_conv_layers", 4
+        )  # Reuse this param for ResBlocks
+        num_flow_layers = hparams.get(
+            "num_flow_layers", 6
+        )  # Number of coupling layers
+        self.augment_channels = 1  # For Temperature (T)
+
+        # Squeeze factor: 1x16x16 -> 4x8x8
+        self.squeeze_factor = 2
+        self.in_channels = self.channel * (
+            self.squeeze_factor**2
+        )  # 1 * 4 = 4 channels
+
+        # FIXED: Create permutation indices for channel mixing
+        # For 4 channels: [0,1,2,3] -> [1,0,3,2]
+        self.register_buffer(
+            "perm_indices",
+            torch.tensor([1, 0, 3, 2] if self.in_channels == 4 else list(range(self.in_channels))),
+        )
+        self.register_buffer(
+            "inv_perm_indices",
+            torch.argsort(self.perm_indices),
+        )
+
+        # Construct Flow Layers
+        self.layers = nn.ModuleList()
+        for i in range(num_flow_layers):
+            self.layers.append(
+                AffineCouplingLayer(
+                    in_channels=self.in_channels,
+                    hidden_channels=hidden_channels,
+                    num_layers=num_blocks,
+                    augment_channels=self.augment_channels,
+                )
+            )
+
+        # Base distribution: Gaussian N(0, 1)
+        self.prior = torch.distributions.Normal(0, 1)
+
+    def squeeze(self, x):
+        """Reshape (B, C, H, W) -> (B, 4*C, H/2, W/2)"""
+        b, c, h, w = x.size()
+        x = x.view(b, c, h // 2, 2, w // 2, 2)
+        x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+        x = x.view(b, c * 4, h // 2, w // 2)
+        return x
+
+    def undo_squeeze(self, x):
+        """Reshape (B, 4*C, H/2, W/2) -> (B, C, H, W)"""
+        b, c, h, w = x.size()
+        x = x.view(b, c // 4, 2, 2, h, w)
+        x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
+        x = x.view(b, c // 4, h * 2, w * 2)
+        return x
+
+    def _prepare_conditional(self, T, h, w):
+        """Resizes Temperature T to match the current feature map spatial size."""
+        if T is None:
+            return None
+
+        T = T.to(self.device)
+        if T.dim() == 1:
+            T = T.unsqueeze(1)  # (B, 1)
+
+        # Repeat T to match spatial dimensions (B, 1, H, W)
+        T_map = T.view(T.shape[0], T.shape[1], 1, 1).repeat(1, 1, h, w)
+        return T_map
+
+    def dequantize(self, x):
+        """
+        Add uniform noise to discrete data {-1, 1} to make it continuous.
+        Training on discrete data with Flows leads to infinite likelihoods without this.
+        """
+        # Assume x is in {-1, 1}
+        # 1. Map to {0, 1}
+        x = (x + 1) / 2.0
+        # 2. Add noise in [0, 1) -> result is in [0, 2)
+        noise = torch.rand_like(x)
+        x = x + noise
+        # 3. Map back to approx range (e.g., -2 to 2) or keep as is.
+        # For simplicity, we just use this "variational" x for density estimation.
+        # We normalize roughly to Gaussian range
+        return x - 1.0  # roughly centered around 0
+
+    def forward(self, x, T=None):
+        """
+        Goes from Data (x) -> Latent (z). Used for training (Likelihood).
+        """
+        # Dequantization for training stability
+        x = self.dequantize(x)
+
+        # Squeeze spatial dims to channels
+        x = self.squeeze(x)
+
+        log_det_sum = 0
+        b, c, h, w = x.shape
+        T_cond = self._prepare_conditional(T, h, w)
+
+        for i, layer in enumerate(self.layers):
+            x, log_det_sum = layer(x, log_det_sum, T_cond=T_cond, reverse=False)
+            # FIXED: Use learnable permutation instead of flip
+            x = x[:, self.perm_indices, :, :]
+
+        z = x
+        return z, log_det_sum
+
+    def log_prob(self, x, T=None):
+        """
+        Calculates log p(x).
+        Compatible with the existing training loop.
+
+        FIXED: Returns (B, 1) instead of scalar for compatibility with util.py
+        """
+        z, log_det = self.forward(x, T)
+
+        # log p(z) = -0.5 * z^2 - 0.5 * log(2pi)
+        log_prob_z = torch.sum(
+            -0.5 * (z**2) - 0.5 * torch.tensor(2 * torch.pi).log(),
+            dim=[1, 2, 3],
+        )
+
+        # log p(x) = log p(z) + log |det(J)|
+        log_prob_x = log_prob_z + log_det
+
+        # FIXED: Return (B, 1) tensor instead of scalar
+        return log_prob_x.unsqueeze(-1)
+
+    @torch.no_grad()
+    def sample(self, batch_size=None, T=None):
+        """
+        Goes from Latent (z) -> Data (x).
+        Used for Generation. O(1) complexity.
+        """
+        bs = batch_size if batch_size is not None else self.batch_size
+
+        # Latent shape must match the squeezed shape
+        h_s, w_s = self.size[0] // 2, self.size[1] // 2
+        c_s = self.channel * 4
+
+        # Sample z from Gaussian Prior
+        z = self.prior.sample((bs, c_s, h_s, w_s)).to(self.device)
+
+        T_cond = self._prepare_conditional(T, h_s, w_s)
+
+        # Inverse flow: iterate backwards
+        for layer in reversed(self.layers):
+            # FIXED: Undo permutation first (because we did it after layer in forward)
+            z = z[:, self.inv_perm_indices, :, :]
+            z, _ = layer(z, 0, T_cond=T_cond, reverse=True)
+
+        # Undo squeeze to get original image size
+        x = self.undo_squeeze(z)
+
+        # Final post-processing: Map continuous values back to discrete {-1, 1}
+        # Since we just want samples, we can simply threshold.
+        # Hard thresholding for Ising Model spin
+        x_discrete = torch.sign(x)
+
+        # Fallback for 0 values if any (rare in float)
+        x_discrete[x_discrete == 0] = 1
+
+        return x_discrete
