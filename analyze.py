@@ -53,7 +53,8 @@ def test_model_ising(model, energy_fn, L, device='cpu', num_temps=20, batch_size
     with torch.no_grad():
         for T in T_values:
             beta = 1.0 / T
-            T_tensor = torch.tensor([T], device=device)
+            # Create temperature tensor with same batch size as samples
+            T_tensor = torch.full((batch_size,), T, device=device)
 
             # Sample from model
             samples = model.sample(batch_size=batch_size, T=T_tensor)
