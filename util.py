@@ -1,5 +1,4 @@
 import torch
-from torch.utils.data import TensorDataset, random_split
 import torch.nn.functional as F
 import numpy as np
 import beaupy
@@ -12,7 +11,6 @@ from config import RunConfig
 import random
 import os
 import math
-from math import pi
 
 
 def generate_fixed_betas(beta_min, beta_max, num_beta):
@@ -64,38 +62,6 @@ def sign_log_transform(x):
 
     sign = 1 if x > 0 else -1
     return sign * math.log10(1 + abs(x))
-
-
-def load_data(n=10000, split_ratio=0.8, seed=42):
-    # Fix random seed for reproducibility
-    torch.manual_seed(seed)
-
-    x_noise = torch.rand(n) * 0.02
-    x = torch.linspace(0, 1, n) + x_noise
-    x = x.clamp(0, 1)  # Fix x to be in [0, 1]
-
-    noise_level = 0.05
-    y = (
-        1.0 * torch.sin(4 * pi * x)
-        + 0.5 * torch.sin(10 * pi * x)
-        + 1.5 * (x**2)
-        + torch.randn(n) * noise_level
-    )
-
-    x = x.view(-1, 1)
-    y = y.view(-1, 1)
-
-    full_dataset = TensorDataset(x, y)
-
-    train_size = int(n * split_ratio)
-    val_size = n - train_size
-
-    generator = torch.Generator().manual_seed(seed)
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size], generator=generator
-    )
-
-    return train_dataset, val_dataset
 
 
 def set_seed(seed: int):
@@ -174,7 +140,6 @@ class Trainer:
         model,
         optimizer,
         scheduler,
-        criterion,
         early_stopping_config=None,
         device="cpu",
         trial=None,
@@ -185,7 +150,6 @@ class Trainer:
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.criterion = criterion
         self.device = device
         self.trial = trial
         self.seed = seed
@@ -479,7 +443,6 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 model,
                 optimizer,
                 scheduler,
-                criterion=F.mse_loss,
                 early_stopping_config=run_config.early_stopping_config,
                 device=device,
                 trial=trial,
