@@ -1,0 +1,42 @@
+project: Ising_VaTD_v0.2
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 250
+batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16      # 16x16 Ising lattice
+  fix_first: 1  # Fix first spin to break symmetry (1 = spin up)
+
+  # Temperature sampling configuration
+  batch_size: 256  # Samples per temperature
+  num_beta: 8     # Number of temperature samples per batch
+  beta_min: 0.1   # 1/T_max (T_max = 10)
+  beta_max: 2.0   # 1/T_min (T_min = 0.5)
+
+  # Model architecture
+  kernel_size: 3        # First masked conv kernel size
+  hidden_channels: 96   # Hidden channels in residual blocks
+  hidden_conv_layers: 4 # Number of residual conv blocks
+  hidden_kernel_size: 5 # Kernel size in residual blocks
+  hidden_width: 128     # Width of FC layers
+  hidden_fc_layers: 1   # Number of FC layers
+
+optimizer_config:
+  lr: 9.166931889186586  # Learning rate
+  eps: 1.e-10
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 250
+  infimum_lr: 0.00002184005074670929
+
+early_stopping_config:
+  enabled: false
+  patience: 50
+  mode: min
+  min_delta: 0.0001
