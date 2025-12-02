@@ -240,14 +240,32 @@ class Trainer:
         loss_view = loss_raw.view(num_beta, batch_size)
         log_prob_view = log_prob.view(num_beta, batch_size)
 
-        # Detach only the baseline to avoid bias while keeping reward gradients
-        baselines = loss_view.mean(dim=1, keepdim=True).detach()
-        advantage = loss_view - baselines
-
         self.optimizer.zero_grad()
-        loss_REINFORCE = torch.mean(advantage * log_prob_view)
-        train_loss = loss_REINFORCE.item()
-        loss_REINFORCE.backward()
+
+        # Branching for Differentiable (Reparameterization) vs Non-Differentiable (REINFORCE)
+        if getattr(self.model, "differentiable_sampling", False):
+            # Reparameterization Trick (Pathwise Derivative)
+            # Directly minimize Free Energy: L = E[ log q + beta * E ]
+            # This has much lower variance than REINFORCE for differentiable models (e.g. RealNVP)
+            loss = loss_raw.mean()
+            loss.backward()
+            train_loss = loss.item()
+        else:
+            # REINFORCE (Score Function Estimator)
+            # Gradient: E[ (log q + beta * E - baseline) * grad(log q) ]
+
+            # Baseline for variance reduction (mean per beta)
+            baselines = loss_view.mean(dim=1, keepdim=True).detach()
+
+            # Advantage must be detached to act as fixed reward signal
+            # This prevents double-counting gradients of log_prob
+            advantage = (loss_view - baselines).detach()
+
+            loss_REINFORCE = torch.mean(advantage * log_prob_view)
+            loss_REINFORCE.backward()
+
+            # Log the actual Free Energy, not the surrogate loss, to be consistent with val_loss
+            train_loss = loss_view.mean().item()
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
