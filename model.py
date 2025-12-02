@@ -101,8 +101,17 @@ class MaskedConv2D(nn.Conv2d):
         self.register_buffer("mask", mask)
 
     def forward(self, x):
-        self.weight.data *= self.mask
-        return super(MaskedConv2D, self).forward(x)
+        # Apply mask during convolution instead of modifying weights in-place
+        # This avoids redundant masking on every forward pass
+        return F.conv2d(
+            x,
+            self.weight * self.mask,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
 
 
 class MaskedResConv2D(nn.Module):
@@ -294,9 +303,11 @@ class DiscretePixelCNN(nn.Module):
                         sample[:, :, 0, 0] = self.fix_first
                     continue
 
+                # Compute predictions for all channels at once (B, Cat, C, H, W)
+                # Optimization: move forward pass outside of channel loop to avoid redundant computation
+                unnormalized = self.masked_conv.forward(sample)
+
                 for k in range(self.channel):
-                    # (B, Cat, C, H, W)
-                    unnormalized = self.masked_conv.forward(sample)
                     # Use multinomial instead of argmax to allow stochastic sampling
                     sample[:, k, i, j] = (
                         torch.multinomial(
