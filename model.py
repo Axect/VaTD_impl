@@ -383,9 +383,7 @@ class STNetwork(nn.Module):
     It predicts the affine transformation parameters based on the input.
     """
 
-    def __init__(
-        self, in_channels, hidden_channels, num_layers, augment_channels=0
-    ):
+    def __init__(self, in_channels, hidden_channels, num_layers, augment_channels=0):
         super().__init__()
         self.in_channels = in_channels
         self.augment_channels = augment_channels
@@ -438,9 +436,7 @@ class AffineCouplingLayer(nn.Module):
     A is kept constant, B is transformed based on A.
     """
 
-    def __init__(
-        self, in_channels, hidden_channels, num_layers, augment_channels=0
-    ):
+    def __init__(self, in_channels, hidden_channels, num_layers, augment_channels=0):
         super().__init__()
         # We process half of the channels
         self.split_len = in_channels // 2
@@ -487,6 +483,9 @@ class RealNVP(nn.Module):
         super().__init__()
         self.hparams = hparams
         self.device = device
+        self.differentiable_sampling = (
+            True  # allow trainer to keep gradients during sampling
+        )
 
         # --- Compatibility with PixelCNN setup ---
         self.channel = 1
@@ -506,22 +505,20 @@ class RealNVP(nn.Module):
         num_blocks = hparams.get(
             "hidden_conv_layers", 4
         )  # Reuse this param for ResBlocks
-        num_flow_layers = hparams.get(
-            "num_flow_layers", 6
-        )  # Number of coupling layers
+        num_flow_layers = hparams.get("num_flow_layers", 6)  # Number of coupling layers
         self.augment_channels = 1  # For Temperature (T)
 
         # Squeeze factor: 1x16x16 -> 4x8x8
         self.squeeze_factor = 2
-        self.in_channels = self.channel * (
-            self.squeeze_factor**2
-        )  # 1 * 4 = 4 channels
+        self.in_channels = self.channel * (self.squeeze_factor**2)  # 1 * 4 = 4 channels
 
         # FIXED: Create permutation indices for channel mixing
         # For 4 channels: [0,1,2,3] -> [1,0,3,2]
         self.register_buffer(
             "perm_indices",
-            torch.tensor([1, 0, 3, 2] if self.in_channels == 4 else list(range(self.in_channels))),
+            torch.tensor(
+                [1, 0, 3, 2] if self.in_channels == 4 else list(range(self.in_channels))
+            ),
         )
         self.register_buffer(
             "inv_perm_indices",
@@ -572,28 +569,14 @@ class RealNVP(nn.Module):
         T_map = T.view(T.shape[0], T.shape[1], 1, 1).repeat(1, 1, h, w)
         return T_map
 
-    def dequantize(self, x):
-        """
-        Add uniform noise to discrete data {-1, 1} to make it continuous.
-        Training on discrete data with Flows leads to infinite likelihoods without this.
-        """
-        # Assume x is in {-1, 1}
-        # 1. Map to {0, 1}
-        x = (x + 1) / 2.0
-        # 2. Add noise in [0, 1) -> result is in [0, 2)
-        noise = torch.rand_like(x)
-        x = x + noise
-        # 3. Map back to approx range (e.g., -2 to 2) or keep as is.
-        # For simplicity, we just use this "variational" x for density estimation.
-        # We normalize roughly to Gaussian range
-        return x - 1.0  # roughly centered around 0
-
     def forward(self, x, T=None):
         """
         Goes from Data (x) -> Latent (z). Used for training (Likelihood).
+
+        NOTE: RealNVP generates continuous distributions directly, so no dequantization needed.
+        The input x should be continuous values from the model's own sample() method.
         """
-        # Dequantization for training stability
-        x = self.dequantize(x)
+        # No dequantization - x is already continuous from sample()
 
         # Squeeze spatial dims to channels
         x = self.squeeze(x)
@@ -631,11 +614,18 @@ class RealNVP(nn.Module):
         # FIXED: Return (B, 1) tensor instead of scalar
         return log_prob_x.unsqueeze(-1)
 
-    @torch.no_grad()
     def sample(self, batch_size=None, T=None):
         """
         Goes from Latent (z) -> Data (x).
         Used for Generation. O(1) complexity.
+
+        Returns continuous values near {-1, 1} using tanh activation.
+        For VaTD's temperature-differentiable objective, gradients flow through sampling.
+
+        For energy calculation with discrete Ising spins, use straight-through:
+            samples_continuous = model.sample(T=T)
+            samples_discrete = torch.sign(samples_continuous).detach()
+            energy = energy_fn(samples_discrete + samples_continuous - samples_continuous.detach())
         """
         bs = batch_size if batch_size is not None else self.batch_size
 
@@ -644,7 +634,8 @@ class RealNVP(nn.Module):
         c_s = self.channel * 4
 
         # Sample z from Gaussian Prior
-        z = self.prior.sample((bs, c_s, h_s, w_s)).to(self.device)
+        # rsample keeps the reparameterization path for lower-variance gradients
+        z = self.prior.rsample((bs, c_s, h_s, w_s)).to(self.device)
 
         T_cond = self._prepare_conditional(T, h_s, w_s)
 
@@ -657,12 +648,6 @@ class RealNVP(nn.Module):
         # Undo squeeze to get original image size
         x = self.undo_squeeze(z)
 
-        # Final post-processing: Map continuous values back to discrete {-1, 1}
-        # Since we just want samples, we can simply threshold.
-        # Hard thresholding for Ising Model spin
-        x_discrete = torch.sign(x)
-
-        # Fallback for 0 values if any (rare in float)
-        x_discrete[x_discrete == 0] = 1
-
-        return x_discrete
+        # Return continuous soft output with gradients
+        # tanh keeps values in (-1, 1) range suitable for Ising spins
+        return torch.tanh(x)

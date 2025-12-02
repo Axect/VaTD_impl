@@ -1,6 +1,7 @@
 import torch
 import wandb
 import numpy as np
+import math
 
 from util import run
 from config import RunConfig, OptimizeConfig
@@ -128,6 +129,7 @@ def main():
     train_beta_min = net_config.get("beta_min", 0.2)
     train_beta_max = net_config.get("beta_max", 1.0)
     num_beta = net_config.get("num_beta", 8)
+    fix_first = net_config.get("fix_first", None)
 
     # Fixed validation beta range (for extrapolation testing)
     # Validation uses wider range than training to test generalization
@@ -153,6 +155,9 @@ def main():
     exact_logz_values = []
     for i, beta in enumerate(fixed_val_betas):
         exact_logz = exact_logZ(n=L, j=1.0, beta=beta.item())
+        # If the model fixes the first spin, adjust exact logZ to the same conditional partition
+        if fix_first is not None:
+            exact_logz = exact_logz - math.log(2.0)
         exact_logz_values.append(exact_logz.item())
         T = 1.0 / beta.item()
         print(

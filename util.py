@@ -11,6 +11,7 @@ from config import RunConfig
 import random
 import os
 import math
+import contextlib
 
 
 def generate_fixed_betas(beta_min, beta_max, num_beta):
@@ -188,7 +189,9 @@ class Trainer:
             self.early_stopping = None
 
     def step(self, batch_size, T):
-        with torch.no_grad():
+        # Allow differentiable sampling for flow-based models (e.g., RealNVP)
+        use_no_grad = not getattr(self.model, "differentiable_sampling", False)
+        with torch.no_grad() if use_no_grad else contextlib.nullcontext():
             samples = self.model.sample(batch_size=batch_size, T=T)
         log_prob = self.model.log_prob(samples, T=T)
         return log_prob, samples
@@ -216,14 +219,31 @@ class Trainer:
             self.optimizer.train()
 
         log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
-        energy = energy_fn(samples)
+
+        # Straight-Through Estimator for flow-based models (RealNVP)
+        # Forward: use discrete spins for energy calculation
+        # Backward: gradients flow through continuous samples
+        if getattr(self.model, "differentiable_sampling", False):
+            # RealNVP outputs continuous values in (-1, 1)
+            # Discretize for energy but keep gradient path
+            samples_discrete = torch.sign(samples)
+            samples_discrete[samples_discrete == 0] = 1  # handle rare zero case
+            # Straight-through: forward uses discrete, backward uses continuous
+            samples_for_energy = samples_discrete.detach() + samples - samples.detach()
+        else:
+            # PixelCNN already outputs discrete samples
+            samples_for_energy = samples
+
+        energy = energy_fn(samples_for_energy)
         beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
         loss_raw = log_prob + beta * energy
         loss_view = loss_raw.view(num_beta, batch_size)
         log_prob_view = log_prob.view(num_beta, batch_size)
 
-        baselines = loss_view.mean(dim=1, keepdim=True)
-        advantage = loss_view - baselines
+        # Detach reward and baseline to avoid leaking gradients through the score
+        loss_view_detached = loss_view.detach()
+        baselines = loss_view_detached.mean(dim=1, keepdim=True)
+        advantage = loss_view_detached - baselines
 
         self.optimizer.zero_grad()
         loss_REINFORCE = torch.mean(advantage * log_prob_view)
@@ -270,7 +290,17 @@ class Trainer:
 
         with torch.no_grad():
             log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
-            energy = energy_fn(samples)
+
+            # Discretize samples for energy calculation if needed
+            if getattr(self.model, "differentiable_sampling", False):
+                # RealNVP outputs continuous values, discretize for energy
+                samples_discrete = torch.sign(samples)
+                samples_discrete[samples_discrete == 0] = 1
+                samples_for_energy = samples_discrete
+            else:
+                samples_for_energy = samples
+
+            energy = energy_fn(samples_for_energy)
             beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
             loss_raw = log_prob + beta * energy
 
