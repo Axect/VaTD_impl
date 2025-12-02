@@ -1,4 +1,4 @@
-project: Ising_VaTD_v0.2
+project: Ising_VaTD_v0.3
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: splus.SPlus
@@ -16,7 +16,7 @@ net_config:
   batch_size: 256  # Samples per temperature
   num_beta: 8     # Number of temperature samples per batch
   beta_min: 0.1   # 1/T_max (T_max = 10)
-  beta_max: 2.0   # 1/T_min (T_min = 0.5)
+  beta_max: 1.0   # 1/T_min (T_min = 1)
 
   # Model architecture
   kernel_size: 3        # First masked conv kernel size
