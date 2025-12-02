@@ -254,6 +254,16 @@ class DiscretePixelCNN(nn.Module):
             augment_channels=self.augment_channels,
         )
 
+    def to(self, *args, **kwargs):
+        """Override to() method to update self.device when model is moved to a different device."""
+        self = super().to(*args, **kwargs)
+        # Extract device from args/kwargs
+        if args and isinstance(args[0], (torch.device, str)):
+            self.device = args[0]
+        elif 'device' in kwargs:
+            self.device = kwargs['device']
+        return self
+
     def sample(self, batch_size=None, T=None):
         batch_size = batch_size if batch_size is not None else self.batch_size
         sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(
@@ -539,6 +549,16 @@ class RealNVP(nn.Module):
 
         # Base distribution: Gaussian N(0, 1)
         self.prior = torch.distributions.Normal(0, 1)
+
+    def to(self, *args, **kwargs):
+        """Override to() method to update self.device when model is moved to a different device."""
+        self = super().to(*args, **kwargs)
+        # Extract device from args/kwargs
+        if args and isinstance(args[0], (torch.device, str)):
+            self.device = args[0]
+        elif 'device' in kwargs:
+            self.device = kwargs['device']
+        return self
 
     def squeeze(self, x):
         """Reshape (B, C, H, W) -> (B, 4*C, H/2, W/2)"""
