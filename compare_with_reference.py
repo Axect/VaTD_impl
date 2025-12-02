@@ -21,7 +21,7 @@ T0_REFERENCE = 2.269  # Critical temperature used in reference
 FACTOR_LIST = [0.5, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.8]
 
 
-def evaluate_at_reference_temps(model, energy_fn, L, device='cpu', batch_size=500):
+def evaluate_at_reference_temps(model, energy_fn, L, device="cpu", batch_size=500):
     """Evaluate model at reference implementation temperatures"""
 
     T_list = [T0_REFERENCE * factor for factor in FACTOR_LIST]
@@ -52,28 +52,30 @@ def evaluate_at_reference_temps(model, energy_fn, L, device='cpu', batch_size=50
             # Error
             error = loss - exact_loss
 
-            results.append({
-                'factor': factor,
-                'T': T,
-                'beta': beta,
-                'loss': loss,
-                'exact_logz': exact_logz,
-                'exact_loss': exact_loss,
-                'error': error,
-                'abs_error': abs(error),
-                'normalized_loss': normalized_loss,
-            })
+            results.append(
+                {
+                    "factor": factor,
+                    "T": T,
+                    "beta": beta,
+                    "loss": loss,
+                    "exact_logz": exact_logz,
+                    "exact_loss": exact_loss,
+                    "error": error,
+                    "abs_error": abs(error),
+                    "normalized_loss": normalized_loss,
+                }
+            )
 
     return pd.DataFrame(results)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--project', type=str, required=True)
-    parser.add_argument('--group', type=str, required=True)
-    parser.add_argument('--seed', type=str, required=True)
-    parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--batch_size', type=int, default=500)
+    parser.add_argument("--project", type=str, required=True)
+    parser.add_argument("--group", type=str, required=True)
+    parser.add_argument("--seed", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--batch_size", type=int, default=500)
     args = parser.parse_args()
 
     # Load model
@@ -92,27 +94,27 @@ def main():
     df = evaluate_at_reference_temps(model, energy_fn, L, args.device, args.batch_size)
 
     # Print comparison table (matching reference format)
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("COMPARISON WITH REFERENCE IMPLEMENTATION")
-    print("="*80)
+    print("=" * 80)
     print(f"Reference T0 = {T0_REFERENCE}")
     print(f"Factor list: {FACTOR_LIST}")
-    print("="*80)
+    print("=" * 80)
 
     print("\nResults:")
-    print(df[['factor', 'T', 'normalized_loss', 'error']].to_string(index=False))
+    print(df[["factor", "T", "normalized_loss", "error"]].to_string(index=False))
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print(f"Mean absolute error: {df['abs_error'].mean():.6f}")
     print(f"Max absolute error: {df['abs_error'].max():.6f}")
     print(f"Error at Tc (factor=1.0): {df[df['factor']==1.0]['error'].values[0]:.6f}")
-    print("="*80)
+    print("=" * 80)
 
     # Save
-    output_file = f'runs/{args.project}/{args.group}/reference_comparison.csv'
+    output_file = f"runs/{args.project}/{args.group}/reference_comparison.csv"
     df.to_csv(output_file, index=False)
     print(f"\nSaved to {output_file}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

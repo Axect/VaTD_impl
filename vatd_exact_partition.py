@@ -62,8 +62,9 @@ def gamma(n, j, beta, r):
         Gamma value for given parameters
     """
     # Compute argument for arccosh
-    arg = (torch.cosh(2*h_star(j, beta)) * torch.cosh(2*h(j, beta)) -
-           torch.sinh(2*h_star(j, beta)) * torch.sinh(2*h(j, beta)) * np.cos(r*np.pi/n))
+    arg = torch.cosh(2 * h_star(j, beta)) * torch.cosh(2 * h(j, beta)) - torch.sinh(
+        2 * h_star(j, beta)
+    ) * torch.sinh(2 * h(j, beta)) * np.cos(r * np.pi / n)
 
     # Add small epsilon to avoid numerical issues when arg is exactly 1
     # arccosh is only defined for x >= 1, and arccosh(1) = 0
@@ -112,38 +113,62 @@ def logZ(n, j, beta):
     terms = []
 
     # Term 1: sum over even r, cosh
-    term1 = torch.cat([
-        torch.log(torch.clamp(2*torch.cosh(n/2*gamma(n, j, beta, 2*r)), min=eps)).reshape(1)
-        for r in range(n)
-    ], dim=0).sum(0, keepdim=True)
+    term1 = torch.cat(
+        [
+            torch.log(
+                torch.clamp(2 * torch.cosh(n / 2 * gamma(n, j, beta, 2 * r)), min=eps)
+            ).reshape(1)
+            for r in range(n)
+        ],
+        dim=0,
+    ).sum(0, keepdim=True)
     terms.append(term1)
 
     # Term 2: sum over even r, sinh
-    term2 = torch.cat([
-        torch.log(torch.clamp(2*torch.sinh(n/2*gamma(n, j, beta, 2*r)), min=eps)).reshape(1)
-        for r in range(n)
-    ], dim=0).sum(0, keepdim=True)
+    term2 = torch.cat(
+        [
+            torch.log(
+                torch.clamp(2 * torch.sinh(n / 2 * gamma(n, j, beta, 2 * r)), min=eps)
+            ).reshape(1)
+            for r in range(n)
+        ],
+        dim=0,
+    ).sum(0, keepdim=True)
     terms.append(term2)
 
     # Term 3: sum over odd r, cosh
-    term3 = torch.cat([
-        torch.log(torch.clamp(2*torch.cosh(n/2*gamma(n, j, beta, 2*r+1)), min=eps)).reshape(1)
-        for r in range(n)
-    ], dim=0).sum(0, keepdim=True)
+    term3 = torch.cat(
+        [
+            torch.log(
+                torch.clamp(
+                    2 * torch.cosh(n / 2 * gamma(n, j, beta, 2 * r + 1)), min=eps
+                )
+            ).reshape(1)
+            for r in range(n)
+        ],
+        dim=0,
+    ).sum(0, keepdim=True)
     terms.append(term3)
 
     # Term 4: sum over odd r, sinh
-    term4 = torch.cat([
-        torch.log(torch.clamp(2*torch.sinh(n/2*gamma(n, j, beta, 2*r+1)), min=eps)).reshape(1)
-        for r in range(n)
-    ], dim=0).sum(0, keepdim=True)
+    term4 = torch.cat(
+        [
+            torch.log(
+                torch.clamp(
+                    2 * torch.sinh(n / 2 * gamma(n, j, beta, 2 * r + 1)), min=eps
+                )
+            ).reshape(1)
+            for r in range(n)
+        ],
+        dim=0,
+    ).sum(0, keepdim=True)
     terms.append(term4)
 
     # Combine all terms using logsumexp for numerical stability
     result = (
         torch.logsumexp(torch.cat(terms, dim=0), dim=0)
-        - torch.log(torch.tensor(2.))
-        + 1/2*n**2*torch.log(2*torch.sinh(2*h(j, beta)))
+        - torch.log(torch.tensor(2.0))
+        + 1 / 2 * n**2 * torch.log(2 * torch.sinh(2 * h(j, beta)))
     )
 
     return result
@@ -161,7 +186,7 @@ def freeEnergy(n, j, beta):
     Returns:
         Free energy per site
     """
-    return -1/n**2/beta * logZ(n, j, beta)
+    return -1 / n**2 / beta * logZ(n, j, beta)
 
 
 # Critical temperature for 2D Ising model (exact value from Onsager)
@@ -169,19 +194,19 @@ def freeEnergy(n, j, beta):
 CRITICAL_TEMPERATURE = 2.0 / np.log(1.0 + np.sqrt(2.0))  # ≈ 2.269185
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     """
     Test the exact partition function at various temperatures.
     """
-    print("="*70)
+    print("=" * 70)
     print("Exact Partition Function for 2D Ising Model")
-    print("="*70)
+    print("=" * 70)
 
     L = 16
     print(f"\nLattice size: {L}×{L}")
     print(f"Critical temperature: Tc = {CRITICAL_TEMPERATURE:.6f}")
     print(f"                      βc = {1.0/CRITICAL_TEMPERATURE:.6f}")
-    print("\n" + "-"*70)
+    print("\n" + "-" * 70)
 
     # Test at various temperatures
     test_temps = [
@@ -193,13 +218,15 @@ if __name__ == '__main__':
     ]
 
     print(f"{'Temperature':<20} {'T':<10} {'β':<10} {'log Z':<15} {'F/site':<12}")
-    print("-"*70)
+    print("-" * 70)
 
     for desc, T in test_temps:
         beta = 1.0 / T
         logz = logZ(n=L, j=1.0, beta=torch.tensor(beta))
         free_energy = freeEnergy(L, 1.0, beta)
 
-        print(f"{desc:<20} {T:>9.4f} {beta:>9.4f} {logz.item():>14.6f} {free_energy.item():>11.6f}")
+        print(
+            f"{desc:<20} {T:>9.4f} {beta:>9.4f} {logz.item():>14.6f} {free_energy.item():>11.6f}"
+        )
 
-    print("="*70)
+    print("=" * 70)

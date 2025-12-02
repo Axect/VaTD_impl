@@ -191,18 +191,24 @@ class Trainer:
         self.seed = seed
         self.pruner = pruner
 
-        # Pre-compute fixed betas for validation
-        self.fixed_val_betas = generate_fixed_betas(
-            model.beta_min,
-            model.beta_max,
-            model.num_beta
-        ).to(device)
+        # Pre-compute fixed betas for validation (from energy_fn)
+        # Validation uses fixed wider range (0.1-2.0) for extrapolation testing
+        # Training uses model's beta range from config
+        if energy_fn is not None and hasattr(energy_fn, "fixed_val_betas"):
+            self.fixed_val_betas = torch.tensor(
+                energy_fn.fixed_val_betas, dtype=torch.float32
+            ).to(device)
+        else:
+            # Fallback: use model's beta range if energy_fn doesn't provide validation betas
+            self.fixed_val_betas = generate_fixed_betas(
+                model.beta_min, model.beta_max, model.num_beta
+            ).to(device)
 
         # Store exact partition function values for validation (if available)
         if energy_fn is not None:
-            self.exact_logz_values = getattr(energy_fn, 'exact_logz_values', None)
-            self.lattice_size = getattr(energy_fn, 'lattice_size', None)
-            self.critical_temperature = getattr(energy_fn, 'critical_temperature', None)
+            self.exact_logz_values = getattr(energy_fn, "exact_logz_values", None)
+            self.lattice_size = getattr(energy_fn, "lattice_size", None)
+            self.critical_temperature = getattr(energy_fn, "critical_temperature", None)
         else:
             self.exact_logz_values = None
             self.lattice_size = None
@@ -228,9 +234,11 @@ class Trainer:
         beta_min = self.model.beta_min
         beta_max = self.model.beta_max
         num_beta = self.model.num_beta
-        beta_samples = (
-            torch.rand(num_beta, device=self.device) * (beta_max - beta_min) + beta_min
-        )
+        # Log-uniform sampling for beta (matches validation's log-spaced distribution)
+        log_beta_samples = torch.rand(num_beta, device=self.device) * (
+            math.log(beta_max) - math.log(beta_min)
+        ) + math.log(beta_min)
+        beta_samples = torch.exp(log_beta_samples)
         T_samples = 1.0 / beta_samples
         T_expanded = T_samples.repeat_interleave(batch_size)
         total_size = num_beta * batch_size
@@ -279,7 +287,8 @@ class Trainer:
                   }
         """
         batch_size = self.model.batch_size
-        num_beta = self.model.num_beta
+        # Use validation beta count (may differ from training num_beta)
+        num_beta = len(self.fixed_val_betas)
 
         # Use fixed betas instead of random sampling
         beta_samples = self.fixed_val_betas  # shape: (num_beta,)
@@ -311,9 +320,9 @@ class Trainer:
             val_loss = loss_per_beta.mean().item()
 
             # Create result dictionary with individual beta losses
-            val_dict = {'val_loss': val_loss}
+            val_dict = {"val_loss": val_loss}
             for i in range(num_beta):
-                val_dict[f'val_loss_beta_{i}'] = loss_per_beta[i].item()
+                val_dict[f"val_loss_beta_{i}"] = loss_per_beta[i].item()
 
             # Compute exact errors if available
             if self.exact_logz_values is not None:
@@ -323,10 +332,10 @@ class Trainer:
                     # Model loss approximates: -log Z + beta * <E>
                     # At equilibrium, this should equal -log Z
                     # Error = model_loss - (-exact_logz) = model_loss + exact_logz
-                    model_loss = val_dict[f'val_loss_beta_{i}']
+                    model_loss = val_dict[f"val_loss_beta_{i}"]
                     error_vs_exact = model_loss + exact_logz
-                    val_dict[f'val_error_exact_beta_{i}'] = error_vs_exact
-                    val_dict[f'val_exact_logz_beta_{i}'] = exact_logz
+                    val_dict[f"val_error_exact_beta_{i}"] = error_vs_exact
+                    val_dict[f"val_exact_logz_beta_{i}"] = exact_logz
 
         return val_dict
 
@@ -337,7 +346,7 @@ class Trainer:
         for epoch in range(epochs):
             train_loss = self.train_epoch(energy_fn)
             val_dict = self.val_epoch(energy_fn)
-            val_loss = val_dict['val_loss']
+            val_loss = val_dict["val_loss"]
             val_losses.append(val_loss)
 
             # Early stopping if loss becomes NaN
@@ -359,33 +368,45 @@ class Trainer:
             }
 
             # Add individual beta losses and beta values
-            for i in range(self.model.num_beta):
-                log_dict[f'val_loss_beta_{i}'] = val_dict[f'val_loss_beta_{i}']
-                log_dict[f'val_beta_{i}'] = self.fixed_val_betas[i].item()
+            # Use validation beta count (may differ from training num_beta)
+            val_num_beta = len(self.fixed_val_betas)
+            for i in range(val_num_beta):
+                log_dict[f"val_loss_beta_{i}"] = val_dict[f"val_loss_beta_{i}"]
+                log_dict[f"val_beta_{i}"] = self.fixed_val_betas[i].item()
 
             # Add sign-log transforms
             log_dict["train_loss_signlog"] = sign_log_transform(train_loss)
             log_dict["val_loss_signlog"] = sign_log_transform(val_loss)
-            for i in range(self.model.num_beta):
-                loss_val = val_dict[f'val_loss_beta_{i}']
-                log_dict[f'val_loss_beta_{i}_signlog'] = sign_log_transform(loss_val)
+            for i in range(val_num_beta):
+                loss_val = val_dict[f"val_loss_beta_{i}"]
+                log_dict[f"val_loss_beta_{i}_signlog"] = sign_log_transform(loss_val)
 
             # Add exact error metrics
             if self.exact_logz_values is not None:
-                for i in range(self.model.num_beta):
-                    if f'val_error_exact_beta_{i}' in val_dict:
-                        log_dict[f'val_error_exact_beta_{i}'] = val_dict[f'val_error_exact_beta_{i}']
-                        log_dict[f'val_error_exact_beta_{i}_signlog'] = sign_log_transform(
-                            val_dict[f'val_error_exact_beta_{i}']
+                for i in range(val_num_beta):
+                    if f"val_error_exact_beta_{i}" in val_dict:
+                        log_dict[f"val_error_exact_beta_{i}"] = val_dict[
+                            f"val_error_exact_beta_{i}"
+                        ]
+                        log_dict[f"val_error_exact_beta_{i}_signlog"] = (
+                            sign_log_transform(val_dict[f"val_error_exact_beta_{i}"])
                         )
-                    if f'val_exact_logz_beta_{i}' in val_dict:
-                        log_dict[f'val_exact_logz_beta_{i}'] = val_dict[f'val_exact_logz_beta_{i}']
+                    if f"val_exact_logz_beta_{i}" in val_dict:
+                        log_dict[f"val_exact_logz_beta_{i}"] = val_dict[
+                            f"val_exact_logz_beta_{i}"
+                        ]
 
                 # Add mean absolute error across all betas
-                errors = [val_dict[f'val_error_exact_beta_{i}'] for i in range(self.model.num_beta)]
-                log_dict['val_error_exact_mean'] = sum(errors) / len(errors)
-                log_dict['val_error_exact_abs_mean'] = sum(abs(e) for e in errors) / len(errors)
-                log_dict['val_error_exact_abs_mean_signlog'] = sign_log_transform(log_dict['val_error_exact_abs_mean'])
+                errors = [
+                    val_dict[f"val_error_exact_beta_{i}"] for i in range(val_num_beta)
+                ]
+                log_dict["val_error_exact_mean"] = sum(errors) / len(errors)
+                log_dict["val_error_exact_abs_mean"] = sum(
+                    abs(e) for e in errors
+                ) / len(errors)
+                log_dict["val_error_exact_abs_mean_signlog"] = sign_log_transform(
+                    log_dict["val_error_exact_abs_mean"]
+                )
 
             if epoch >= 10:
                 log_dict["predicted_final_loss"] = predict_final_loss(
@@ -411,7 +432,9 @@ class Trainer:
             wandb.log(log_dict)
             if epoch % 10 == 0 or epoch == epochs - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
-                print(f"epoch: {epoch}, train_loss: {train_loss:.4e}, val_loss: {val_loss:.4e}, lr: {lr:.4e}")
+                print(
+                    f"epoch: {epoch}, train_loss: {train_loss:.4e}, val_loss: {val_loss:.4e}, lr: {lr:.4e}"
+                )
 
         return val_loss
 

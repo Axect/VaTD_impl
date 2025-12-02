@@ -1,5 +1,6 @@
 import numpy as np
 
+
 def energy(x):
     """
     x: 2D numpy array of spins

@@ -1,9 +1,11 @@
 """
 Test integration of DiscretePixelCNN with Ising energy function
 """
+
 import torch
 from model import DiscretePixelCNN
 from main import create_ising_energy_fn
+
 
 def test_discrete_pixelcnn_init():
     """Test if DiscretePixelCNN initializes properly"""
@@ -32,6 +34,7 @@ def test_discrete_pixelcnn_init():
 
     return model
 
+
 def test_sampling(model):
     """Test if sampling works"""
     print("\nTesting sampling...")
@@ -47,6 +50,7 @@ def test_sampling(model):
 
     return samples
 
+
 def test_log_prob(model, samples):
     """Test if log_prob works"""
     print("\nTesting log_prob...")
@@ -58,6 +62,7 @@ def test_log_prob(model, samples):
     print(f"  - Log prob values: {log_prob.squeeze()}")
 
     return log_prob
+
 
 def test_energy_function():
     """Test if Ising energy function works"""
@@ -79,6 +84,7 @@ def test_energy_function():
     print(f"  - All spins down energy: {energy[1].item()}")
 
     return energy_fn
+
 
 def test_loss_calculation(model, energy_fn):
     """Test if loss calculation works (mimicking Trainer)"""
@@ -107,10 +113,11 @@ def test_loss_calculation(model, energy_fn):
     print(f"  - Loss values: {loss.squeeze()}")
     print(f"  - Mean loss: {loss.mean().item()}")
 
+
 def main():
-    print("="*60)
+    print("=" * 60)
     print("DiscretePixelCNN + Ising Integration Test")
-    print("="*60)
+    print("=" * 60)
 
     try:
         # Test model initialization
@@ -128,15 +135,17 @@ def main():
         # Test loss calculation
         test_loss_calculation(model, energy_fn)
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("All tests passed! ✓")
-        print("="*60)
+        print("=" * 60)
 
     except Exception as e:
         print(f"\n✗ Test failed with error:")
         print(f"  {type(e).__name__}: {e}")
         import traceback
+
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()

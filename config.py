@@ -68,7 +68,12 @@ class RunConfig:
 
         # For DiscretePixelCNN, only include key architecture parameters to keep name short
         if "DiscretePixelCNN" in self.net:
-            key_params = ["size", "hidden_channels", "hidden_conv_layers", "hidden_width"]
+            key_params = [
+                "size",
+                "hidden_channels",
+                "hidden_conv_layers",
+                "hidden_width",
+            ]
             for k in key_params:
                 if k in self.net_config:
                     v = self.net_config[k]

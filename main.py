@@ -19,7 +19,7 @@ def create_adjacency_matrix(L, d=2):
     Returns:
         adjacency matrix of shape (L^d, L^d)
     """
-    N_site = L ** d
+    N_site = L**d
     Adj = np.zeros((N_site, N_site), dtype=np.float32)
 
     def index2coord(idx, L, d):
@@ -49,7 +49,7 @@ def create_adjacency_matrix(L, d=2):
     return Adj
 
 
-def create_ising_energy_fn(L, d=2, device='cpu'):
+def create_ising_energy_fn(L, d=2, device="cpu"):
     """
     Create Ising energy function for a d-dimensional lattice.
 
@@ -63,7 +63,9 @@ def create_ising_energy_fn(L, d=2, device='cpu'):
     """
     # Create adjacency matrix and convert to torch
     Adj = create_adjacency_matrix(L, d)
-    N = torch.from_numpy(Adj).float().to(device) * -1  # multiply by -1 like VanillaIsing
+    N = (
+        torch.from_numpy(Adj).float().to(device) * -1
+    )  # multiply by -1 like VanillaIsing
 
     def energy_fn(samples):
         """
@@ -120,26 +122,42 @@ def main():
     from vatd_exact_partition import logZ as exact_logZ, CRITICAL_TEMPERATURE
     from util import generate_fixed_betas
 
-    # Get model config for beta range
-    model_config_dict = base_config.gen_config().get("model_config", {})
-    beta_min = model_config_dict.get("beta_min", 0.1)
-    beta_max = model_config_dict.get("beta_max", 2.0)
-    num_beta = model_config_dict.get("num_beta", 8)
+    # Get model config for training beta range (from config)
+    config = base_config.gen_config()
+    net_config = config.get("net_config", {})
+    train_beta_min = net_config.get("beta_min", 0.2)
+    train_beta_max = net_config.get("beta_max", 1.0)
+    num_beta = net_config.get("num_beta", 8)
 
-    # Generate fixed validation betas (same ones used in validation)
-    fixed_val_betas = generate_fixed_betas(beta_min, beta_max, num_beta)
+    # Fixed validation beta range (for extrapolation testing)
+    # Validation uses wider range than training to test generalization
+    val_beta_min = 0.1
+    val_beta_max = 2.0
+    val_num_beta = 8
+
+    # Generate fixed validation betas (wider range for extrapolation)
+    fixed_val_betas = generate_fixed_betas(val_beta_min, val_beta_max, val_num_beta)
 
     # Compute exact logZ for each validation beta
-    print(f"\nComputing exact partition function for {num_beta} validation temperatures...")
-    print(f"Beta range: [{beta_min:.3f}, {beta_max:.3f}]")
-    print(f"Critical temperature: Tc = {CRITICAL_TEMPERATURE:.6f} (βc = {1.0/CRITICAL_TEMPERATURE:.6f})")
+    print(
+        f"\nComputing exact partition function for {val_num_beta} validation temperatures..."
+    )
+    print(f"Training beta range: [{train_beta_min:.3f}, {train_beta_max:.3f}]")
+    print(
+        f"Validation beta range: [{val_beta_min:.3f}, {val_beta_max:.3f}] (wider for extrapolation)"
+    )
+    print(
+        f"Critical temperature: Tc = {CRITICAL_TEMPERATURE:.6f} (βc = {1.0/CRITICAL_TEMPERATURE:.6f})"
+    )
 
     exact_logz_values = []
     for i, beta in enumerate(fixed_val_betas):
         exact_logz = exact_logZ(n=L, j=1.0, beta=beta.item())
         exact_logz_values.append(exact_logz.item())
         T = 1.0 / beta.item()
-        print(f"  β_{i} = {beta.item():.4f} (T = {T:.4f}): log Z = {exact_logz.item():.6f}")
+        print(
+            f"  β_{i} = {beta.item():.4f} (T = {T:.4f}): log Z = {exact_logz.item():.6f}"
+        )
 
     # Attach to energy_fn as attributes (for trainer access)
     energy_fn.exact_logz_values = exact_logz_values
@@ -167,15 +185,11 @@ def main():
 
             trial.set_user_attr("group_name", group_name)
 
-            return run(
-                run_config, energy_fn, group_name, trial=trial, pruner=pruner
-            )
+            return run(run_config, energy_fn, group_name, trial=trial, pruner=pruner)
 
         study = optimize_config.create_study(project=f"{base_config.project}_Opt")
         study.optimize(
-            lambda trial: objective(
-                trial, base_config, optimize_config, energy_fn
-            ),
+            lambda trial: objective(trial, base_config, optimize_config, energy_fn),
             n_trials=optimize_config.trials,
         )
 
