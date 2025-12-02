@@ -15,9 +15,6 @@ import math
 from math import pi
 
 
-BATCH_SIZE = 512
-
-
 def generate_fixed_betas(beta_min, beta_max, num_beta):
     """
     Generate log-spaced beta values for fixed validation.
