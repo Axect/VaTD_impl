@@ -17,7 +17,8 @@ from main import create_ising_energy_fn
 from vatd_exact_partition import logZ as exact_logZ, CRITICAL_TEMPERATURE
 
 
-def test_model_ising(model, energy_fn, L, device='cpu', num_temps=20, batch_size=500):
+def test_model_ising(model, energy_fn, L, device='cpu', num_temps=20, batch_size=500,
+                     T_min=None, T_max=None):
     """
     Evaluate trained model at multiple temperatures.
 
@@ -28,6 +29,8 @@ def test_model_ising(model, energy_fn, L, device='cpu', num_temps=20, batch_size
         device: Device to run on
         num_temps: Number of temperature points to test
         batch_size: Samples per temperature
+        T_min: Minimum temperature (default: 0.7*Tc)
+        T_max: Maximum temperature (default: 1.3*Tc)
 
     Returns:
         pandas.DataFrame with columns:
@@ -42,9 +45,12 @@ def test_model_ising(model, energy_fn, L, device='cpu', num_temps=20, batch_size
             - logz_error: model_logz - exact_logz
             - abs_error: Absolute log Z error
     """
-    # Temperature range: 0.7*Tc to 1.3*Tc
-    T_min = 0.7 * CRITICAL_TEMPERATURE
-    T_max = 1.3 * CRITICAL_TEMPERATURE
+    # Temperature range
+    if T_min is None:
+        T_min = 0.7 * CRITICAL_TEMPERATURE
+    if T_max is None:
+        T_max = 1.3 * CRITICAL_TEMPERATURE
+
     T_values = np.linspace(T_min, T_max, num_temps)
 
     results = []
@@ -93,7 +99,7 @@ def test_model_ising(model, energy_fn, L, device='cpu', num_temps=20, batch_size
     return pd.DataFrame(results)
 
 
-def plot_model_vs_exact(df, output_dir='figs'):
+def plot_model_vs_exact(df, output_dir='figs', title_suffix='', filename='model_test_analysis.png'):
     """
     Generate comprehensive plots comparing model vs exact values.
 
@@ -105,6 +111,8 @@ def plot_model_vs_exact(df, output_dir='figs'):
     Args:
         df: DataFrame with test results
         output_dir: Directory to save plots (default: 'figs')
+        title_suffix: Suffix to add to plot titles (e.g., '(Critical Range)')
+        filename: Output filename (default: 'model_test_analysis.png')
     """
     Path(output_dir).mkdir(exist_ok=True)
 
@@ -121,7 +129,7 @@ def plot_model_vs_exact(df, output_dir='figs'):
     ax.set_ylabel('log Z')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_title('Log Partition Function: Model vs Exact')
+    ax.set_title(f'Log Partition Function: Model vs Exact{title_suffix}')
 
     # Plot 2: Log Z Error vs Temperature
     ax = axes[0, 1]
@@ -133,7 +141,7 @@ def plot_model_vs_exact(df, output_dir='figs'):
     ax.set_ylabel('Error (Model - Exact)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_title('Log Z Error vs Temperature')
+    ax.set_title(f'Log Z Error vs Temperature{title_suffix}')
 
     # Row 2: Loss Comparison
     # Plot 3: Model Loss vs Exact Loss
@@ -146,7 +154,7 @@ def plot_model_vs_exact(df, output_dir='figs'):
     ax.set_ylabel('Loss')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_title('Loss: Model vs Exact')
+    ax.set_title(f'Loss: Model vs Exact{title_suffix}')
 
     # Plot 4: Loss Error vs Temperature
     ax = axes[1, 1]
@@ -158,7 +166,7 @@ def plot_model_vs_exact(df, output_dir='figs'):
     ax.set_ylabel('Error (Model - Exact)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_title('Loss Error vs Temperature')
+    ax.set_title(f'Loss Error vs Temperature{title_suffix}')
 
     # Row 3: Additional Metrics
     # Plot 5: Absolute Error (log scale)
@@ -170,7 +178,7 @@ def plot_model_vs_exact(df, output_dir='figs'):
     ax.set_ylabel('|Log Z Error| (log scale)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_title('Absolute Error (log scale)')
+    ax.set_title(f'Absolute Error{title_suffix}')
 
     # Plot 6: Error vs Reduced Temperature (T/Tc)
     ax = axes[2, 1]
@@ -181,10 +189,10 @@ def plot_model_vs_exact(df, output_dir='figs'):
     ax.set_ylabel('Log Z Error (Model - Exact)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_title('Error vs Reduced Temperature')
+    ax.set_title(f'Error vs Reduced Temperature{title_suffix}')
 
     plt.tight_layout()
-    output_path = f'{output_dir}/model_test_analysis.png'
+    output_path = f'{output_dir}/{filename}'
     plt.savefig(output_path, dpi=150)
     plt.close()
 
@@ -222,51 +230,119 @@ def main():
     energy_fn = create_ising_energy_fn(L=L, d=2, device=device)
     console.print(f"Critical temperature: {CRITICAL_TEMPERATURE:.4f}")
 
-    # Test model
-    console.print("\n[bold]Testing model at multiple temperatures...[/bold]")
-    df = test_model_ising(
+    # Get validation temperature range from model config
+    model_config = config.gen_config().get("model_config", {})
+    beta_min = model_config.get("beta_min", 0.1)
+    beta_max = model_config.get("beta_max", 2.0)
+    T_val_max = 1.0 / beta_min  # Higher temperature
+    T_val_min = 1.0 / beta_max  # Lower temperature
+    console.print(f"Validation range: T = [{T_val_min:.4f}, {T_val_max:.4f}] (β = [{beta_min:.4f}, {beta_max:.4f}])")
+
+    # ========================================
+    # Test 1: Critical Temperature Range
+    # ========================================
+    console.print("\n[bold cyan]Test 1: Critical Temperature Range (0.7*Tc to 1.3*Tc)[/bold cyan]")
+    df_critical = test_model_ising(
         model, energy_fn, L,
         device=device,
         num_temps=20,
         batch_size=500
     )
 
-    # Display results
+    # Display results for critical range
     console.print("\n" + "="*70)
-    console.print("MODEL TESTING RESULTS")
+    console.print("CRITICAL RANGE RESULTS")
     console.print("="*70)
-    console.print(df.to_string(index=False))
+    console.print(df_critical.to_string(index=False))
     console.print("="*70)
 
-    # Summary statistics
-    idx_min_error = df['abs_error'].idxmin()
-    idx_max_error = df['abs_error'].idxmax()
+    # Summary statistics for critical range
+    idx_min_error = df_critical['abs_error'].idxmin()
+    idx_max_error = df_critical['abs_error'].idxmax()
 
     console.print(f"\n[bold green]Best accuracy:[/bold green]")
-    console.print(f"  T = {df.loc[idx_min_error, 'T']:.4f} (T/Tc = {df.loc[idx_min_error, 'T/Tc']:.3f})")
-    console.print(f"  |Error| = {df.loc[idx_min_error, 'abs_error']:.6f}")
+    console.print(f"  T = {df_critical.loc[idx_min_error, 'T']:.4f} (T/Tc = {df_critical.loc[idx_min_error, 'T/Tc']:.3f})")
+    console.print(f"  |Error| = {df_critical.loc[idx_min_error, 'abs_error']:.6f}")
 
     console.print(f"\n[bold red]Worst accuracy:[/bold red]")
-    console.print(f"  T = {df.loc[idx_max_error, 'T']:.4f} (T/Tc = {df.loc[idx_max_error, 'T/Tc']:.3f})")
-    console.print(f"  |Error| = {df.loc[idx_max_error, 'abs_error']:.6f}")
+    console.print(f"  T = {df_critical.loc[idx_max_error, 'T']:.4f} (T/Tc = {df_critical.loc[idx_max_error, 'T/Tc']:.3f})")
+    console.print(f"  |Error| = {df_critical.loc[idx_max_error, 'abs_error']:.6f}")
 
     # Error at critical temperature
-    idx_critical = (df['T'] - CRITICAL_TEMPERATURE).abs().idxmin()
+    idx_critical_temp = (df_critical['T'] - CRITICAL_TEMPERATURE).abs().idxmin()
     console.print(f"\n[bold yellow]At critical temperature Tc = {CRITICAL_TEMPERATURE:.4f}:[/bold yellow]")
-    console.print(f"  T = {df.loc[idx_critical, 'T']:.4f}")
-    console.print(f"  Log Z Error = {df.loc[idx_critical, 'logz_error']:.6f}")
-    console.print(f"  |Error| = {df.loc[idx_critical, 'abs_error']:.6f}")
+    console.print(f"  T = {df_critical.loc[idx_critical_temp, 'T']:.4f}")
+    console.print(f"  Log Z Error = {df_critical.loc[idx_critical_temp, 'logz_error']:.6f}")
+    console.print(f"  |Error| = {df_critical.loc[idx_critical_temp, 'abs_error']:.6f}")
 
-    # Generate plots
-    console.print("\n[bold]Generating plots...[/bold]")
-    plot_path = plot_model_vs_exact(df)
-    console.print(f"[green]✓[/green] Saved plot to {plot_path}")
+    # Generate plots for critical range
+    console.print("\n[bold]Generating plots for critical range...[/bold]")
+    plot_path_critical = plot_model_vs_exact(
+        df_critical,
+        title_suffix=' (Critical Range)',
+        filename='model_test_critical.png'
+    )
+    console.print(f"[green]✓[/green] Saved plot to {plot_path_critical}")
 
-    # Save results
+    # Save results for critical range
     output_dir = f'runs/{project}/{group_name}'
-    output_file = f'{output_dir}/test_results_{seed}.csv'
-    df.to_csv(output_file, index=False)
-    console.print(f"[green]✓[/green] Saved results to {output_file}")
+    output_file_critical = f'{output_dir}/test_results_critical_{seed}.csv'
+    df_critical.to_csv(output_file_critical, index=False)
+    console.print(f"[green]✓[/green] Saved results to {output_file_critical}")
+
+    # ========================================
+    # Test 2: Validation Range
+    # ========================================
+    console.print("\n[bold cyan]Test 2: Validation Range[/bold cyan]")
+    df_validation = test_model_ising(
+        model, energy_fn, L,
+        device=device,
+        num_temps=20,
+        batch_size=500,
+        T_min=T_val_min,
+        T_max=T_val_max
+    )
+
+    # Display results for validation range
+    console.print("\n" + "="*70)
+    console.print("VALIDATION RANGE RESULTS")
+    console.print("="*70)
+    console.print(df_validation.to_string(index=False))
+    console.print("="*70)
+
+    # Summary statistics for validation range
+    idx_min_error_val = df_validation['abs_error'].idxmin()
+    idx_max_error_val = df_validation['abs_error'].idxmax()
+
+    console.print(f"\n[bold green]Best accuracy:[/bold green]")
+    console.print(f"  T = {df_validation.loc[idx_min_error_val, 'T']:.4f} (T/Tc = {df_validation.loc[idx_min_error_val, 'T/Tc']:.3f})")
+    console.print(f"  |Error| = {df_validation.loc[idx_min_error_val, 'abs_error']:.6f}")
+
+    console.print(f"\n[bold red]Worst accuracy:[/bold red]")
+    console.print(f"  T = {df_validation.loc[idx_max_error_val, 'T']:.4f} (T/Tc = {df_validation.loc[idx_max_error_val, 'T/Tc']:.3f})")
+    console.print(f"  |Error| = {df_validation.loc[idx_max_error_val, 'abs_error']:.6f}")
+
+    # Error at critical temperature (if in range)
+    if T_val_min <= CRITICAL_TEMPERATURE <= T_val_max:
+        idx_critical_temp_val = (df_validation['T'] - CRITICAL_TEMPERATURE).abs().idxmin()
+        console.print(f"\n[bold yellow]At critical temperature Tc = {CRITICAL_TEMPERATURE:.4f}:[/bold yellow]")
+        console.print(f"  T = {df_validation.loc[idx_critical_temp_val, 'T']:.4f}")
+        console.print(f"  Log Z Error = {df_validation.loc[idx_critical_temp_val, 'logz_error']:.6f}")
+        console.print(f"  |Error| = {df_validation.loc[idx_critical_temp_val, 'abs_error']:.6f}")
+
+    # Generate plots for validation range
+    console.print("\n[bold]Generating plots for validation range...[/bold]")
+    plot_path_validation = plot_model_vs_exact(
+        df_validation,
+        title_suffix=' (Validation Range)',
+        filename='model_test_validation.png'
+    )
+    console.print(f"[green]✓[/green] Saved plot to {plot_path_validation}")
+
+    # Save results for validation range
+    output_file_validation = f'{output_dir}/test_results_validation_{seed}.csv'
+    df_validation.to_csv(output_file_validation, index=False)
+    console.print(f"[green]✓[/green] Saved results to {output_file_validation}")
 
 
 if __name__ == "__main__":
