@@ -240,10 +240,9 @@ class Trainer:
         loss_view = loss_raw.view(num_beta, batch_size)
         log_prob_view = log_prob.view(num_beta, batch_size)
 
-        # Detach reward and baseline to avoid leaking gradients through the score
-        loss_view_detached = loss_view.detach()
-        baselines = loss_view_detached.mean(dim=1, keepdim=True)
-        advantage = loss_view_detached - baselines
+        # Detach only the baseline to avoid bias while keeping reward gradients
+        baselines = loss_view.mean(dim=1, keepdim=True).detach()
+        advantage = loss_view - baselines
 
         self.optimizer.zero_grad()
         loss_REINFORCE = torch.mean(advantage * log_prob_view)
