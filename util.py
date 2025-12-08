@@ -237,7 +237,7 @@ class Trainer:
 
         energy = energy_fn(samples_for_energy)
         beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
-        loss_raw = (log_prob + beta * energy) / beta
+        loss_raw = log_prob + beta * energy
 
         # Normalize by number of pixels/spins
         num_pixels = samples.shape[-2] * samples.shape[-1]
