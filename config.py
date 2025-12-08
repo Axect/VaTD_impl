@@ -13,6 +13,29 @@ class EarlyStoppingConfig:
 
 
 @dataclass
+class GumbelConfig:
+    """Configuration for Gumbel-Softmax training."""
+    use_gumbel: bool = False
+    initial_temperature: float = 1.0
+    final_temperature: float = 0.1
+    anneal_epochs: int | None = None  # If None, anneal throughout all epochs
+    hard: bool = True
+
+    def get_temperature(self, epoch, total_epochs):
+        """Compute temperature for current epoch with exponential annealing."""
+        anneal_epochs = self.anneal_epochs if self.anneal_epochs else total_epochs
+        if epoch >= anneal_epochs:
+            return self.final_temperature
+
+        # Exponential decay: tau = tau_0 * (tau_final/tau_0)^(t/T)
+        ratio = epoch / anneal_epochs
+        temperature = self.initial_temperature * (
+            (self.final_temperature / self.initial_temperature) ** ratio
+        )
+        return temperature
+
+
+@dataclass
 class RunConfig:
     project: str
     device: str
@@ -28,11 +51,18 @@ class RunConfig:
     early_stopping_config: EarlyStoppingConfig = field(
         default_factory=lambda: EarlyStoppingConfig()
     )
+    gumbel_config: GumbelConfig = field(
+        default_factory=lambda: GumbelConfig()
+    )
 
     def __post_init__(self):
         if isinstance(self.early_stopping_config, dict):
             self.early_stopping_config = EarlyStoppingConfig(
                 **self.early_stopping_config
+            )
+        if isinstance(self.gumbel_config, dict):
+            self.gumbel_config = GumbelConfig(
+                **self.gumbel_config
             )
 
     @classmethod

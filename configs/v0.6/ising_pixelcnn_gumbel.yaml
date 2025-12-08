@@ -1,0 +1,49 @@
+project: Ising_VaTD_v0.6_Gumbel
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 200
+batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16      # 16x16 Ising lattice
+  fix_first: 1  # Fix first spin to break symmetry (1 = spin up)
+
+  # Temperature sampling configuration
+  batch_size: 256  # Samples per temperature
+  num_beta: 8     # Number of temperature samples per batch
+  beta_min: 0.2   # 1/T_max (T_max = 5)
+  beta_max: 1.0   # 1/T_min (T_min = 1)
+
+  # Model architecture
+  kernel_size: 7        # First masked conv kernel size
+  hidden_channels: 64   # Hidden channels in residual blocks
+  hidden_conv_layers: 5 # Number of residual conv blocks
+  hidden_kernel_size: 3 # Kernel size in residual blocks
+  hidden_width: 128     # Width of FC layers
+  hidden_fc_layers: 2   # Number of FC layers
+
+optimizer_config:
+  lr: 1.e-1  # Learning rate
+  eps: 1.e-10
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 150
+  infimum_lr: 1.e-5
+
+early_stopping_config:
+  enabled: false
+  patience: 50
+  mode: min
+  min_delta: 0.0001
+
+gumbel_config:
+  use_gumbel: true              # Enable Gumbel-Softmax gradient estimation
+  initial_temperature: 1.0      # Starting temperature (tau_0)
+  final_temperature: 0.1        # Final temperature (tau_final)
+  anneal_epochs: null           # Anneal throughout all epochs (null = use total epochs)
+  hard: true                    # Use straight-through estimator (discrete forward, soft backward)

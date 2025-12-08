@@ -362,3 +362,129 @@ class DiscretePixelCNN(nn.Module):
         log_prob_sum = einops.reduce(log_prob_selected, "b c hw -> b 1", "sum")
 
         return log_prob_sum
+
+    def sample_gumbel_softmax(self, batch_size=None, T=None, temperature=1.0, hard=True):
+        """
+        Sample using Gumbel-Softmax (continuous relaxation of discrete sampling).
+
+        This enables gradient flow through sampling via reparameterization trick.
+
+        Args:
+            batch_size (int): Number of samples to generate
+            T (torch.Tensor): Temperature values for conditional generation
+            temperature (float): Gumbel-Softmax temperature (tau)
+                - Lower temperature → closer to discrete (more deterministic)
+                - Higher temperature → more uniform (more stochastic)
+                - Typically annealed from 1.0 to 0.1 during training
+            hard (bool): If True, use straight-through estimator
+                - Forward pass: discrete (one-hot)
+                - Backward pass: continuous (soft probabilities)
+
+        Returns:
+            torch.Tensor: Samples in {-1, +1} space with shape (B, C, H, W)
+                If hard=False, returns soft samples (weighted average)
+                If hard=True, returns hard samples but with soft gradients
+        """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+
+        # Initialize with zeros (will be filled sequentially)
+        sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(
+            self.device
+        )
+
+        # Temperature conditioning
+        if T is not None:
+            T = T.to(self.device)
+            if T.dim() == 1:
+                T = T.unsqueeze(1)
+
+            T_expanded = einops.repeat(
+                T, "b c -> b c h w", h=self.size[0], w=self.size[1]
+            )
+            sample = torch.cat([sample, T_expanded], dim=1)
+
+        # Sequential sampling with Gumbel-Softmax
+        for i in range(self.size[0]):
+            for j in range(self.size[1]):
+                # Fix first element if needed
+                if self.fix_first is not None and i == 0 and j == 0:
+                    if T is not None:
+                        sample[:, : self.channel, 0, 0] = self.fix_first
+                    else:
+                        sample[:, :, 0, 0] = self.fix_first
+                    continue
+
+                # Get logits: (B, Cat, C, H, W)
+                logits = self.masked_conv.forward(sample)
+
+                for k in range(self.channel):
+                    # Extract logits for current position: (B, Cat)
+                    logits_ijk = logits[:, :, k, i, j]
+
+                    # Sample Gumbel noise
+                    gumbel_noise = -torch.log(-torch.log(
+                        torch.rand_like(logits_ijk) + 1e-20
+                    ) + 1e-20)
+
+                    # Gumbel-Softmax: (B, Cat)
+                    y_soft = F.softmax((logits_ijk + gumbel_noise) / temperature, dim=1)
+
+                    if hard:
+                        # Straight-through estimator
+                        # Forward: one-hot (discrete)
+                        y_hard_indices = y_soft.argmax(dim=1)
+                        y_hard = F.one_hot(y_hard_indices, num_classes=self.category).float()
+
+                        # Backward: soft probabilities
+                        # This gradient trick allows gradients to flow through discrete sampling
+                        y = y_hard - y_soft.detach() + y_soft
+                    else:
+                        # Pure soft (continuous relaxation)
+                        y = y_soft
+
+                    # Convert from one-hot/soft to scalar value
+                    # For hard mode: effectively argmax
+                    # For soft mode: weighted average (0 * p(0) + 1 * p(1))
+                    if hard:
+                        sample[:, k, i, j] = y_hard_indices.float()
+                    else:
+                        # Weighted sum: E[value] = sum_c (c * p(c))
+                        values = torch.arange(self.category, device=self.device).float()
+                        sample[:, k, i, j] = (y * values.unsqueeze(0)).sum(dim=1)
+
+        # Remove temperature channel if present
+        if T is not None:
+            sample = sample[:, : self.channel, :, :]
+
+        # Map {0,1} to {-1,1}
+        sample = self.mapping(sample)
+
+        return sample
+
+    def get_logits(self, sample, T=None):
+        """
+        Get logits for given samples (helper method for Gumbel-Softmax training).
+
+        Args:
+            sample (torch.Tensor): Samples in {-1, +1} space
+            T (torch.Tensor): Temperature values
+
+        Returns:
+            torch.Tensor: Logits with shape (B, Cat, C, H, W)
+        """
+        # Map {-1,1} to {0,1}
+        sample = self.reverse_mapping(sample)
+
+        if T is not None:
+            T = T.to(self.device)
+            if T.dim() == 1:
+                T = T.unsqueeze(1)
+
+            T_expanded = einops.repeat(
+                T, "b c -> b c h w", h=sample.shape[2], w=sample.shape[3]
+            )
+            sample = torch.cat([sample, T_expanded], dim=1)
+
+        logits = self.masked_conv.forward(sample)  # (B, Cat, C, H, W)
+
+        return logits
