@@ -441,7 +441,11 @@ class Trainer:
                 if self.pruner.should_prune():
                     raise optuna.TrialPruned()
 
-            self.scheduler.step()
+            # ReduceLROnPlateau requires metrics, other schedulers don't
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                self.scheduler.step(val_loss)
+            else:
+                self.scheduler.step()
             wandb.log(log_dict)
             if epoch % 10 == 0 or epoch == epochs - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
