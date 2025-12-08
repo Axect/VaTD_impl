@@ -739,12 +739,13 @@ class RealNVP(nn.Module):
 
         # Correction on sign:
         # log_det_tanh variable above computes 2 log cosh.
-        # We want to compute: log q(x) = log q(x_pre) + log |det(dx/dx_pre)|
-        # log |det(dx/dx_pre)| = log(sech^2) = -2 log cosh
-        # So we SUBTRACT log_det_tanh (which is 2 log cosh).
+        # We want to compute: log p(x) = log p(x_pre) + log |dx_pre/dx|
+        # dx_pre/dx = 1/sech^2 = cosh^2
+        # log |dx_pre/dx| = 2 log cosh = log_det_tanh
+        # So we ADD log_det_tanh.
 
-        # FIXED: Changed from + to -
-        log_prob_x = log_prob_z + log_det_flow - log_det_tanh
+        # FIXED: Changed from - to + (correcting previous error)
+        log_prob_x = log_prob_z + log_det_flow + log_det_tanh
 
         x = torch.tanh(x_pre)
 
