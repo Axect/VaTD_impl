@@ -237,7 +237,7 @@ class Trainer:
 
         energy = energy_fn(samples_for_energy)
         beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
-        loss_raw = log_prob + beta * energy
+        loss_raw = (log_prob + beta * energy) / beta
         loss_view = loss_raw.view(num_beta, batch_size)
         log_prob_view = log_prob.view(num_beta, batch_size)
 
