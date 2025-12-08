@@ -190,6 +190,12 @@ class Trainer:
             self.early_stopping = None
 
     def step(self, batch_size, T):
+        # Optimized step for models that can compute sample and log_prob together
+        # This is crucial for flow models to avoid numerical instability of inverse(tanh)
+        if hasattr(self.model, "sample_and_log_prob"):
+             log_prob, samples = self.model.sample_and_log_prob(batch_size=batch_size, T=T)
+             return log_prob, samples
+
         # Allow differentiable sampling for flow-based models (e.g., RealNVP)
         use_no_grad = not getattr(self.model, "differentiable_sampling", False)
         with torch.no_grad() if use_no_grad else contextlib.nullcontext():

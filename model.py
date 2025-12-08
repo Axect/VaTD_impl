@@ -482,8 +482,10 @@ class AffineCouplingLayer(nn.Module):
             y_b = (x_b - t) * torch.exp(-s)
             y_a = x_a
 
-            # Inverse doesn't strictly need log_det for sampling,
-            # but we keep consistency if needed.
+            # We calculate the log determinant of the FORWARD transformation (dz/dx)
+            # even during the inverse pass, because we need it for log_prob calculation
+            # in sample_and_log_prob.
+            log_det = log_det + torch.sum(s, dim=[1, 2, 3])
 
         return torch.cat([y_a, y_b], dim=1), log_det
 
@@ -646,9 +648,113 @@ class RealNVP(nn.Module):
         # FIXED: Return (B, 1) tensor instead of scalar
         return log_prob_x.unsqueeze(-1)
 
+    def sample_and_log_prob(self, batch_size=None, T=None):
+        """
+        Efficiently computes both sample and log_prob.
+        Avoids the numerical instability of atanh(tanh(x)) at boundaries.
+        """
+        bs = batch_size if batch_size is not None else self.batch_size
+
+        # Latent shape must match the squeezed shape
+        h_s, w_s = self.size[0] // 2, self.size[1] // 2
+        c_s = self.channel * 4
+
+        # Sample z from Gaussian Prior
+        z = self.prior.rsample((bs, c_s, h_s, w_s)).to(self.device)
+
+        T_cond = self._prepare_conditional(T, h_s, w_s)
+
+        # Inverse flow: z -> x_pre (unbounded)
+        # We need to track log_det during inverse flow as well
+        # Note: The existing layers return log_det for forward pass.
+        # For inverse pass, log_det_inverse = -log_det_forward.
+        # But we need to compute it.
+        
+        # Our AffineCouplingLayer calculates log_det += sum(s) in forward.
+        # In inverse: y_b = (x_b - t) * exp(-s).
+        # Jacobian is exp(-s). Log det is -sum(s).
+        # So we can just accumulate sum(s) and subtract it.
+        
+        log_det_flow = 0
+        
+        # Inverse flow: iterate backwards
+        for layer in reversed(self.layers):
+            z = z[:, self.inv_perm_indices, :, :]
+            # We need to modify layer to return log_det in reverse mode?
+            # Or just access s?
+            # The current implementation of AffineCouplingLayer.forward:
+            # if reverse: return ... (doesn't return log_det)
+            
+            # We need to fix AffineCouplingLayer to return log_det in reverse too
+            # Or manually compute it here. 
+            # But 's' is internal to layer.
+            
+            # Let's assume I update AffineCouplingLayer to return log_det in reverse mode.
+            z, log_det_layer = layer(z, 0, T_cond=T_cond, reverse=True)
+            log_det_flow += log_det_layer
+
+        # Undo squeeze to get original image size
+        x_pre = self.undo_squeeze(z)
+
+        # log_prob calculation
+        # log q(x) = log p(z) - log |det J_flow| - log |det J_tanh|
+        # J_flow: dz/dx_pre. 
+        # We computed z -> x_pre. The accumulated log_det_flow is log |det dx_pre/dz|.
+        # So log |det dz/dx_pre| = -log_det_flow.
+        
+        # Wait, let's verify sign.
+        # Forward (x->z): log_det += sum(s). log q(x) = log p(z) + sum(s).
+        # Inverse (z->x): x = z * e^{-s}. dx/dz = e^{-s}. log det = -s.
+        # log q(x) = log p(z) - log |dx/dz| = log p(z) - (-s) = log p(z) + s.
+        # So we need the sum(s).
+        # If 'log_det_flow' accumulates sum(s) (magnitude of scaling), 
+        # then log_prob = log p(z) + log_det_flow.
+        
+        # log p(z)
+        log_prob_z = torch.sum(
+            -0.5 * (z**2) - 0.5 * torch.tensor(2 * torch.pi).log(),
+            dim=[1, 2, 3],
+        )
+        
+        # log |det J_tanh|
+        # x = tanh(x_pre). dx/dx_pre = 1 - x^2 = sech^2(x_pre).
+        # log |dx/dx_pre| = log(sech^2 x_pre) = -2 log cosh x_pre.
+        # We need to subtract this from log density of x_pre.
+        # log q(x) = log q(x_pre) - log |dx/dx_pre|
+        #          = (log p(z) + log_det_flow) - (-2 log cosh x_pre)
+        #          = log p(z) + log_det_flow + 2 log cosh x_pre.
+        
+        # 2 log cosh(x) = 2 * (x + softplus(-2x) - log(2))
+        # Stable implementation:
+        log_det_tanh = 2 * (x_pre - torch.log(torch.tensor(2.0)) + F.softplus(-2 * x_pre))
+        log_det_tanh = log_det_tanh.sum(dim=[1, 2, 3])
+        
+        log_prob_x = log_prob_z + log_det_flow - log_det_tanh
+        
+        # Note: Previous reasoning:
+        # log q(x) = log p(x_pre) - log |det tanh'|
+        # log |det tanh'| = log(sech^2) = -2 log cosh.
+        # - log |det tanh'| = + 2 log cosh.
+        # So we ADD 2 log cosh.
+        
+        # Correction on sign:
+        # log_det_tanh variable above computes 2 log cosh.
+        # So we should ADD it?
+        # Let's check: x_pre=0. tanh'=1. log det=0. 2 log cosh=0.
+        # x_pre=inf. tanh'=0. log det=-inf. -log det=+inf.
+        # 2 log cosh = inf.
+        # So yes, we ADD log_det_tanh.
+        
+        log_prob_x = log_prob_z + log_det_flow + log_det_tanh
+        
+        x = torch.tanh(x_pre)
+        
+        return log_prob_x.unsqueeze(-1), x
+
     def sample(self, batch_size=None, T=None):
         """
         Goes from Latent (z) -> Data (x).
+        Used for Generation. O(1) complexity.
         Used for Generation. O(1) complexity.
 
         Returns continuous values near {-1, 1} using tanh activation.
