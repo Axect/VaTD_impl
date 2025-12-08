@@ -39,15 +39,17 @@ def evaluate_at_reference_temps(model, energy_fn, L, device="cpu", batch_size=50
             energy = energy_fn(samples)
 
             beta_tensor = torch.tensor([beta], device=device).unsqueeze(-1)
-            loss_raw = log_prob + beta_tensor * energy
+            num_pixels = L * L
+            loss_raw = (log_prob + beta_tensor * energy) / num_pixels
             loss = loss_raw.mean().item()
 
             # Compute exact
-            exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item()
+            exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item() / num_pixels
             exact_loss = -exact_logz
 
             # Normalized loss (like reference: loss / (L*L*0.45))
-            normalized_loss = loss / (L * L * 0.45)
+            # Since loss is now per-pixel, we just divide by 0.45
+            normalized_loss = loss / 0.45
 
             # Error
             error = loss - exact_loss

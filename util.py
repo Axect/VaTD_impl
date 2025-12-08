@@ -238,6 +238,11 @@ class Trainer:
         energy = energy_fn(samples_for_energy)
         beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
         loss_raw = (log_prob + beta * energy) / beta
+
+        # Normalize by number of pixels/spins
+        num_pixels = samples.shape[-2] * samples.shape[-1]
+        loss_raw = loss_raw / num_pixels
+
         loss_view = loss_raw.view(num_beta, batch_size)
         log_prob_view = log_prob.view(num_beta, batch_size)
 
@@ -323,6 +328,10 @@ class Trainer:
             beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
             loss_raw = log_prob + beta * energy
 
+            # Normalize by number of pixels/spins
+            num_pixels = samples.shape[-2] * samples.shape[-1]
+            loss_raw = loss_raw / num_pixels
+
             # Reshape to separate beta dimensions: (num_beta, batch_size)
             loss_view = loss_raw.view(num_beta, batch_size)
 
@@ -342,13 +351,15 @@ class Trainer:
                 for i in range(num_beta):
                     # Exact log partition function (negative of exact loss)
                     exact_logz = self.exact_logz_values[i]
-                    # Model loss approximates: -log Z + beta * <E>
-                    # At equilibrium, this should equal -log Z
-                    # Error = model_loss - (-exact_logz) = model_loss + exact_logz
+                    # Normalize exact logz to per-pixel
+                    exact_logz_per_pixel = exact_logz / num_pixels
+                    
+                    # Model loss approximates: -log Z/N
+                    # Error = model_loss - (-exact_logz/N) = model_loss + exact_logz/N
                     model_loss = val_dict[f"val_loss_beta_{i}"]
-                    error_vs_exact = model_loss + exact_logz
+                    error_vs_exact = model_loss + exact_logz_per_pixel
                     val_dict[f"val_error_exact_beta_{i}"] = error_vs_exact
-                    val_dict[f"val_exact_logz_beta_{i}"] = exact_logz
+                    val_dict[f"val_exact_logz_beta_{i}"] = exact_logz_per_pixel
 
         return val_dict
 
