@@ -1,0 +1,37 @@
+project: Ising_VaTD_v0.6_Glow
+device: cuda:0
+net: model.Glow
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 10
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+
+  # Temperature sampling configuration
+  batch_size: 256
+  num_beta: 8
+  beta_min: 0.2
+  beta_max: 1.0
+
+  # Flow architecture
+  hidden_channels: 64
+  num_flow_layers: 6 # Number of steps in the flow
+
+optimizer_config:
+  lr: 1.e-3
+  eps: 1.e-10
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 150
+  infimum_lr: 1.e-5
+
+early_stopping_config:
+  enabled: false
+  patience: 50
+  mode: min
+  min_delta: 0.0001

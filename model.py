@@ -2,6 +2,24 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import einops
+import numpy as np
+
+# Try importing nflows
+try:
+    import nflows.flows.base
+    import nflows.distributions.normal
+    import nflows.transforms.base
+    import nflows.transforms.conv
+    import nflows.transforms.normalization
+    import nflows.transforms.coupling
+    import nflows.transforms.reshape
+    import nflows.transforms.nonlinearities
+    import nflows.transforms.permutations
+    import nflows.nn.nets
+    
+    NFLOWS_AVAILABLE = True
+except ImportError:
+    NFLOWS_AVAILABLE = False
 
 
 class MaskedConv2D(nn.Conv2d):
@@ -789,3 +807,162 @@ class RealNVP(nn.Module):
         # Return continuous soft output with gradients
         # tanh keeps values in (-1, 1) range suitable for Ising spins
         return torch.tanh(x)
+
+
+# ============================================================================
+# Glow (using nflows) Implementation
+# ============================================================================
+
+
+class ContextualConvNet(nn.Module):
+    def __init__(self, in_channels, out_channels, hidden_channels, context_channels=0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels + context_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, 1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, out_channels, 3, padding=1)
+        )
+        self.context_channels = context_channels
+        
+        # Initialize last layer with zeros for identity initialization of flow
+        self.net[-1].weight.data.zero_()
+        self.net[-1].bias.data.zero_()
+
+    def forward(self, inputs, context=None):
+        if self.context_channels > 0:
+            # Broadcast context (B, C_ctx) to (B, C_ctx, H, W)
+            # context from nflows might be (B, C_ctx).
+            if context.dim() == 2:
+                context = context.unsqueeze(-1).unsqueeze(-1)
+                context = context.expand(-1, -1, inputs.shape[2], inputs.shape[3])
+            # If context is already (B, C_ctx, H, W), use as is
+            
+            x = torch.cat([inputs, context], dim=1)
+        else:
+            x = inputs
+        return self.net(x)
+
+
+class Glow(nn.Module):
+    """
+    Glow-like model implemented using nflows library.
+    Features:
+    - ActNorm
+    - Invertible 1x1 Conv
+    - Affine Coupling Layer
+    - Squeeze/Unsqueeze (for single scale)
+    - Tanh output (mapped from unbounded space)
+    """
+    def __init__(self, hparams, device="cpu"):
+        super().__init__()
+        if not NFLOWS_AVAILABLE:
+            raise ImportError("nflows library is not installed. Please install it to use Glow.")
+            
+        self.hparams = hparams
+        self.device = device
+        self.channel = 1
+        self.size = hparams.get("size", 16)
+        if isinstance(self.size, int):
+            self.size = (self.size, self.size)
+        
+        self.batch_size = hparams.get("batch_size", 64)
+        self.beta_min = hparams.get("beta_min", 0.2)
+        self.beta_max = hparams.get("beta_max", 1.0)
+        self.num_beta = hparams.get("num_beta", 8)
+        self.augment_channels = 1 # T
+        self.differentiable_sampling = True
+
+        hidden_channels = hparams.get("hidden_channels", 64)
+        num_flow_layers = hparams.get("num_flow_layers", 6)
+        
+        # Base distribution shape (after squeeze)
+        # Squeeze 1x16x16 -> 4x8x8
+        c, h, w = self.channel * 4, self.size[0] // 2, self.size[1] // 2
+        
+        # Define the transforms
+        transforms = []
+        
+        # 1. Transform bounded data (-1, 1) to unbounded space using Inverse Tanh
+        # Note: nflows Tanh forward is x -> tanh(x).
+        # We want Data -> Latent direction for forward.
+        # Data is in (-1, 1). We need atanh(x) to get to unbounded space.
+        # So we use InverseTransform(Tanh()).
+        transforms.append(nflows.transforms.base.InverseTransform(nflows.transforms.nonlinearities.Tanh()))
+        
+        # 2. Squeeze 1x16x16 -> 4x8x8
+        transforms.append(nflows.transforms.reshape.SqueezeTransform())
+        
+        # 3. Flow Steps
+        for _ in range(num_flow_layers):
+            # ActNorm
+            transforms.append(nflows.transforms.normalization.ActNorm(c))
+            
+            # Invertible 1x1 Convolution
+            transforms.append(nflows.transforms.conv.OneByOneConvolution(c))
+            
+            # Affine Coupling
+            def create_net(in_channels, out_channels):
+                return ContextualConvNet(
+                    in_channels, 
+                    out_channels, 
+                    hidden_channels, 
+                    context_channels=self.augment_channels
+                )
+            
+            # Checkboard-like masking on channels
+            # We have 4 channels. 
+            # We can use alternating pattern.
+            mask = torch.ones((c, h, w))
+            mask[1::2, :, :] = 0 # Even channels identity, odd channels transform
+            
+            transforms.append(nflows.transforms.coupling.AffineCouplingTransform(
+                mask=mask,
+                transform_net_create_fn=create_net
+            ))
+            
+        self.transform = nflows.transforms.base.CompositeTransform(transforms)
+        self.distribution = nflows.distributions.normal.StandardNormal([c, h, w])
+        self.flow = nflows.flows.base.Flow(self.transform, self.distribution)
+
+    def to(self, *args, **kwargs):
+        self = super().to(*args, **kwargs)
+        if args and isinstance(args[0], (torch.device, str)):
+            self.device = args[0]
+        elif 'device' in kwargs:
+            self.device = kwargs['device']
+        return self
+
+    def _prepare_context(self, T, batch_size):
+        # T: (B) or (B, 1)
+        if T.dim() == 1:
+            T = T.unsqueeze(1)
+        return T # (B, 1) - The ConvNet will expand it.
+        
+    def log_prob(self, x, T=None):
+        # x: (B, 1, H, W) in (-1, 1) (approx)
+        # Stability: clamp x to avoid atanh explosion
+        eps = 1e-6
+        x = torch.clamp(x, -1 + eps, 1 - eps)
+        
+        # T: (B) or (B, 1)
+        context = self._prepare_context(T, x.shape[0]) if T is not None else None
+        
+        # nflows log_prob returns (B,)
+        lp = self.flow.log_prob(x, context=context)
+        return lp.unsqueeze(-1) # (B, 1)
+
+    def sample(self, batch_size=None, T=None):
+        bs = batch_size if batch_size is not None else self.batch_size
+        context = self._prepare_context(T, bs) if T is not None else None
+        
+        samples = self.flow.sample(bs, context=context)
+        return samples
+
+    def sample_and_log_prob(self, batch_size=None, T=None):
+        bs = batch_size if batch_size is not None else self.batch_size
+        context = self._prepare_context(T, bs) if T is not None else None
+        
+        samples, log_prob = self.flow.sample_and_log_prob(bs, context=context)
+        return log_prob.unsqueeze(-1), samples
