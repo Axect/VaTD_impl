@@ -260,7 +260,8 @@ class Trainer:
 
             # Advantage must be detached to act as fixed reward signal
             # This prevents double-counting gradients of log_prob
-            advantage = (loss_view - baselines).detach()
+            #advantage = (loss_view - baselines).detach()
+            advantage = (loss_view - baselines)
 
             loss_REINFORCE = torch.mean(advantage * log_prob_view)
             loss_REINFORCE.backward()
