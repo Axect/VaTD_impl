@@ -1,4 +1,4 @@
-study_name: TPE_Glow
+study_name: TPE
 trials: 100
 seed: 42
 metric: val_loss
@@ -19,23 +19,36 @@ pruner:
 
 search_space:
   net_config:
-    # Glow architecture parameters
+    # Model architecture parameters
+    kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9]
     hidden_channels:
       type: categorical
       choices: [32, 64, 96, 128]
-    num_flow_layers:
+    hidden_conv_layers:
       type: int
-      min: 4
-      max: 12
+      min: 3
+      max: 6
+    hidden_kernel_size:
+      type: categorical
+      choices: [3, 5, 7]
+    hidden_width:
+      type: categorical
+      choices: [128, 256, 512]
+    hidden_fc_layers:
+      type: int
+      min: 1
+      max: 3
   optimizer_config:
     lr:
       type: float
-      min: 1.e-4
-      max: 1.e-1
+      min: 5.e-2
+      max: 1.e+1
       log: true
   scheduler_config:
     infimum_lr:
       type: float
       min: 1.e-7
-      max: 1.e-4
+      max: 1.e-3
       log: true
