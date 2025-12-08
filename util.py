@@ -315,11 +315,11 @@ class Trainer:
         ):
             self.optimizer.train()
 
-        # Step 1: Sample discrete configurations (no gradient for sampling)
+        # Step 1: Sample discrete configurations
         with torch.no_grad():
             samples_discrete = self.model.sample(batch_size=total_size, T=T_expanded)
 
-        # Compute log_prob WITH gradient tracking for entropy term
+        # Compute log_prob with gradient for entropy term (REINFORCE)
         log_prob = self.model.log_prob(samples_discrete, T=T_expanded)
 
         # Step 2: Get logits for the discrete samples (with gradient tracking)
@@ -394,17 +394,17 @@ class Trainer:
         # Hybrid gradient computation:
         # Free Energy: F = E_q[log q(x) + β·E(x)]
         #
-        # Part 1: log q(x) term - Direct gradient (differentiable)
-        # Since log_prob is computed with gradient tracking, we can backprop directly
-        # This estimates ∇_θ E_q[log q] via the score function
+        # Part 1: Entropy term - REINFORCE gradient
+        # ∇_θ E_q[log q(x)] computed via score function with gradient
         log_prob_loss = torch.mean(log_prob_view)
 
-        # Part 2: β·E(x) term - Direct gradient (through Gumbel-Softmax)
-        # Energy is computed from soft samples, so gradient flows through Gumbel-Softmax
+        # Part 2: Energy term - Gumbel-Softmax gradient (lower variance)
+        # Direct gradient through soft samples
         beta_energy = beta_expanded_view * energy_view
         energy_loss = torch.mean(beta_energy)
 
-        # Total loss
+        # Combined loss
+        # Note: Both terms contribute gradients now, preventing vanishing gradients at low beta
         total_loss = log_prob_loss + energy_loss
         total_loss.backward()
 
