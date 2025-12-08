@@ -596,12 +596,24 @@ class RealNVP(nn.Module):
         NOTE: RealNVP generates continuous distributions directly, so no dequantization needed.
         The input x should be continuous values from the model's own sample() method.
         """
-        # No dequantization - x is already continuous from sample()
+        # Inverse of the final tanh in sample()
+        # x is in (-1, 1). We need to apply atanh to map it back to (-inf, inf)
+        # and account for the Jacobian determinant change.
+
+        # Stability: clip x to (-1 + eps, 1 - eps)
+        eps = 1e-6
+        x = torch.clamp(x, -1 + eps, 1 - eps)
+
+        # Log-determinant adjustment for atanh
+        # log |det dy/dx| = - sum(log(1 - x^2))
+        delta_log_det = -torch.sum(torch.log(1 - x**2), dim=[1, 2, 3])
+
+        x = torch.atanh(x)
 
         # Squeeze spatial dims to channels
         x = self.squeeze(x)
 
-        log_det_sum = 0
+        log_det_sum = delta_log_det
         b, c, h, w = x.shape
         T_cond = self._prepare_conditional(T, h, w)
 
