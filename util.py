@@ -12,7 +12,6 @@ from config import RunConfig
 import random
 import os
 import math
-import contextlib
 
 
 def generate_fixed_betas(beta_min, beta_max, num_beta):
@@ -190,15 +189,8 @@ class Trainer:
             self.early_stopping = None
 
     def step(self, batch_size, T):
-        # Optimized step for models that can compute sample and log_prob together
-        # This is crucial for flow models to avoid numerical instability of inverse(tanh)
-        if hasattr(self.model, "sample_and_log_prob"):
-             log_prob, samples = self.model.sample_and_log_prob(batch_size=batch_size, T=T)
-             return log_prob, samples
-
-        # Allow differentiable sampling for flow-based models (e.g., RealNVP)
-        use_no_grad = not getattr(self.model, "differentiable_sampling", False)
-        with torch.no_grad() if use_no_grad else contextlib.nullcontext():
+        # Sample from PixelCNN (no gradient tracking needed for sampling)
+        with torch.no_grad():
             samples = self.model.sample(batch_size=batch_size, T=T)
         log_prob = self.model.log_prob(samples, T=T)
         return log_prob, samples
@@ -227,58 +219,45 @@ class Trainer:
 
         log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
 
-        # Straight-Through Estimator for flow-based models (RealNVP)
-        # Forward: use discrete spins for energy calculation
-        # Backward: gradients flow through continuous samples
-        if getattr(self.model, "differentiable_sampling", False):
-            # RealNVP outputs continuous values in (-1, 1)
-            # Discretize for energy but keep gradient path
-            samples_discrete = torch.sign(samples)
-            samples_discrete[samples_discrete == 0] = 1  # handle rare zero case
-            # Straight-through: forward uses discrete, backward uses continuous
-            samples_for_energy = samples_discrete.detach() + samples - samples.detach()
-        else:
-            # PixelCNN already outputs discrete samples
-            samples_for_energy = samples
-
-        energy = energy_fn(samples_for_energy)
-        beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
-        loss_raw = log_prob + beta * energy
+        # PixelCNN outputs discrete samples
+        energy = energy_fn(samples)
 
         # Normalize by number of pixels/spins
         num_pixels = samples.shape[-2] * samples.shape[-1]
-        loss_raw = loss_raw / num_pixels
 
-        loss_view = loss_raw.view(num_beta, batch_size)
+        # Reshape for per-beta computation
         log_prob_view = log_prob.view(num_beta, batch_size)
+        energy_view = energy.view(num_beta, batch_size) / num_pixels
+        beta_expanded = (1.0 / T_expanded).view(num_beta, batch_size)
 
         self.optimizer.zero_grad()
 
-        # Branching for Differentiable (Reparameterization) vs Non-Differentiable (REINFORCE)
-        if getattr(self.model, "differentiable_sampling", False):
-            # Reparameterization Trick (Pathwise Derivative)
-            # Directly minimize Free Energy: L = E[ log q + beta * E ]
-            # This has much lower variance than REINFORCE for differentiable models (e.g. RealNVP)
-            loss = loss_raw.mean()
-            loss.backward()
-            train_loss = loss.item()
-        else:
-            # REINFORCE (Score Function Estimator)
-            # Gradient: E[ (log q + beta * E - baseline) * grad(log q) ]
+        # Separate gradient computation:
+        # Free Energy: F = E_q[log q(x|T) + β·E(x)]
+        #
+        # Part 1: log q term - direct gradient (differentiable)
+        # ∇_θ E_q[log q] can be computed directly since q depends on θ
+        log_prob_loss = torch.mean(log_prob_view)
 
-            # Baseline for variance reduction (mean per beta)
-            baselines = loss_view.mean(dim=1, keepdim=True).detach()
+        # Part 2: β·E term - REINFORCE (score function estimator)
+        # ∇_θ E_q[β·E] = E_q[∇_θ log q · β·E] since E is independent of θ
+        beta_energy = beta_expanded * energy_view
 
-            # Advantage must be detached to act as fixed reward signal
-            # This prevents double-counting gradients of log_prob
-            #advantage = (loss_view - baselines).detach()
-            advantage = (loss_view - baselines)
+        # Baseline for variance reduction (mean per beta)
+        baseline_energy = beta_energy.mean(dim=1, keepdim=True).detach()
 
-            loss_REINFORCE = torch.mean(advantage * log_prob_view)
-            loss_REINFORCE.backward()
+        # Advantage MUST be detached to act as fixed reward signal
+        advantage = (beta_energy - baseline_energy).detach()
 
-            # Log the actual Free Energy, not the surrogate loss, to be consistent with val_loss
-            train_loss = loss_view.mean().item()
+        # REINFORCE gradient for energy term
+        energy_reinforce_loss = torch.mean(advantage * log_prob_view)
+
+        # Total loss (combines both gradient estimates)
+        total_loss = log_prob_loss + energy_reinforce_loss
+        total_loss.backward()
+
+        # Log the actual Free Energy (not the surrogate loss)
+        train_loss = (log_prob_view + beta_expanded * energy_view).mean().item()
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -321,16 +300,8 @@ class Trainer:
         with torch.no_grad():
             log_prob, samples = self.step(batch_size=total_size, T=T_expanded)
 
-            # Discretize samples for energy calculation if needed
-            if getattr(self.model, "differentiable_sampling", False):
-                # RealNVP outputs continuous values, discretize for energy
-                samples_discrete = torch.sign(samples)
-                samples_discrete[samples_discrete == 0] = 1
-                samples_for_energy = samples_discrete
-            else:
-                samples_for_energy = samples
-
-            energy = energy_fn(samples_for_energy)
+            # PixelCNN outputs discrete samples
+            energy = energy_fn(samples)
             beta = (1.0 / T_expanded).unsqueeze(-1)  # (total_size, 1)
             loss_raw = log_prob + beta * energy
 
