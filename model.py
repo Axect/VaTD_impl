@@ -844,6 +844,67 @@ class ContextualConvNet(nn.Module):
             x = inputs
         return self.net(x)
 
+if NFLOWS_AVAILABLE:
+    class ImageAffineCouplingTransform(nflows.transforms.base.Transform):
+        def __init__(self, channels, hidden_channels, context_channels=0):
+            super().__init__()
+            self.channels = channels
+            self.split_len = channels // 2
+            
+            self.transform_net = ContextualConvNet(
+                in_channels=self.split_len,
+                out_channels=(channels - self.split_len) * 2,
+                hidden_channels=hidden_channels,
+                context_channels=context_channels
+            )
+
+        def forward(self, inputs, context=None):
+            # inputs: (B, C, H, W)
+            # Split
+            input_a = inputs[:, :self.split_len, :, :]
+            input_b = inputs[:, self.split_len:, :, :]
+            
+            # Predict parameters (s, t) from input_a
+            # returns (B, C_b * 2, H, W)
+            h = self.transform_net(input_a, context)
+            s, t = h.chunk(2, dim=1)
+            
+            # Scale s (tanh usually good for stability)
+            # nflows implementation often uses sigmoid or linear, 
+            # here we use tanh as in RealNVP implementation for consistency
+            s = torch.tanh(s)
+            
+            # Affine Transform: y_b = x_b * exp(s) + t
+            output_b = input_b * torch.exp(s) + t
+            output_a = input_a # Identity
+            
+            outputs = torch.cat([output_a, output_b], dim=1)
+            
+            # Log Det: sum(s)
+            logabsdet = torch.sum(s, dim=[1, 2, 3])
+            
+            return outputs, logabsdet
+
+        def inverse(self, inputs, context=None):
+            # inputs: (B, C, H, W)
+            input_a = inputs[:, :self.split_len, :, :]
+            input_b = inputs[:, self.split_len:, :, :]
+            
+            h = self.transform_net(input_a, context)
+            s, t = h.chunk(2, dim=1)
+            s = torch.tanh(s)
+            
+            # Inverse Affine: x_b = (y_b - t) * exp(-s)
+            output_b = (input_b - t) * torch.exp(-s)
+            output_a = input_a
+            
+            outputs = torch.cat([output_a, output_b], dim=1)
+            
+            # Log Det: -sum(s)
+            logabsdet = -torch.sum(s, dim=[1, 2, 3])
+            
+            return outputs, logabsdet
+
 
 class Glow(nn.Module):
     """
@@ -851,7 +912,7 @@ class Glow(nn.Module):
     Features:
     - ActNorm
     - Invertible 1x1 Conv
-    - Affine Coupling Layer
+    - Affine Coupling Layer (Custom Image-compatible)
     - Squeeze/Unsqueeze (for single scale)
     - Tanh output (mapped from unbounded space)
     """
@@ -902,24 +963,11 @@ class Glow(nn.Module):
             # Invertible 1x1 Convolution
             transforms.append(nflows.transforms.conv.OneByOneConvolution(c))
             
-            # Affine Coupling
-            def create_net(in_channels, out_channels):
-                return ContextualConvNet(
-                    in_channels, 
-                    out_channels, 
-                    hidden_channels, 
-                    context_channels=self.augment_channels
-                )
-            
-            # Checkboard-like masking on channels
-            # We have 4 channels. 
-            # We can use alternating pattern.
-            mask = torch.ones((c, h, w))
-            mask[1::2, :, :] = 0 # Even channels identity, odd channels transform
-            
-            transforms.append(nflows.transforms.coupling.AffineCouplingTransform(
-                mask=mask,
-                transform_net_create_fn=create_net
+            # Image Affine Coupling (Using standard split)
+            transforms.append(ImageAffineCouplingTransform(
+                channels=c,
+                hidden_channels=hidden_channels,
+                context_channels=self.augment_channels
             ))
             
         self.transform = nflows.transforms.base.CompositeTransform(transforms)
