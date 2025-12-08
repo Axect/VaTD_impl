@@ -1,15 +1,16 @@
-project: Ising_VaTD_v0.3_NF
+project: Ising_VaTD_v0.3
 device: cuda:0
-net: model.RealNVP
+net: model.DiscretePixelCNN
 optimizer: splus.SPlus
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 10
-batch_size: 512  # Not used for RealNVP, but required by RunConfig
+batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
 seeds: [42]
 
 net_config:
   # Lattice configuration
   size: 16      # 16x16 Ising lattice
+  fix_first: 1  # Fix first spin to break symmetry (1 = spin up)
 
   # Temperature sampling configuration
   batch_size: 256  # Samples per temperature
@@ -17,10 +18,13 @@ net_config:
   beta_min: 0.2   # 1/T_max (T_max = 5)
   beta_max: 1.0   # 1/T_min (T_min = 1)
 
-  # Flow architecture
-  hidden_channels: 64      # Hidden channels in coupling layers
-  hidden_conv_layers: 4    # Number of ResBlocks in s/t networks
-  num_flow_layers: 6       # Number of affine coupling layers
+  # Model architecture
+  kernel_size: 7        # First masked conv kernel size
+  hidden_channels: 64   # Hidden channels in residual blocks
+  hidden_conv_layers: 5 # Number of residual conv blocks
+  hidden_kernel_size: 3 # Kernel size in residual blocks
+  hidden_width: 128     # Width of FC layers
+  hidden_fc_layers: 2   # Number of FC layers
 
 optimizer_config:
   lr: 1.e-1  # Learning rate

@@ -1,4 +1,4 @@
-project: Ising_VaTD_v0.3_NF
+project: Ising_VaTD_v0.5_NF
 device: cuda:0
 net: model.RealNVP
 optimizer: splus.SPlus
