@@ -5,6 +5,7 @@ import beaupy
 from rich.console import Console
 import wandb
 import optuna
+from tqdm import tqdm
 
 from config import RunConfig
 
@@ -130,7 +131,7 @@ def predict_final_loss(losses, max_epochs):
             return predicted_loss
 
     except Exception as e:
-        print(f"Error in loss prediction: {e}")
+        tqdm.write(f"Error in loss prediction: {e}")
 
     return -np.log10(losses[-1])
 
@@ -354,7 +355,7 @@ class Trainer:
         val_loss = 0
         val_losses = []
 
-        for epoch in range(epochs):
+        for epoch in tqdm(range(epochs), desc="Overall Progress"):
             train_loss = self.train_epoch(energy_fn)
             val_dict = self.val_epoch(energy_fn)
             val_loss = val_dict["val_loss"]
@@ -362,14 +363,14 @@ class Trainer:
 
             # Early stopping if loss becomes NaN
             if math.isnan(train_loss) or math.isnan(val_loss):
-                print("Early stopping due to NaN loss")
+                tqdm.write("Early stopping due to NaN loss")
                 val_loss = math.inf
                 break
 
             # Early stopping check
             if self.early_stopping is not None:
                 if self.early_stopping(val_loss):
-                    print(f"Early stopping triggered at epoch {epoch}")
+                    tqdm.write(f"Early stopping triggered at epoch {epoch}")
                     break
 
             log_dict = {
@@ -443,7 +444,7 @@ class Trainer:
             wandb.log(log_dict)
             if epoch % 10 == 0 or epoch == epochs - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
-                print(
+                tqdm.write(
                     f"epoch: {epoch}, train_loss: {train_loss:.4e}, val_loss: {val_loss:.4e}, lr: {lr:.4e}"
                 )
 
@@ -518,7 +519,7 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
         wandb.finish()
         raise
     except Exception as e:
-        print(f"Runtime error during training: {e}")
+        tqdm.write(f"Runtime error during training: {e}")
         wandb.finish()
         raise optuna.TrialPruned()
     finally:
