@@ -446,43 +446,25 @@ class Trainer:
             T=T_expanded
         )
 
-        # DEBUG: Check continuous samples
-        if torch.any(samples_continuous.abs() > 10.0):
-            print(f"WARNING: Extreme continuous samples! Max: {samples_continuous.abs().max().item():.2e}")
-            print(f"  Range: [{samples_continuous.min().item():.2e}, {samples_continuous.max().item():.2e}]")
-
         # Discrete samples (for energy computation validation)
         samples_discrete = self.model.dequantizer.quantize(samples_continuous)
 
         # Compute log probability
         log_prob = self.model.log_prob(samples_continuous, T=T_expanded)
 
-        # DEBUG: Check log_prob
-        if torch.any(log_prob.abs() > 1000.0):
-            print(f"WARNING: Extreme log_prob! Range: [{log_prob.min().item():.2e}, {log_prob.max().item():.2e}]")
-
         # Compute energy on continuous samples for gradient flow
-        # Ising energy E = (s^T A s)/2 is bilinear, so it works with continuous values
-        # This allows gradients to flow through the flow model
-        energy = energy_fn(samples_continuous)
+        # Ising energy E = (s^T A s)/2 is bilinear.
+        # CRITICAL FIX: We must bound the samples to (-1, 1) before computing energy
+        # because the Ising Hamiltonian is unbounded for large continuous values.
+        # Without tanh, the energy term pushes samples to infinity to minimize E.
+        # tanh provides a soft relaxation of the spin constraint.
+        energy = energy_fn(torch.tanh(samples_continuous))
 
         beta = (1.0 / T_expanded).view(-1, 1)
-
-        # DEBUG: Check energies
-        if torch.any(energy.abs() > 1000.0):
-            print(f"WARNING: Extreme energy! Range: [{energy.min().item():.2e}, {energy.max().item():.2e}]")
 
         # Free energy loss: F = E_p[log p(x) + β·E(x)]
         # This minimizes the variational free energy
         loss = (log_prob + beta * energy).mean()
-
-        # DEBUG: Check final loss
-        if torch.isnan(loss) or torch.isinf(loss) or loss.abs() > 1e10:
-            print(f"CRITICAL: Loss explosion detected! loss = {loss.item():.2e}")
-            print(f"  log_prob: mean={log_prob.mean().item():.2e}, std={log_prob.std().item():.2e}")
-            print(f"  beta: mean={beta.mean().item():.2e}, max={beta.max().item():.2e}")
-            print(f"  energy_for_grad: mean={energy_for_grad.mean().item():.2e}, max={energy_for_grad.max().item():.2e}")
-            print(f"  beta * energy: mean={(beta * energy_for_grad).mean().item():.2e}, max={(beta * energy_for_grad).max().item():.2e}")
 
         self.optimizer.zero_grad()
         loss.backward()
