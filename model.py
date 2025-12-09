@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import einops
 import numpy as np
+from typing import Tuple
 
 
 
@@ -216,6 +217,621 @@ class MaskedResConv2D(nn.Module):
         x = self.final_fc(x)
 
         return x.reshape(size[0], self.category, self.channel, size[-2], size[-1])
+
+
+# ============================================================================
+# Normalizing Flow Components for VaTD
+# ============================================================================
+
+
+def create_checkerboard_mask(H: int, W: int, parity: int = 0) -> torch.Tensor:
+    """
+    2D 격자에 대한 checkerboard 마스크 생성.
+
+    Args:
+        H: 격자 높이
+        W: 격자 너비
+        parity: 0이면 (i+j)가 짝수인 위치, 1이면 홀수인 위치 선택
+
+    Returns:
+        Boolean 텐서 (H*W,) - True인 위치가 transform될 위치
+
+    Example (4x4, parity=0):
+        [[T, F, T, F],
+         [F, T, F, T],
+         [T, F, T, F],
+         [F, T, F, T]]
+    """
+    i = torch.arange(H).view(-1, 1).expand(H, W)
+    j = torch.arange(W).view(1, -1).expand(H, W)
+    mask = ((i + j) % 2 == parity).flatten()
+    return mask
+
+
+class Dequantizer:
+    """
+    Discrete {-1, +1} 스핀과 continuous 값 사이의 변환 처리.
+
+    Training: discrete 값에 uniform noise 추가
+    Inference: continuous 값을 threshold하여 discrete로 변환
+
+    Attributes:
+        noise_scale: dequantization noise 크기 (delta)
+    """
+
+    def __init__(self, noise_scale: float = 0.05):
+        """
+        Args:
+            noise_scale: noise 범위 [-delta, delta]의 delta 값
+        """
+        self.noise_scale = noise_scale
+
+    def dequantize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Training용: discrete 값에 uniform noise 추가.
+
+        Args:
+            x: {-1, +1} 값을 가진 discrete 텐서
+
+        Returns:
+            대략 [-1-delta, 1+delta] 범위의 continuous 텐서
+        """
+        noise = torch.empty_like(x).uniform_(-self.noise_scale, self.noise_scale)
+        return x + noise
+
+    def quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Inference용: continuous 값을 discrete로 변환.
+
+        Args:
+            x: Continuous 텐서
+
+        Returns:
+            {-1, +1} 값을 가진 discrete 텐서
+        """
+        return torch.sign(x).clamp(-1, 1)  # sign(0) = 0 처리
+
+
+class TemperatureConditioner(nn.Module):
+    """
+    FiLM (Feature-wise Linear Modulation) style temperature conditioning.
+
+    Takes temperature T as input and outputs scale (gamma) and shift (beta)
+    parameters for feature modulation in coupling networks.
+
+    Attributes:
+        net: MLP network that maps T -> (gamma, beta)
+    """
+
+    def __init__(self, hidden_dim: int, output_dim: int):
+        """
+        Args:
+            hidden_dim: Hidden layer dimension
+            output_dim: Output dimension (= hidden_channels of coupling network)
+        """
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * output_dim)  # Output gamma and beta together
+        )
+
+    def forward(self, T: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            T: Temperature tensor of shape (B, 1)
+
+        Returns:
+            gamma: Scale parameters (B, output_dim)
+            beta: Shift parameters (B, output_dim)
+        """
+        params = self.net(T)
+        gamma, beta = params.chunk(2, dim=-1)
+        # Initialize gamma around 1, beta around 0 for stable training start
+        gamma = 1.0 + 0.1 * gamma
+        beta = 0.1 * beta
+        return gamma, beta
+
+
+class ConditionalCouplingNet(nn.Module):
+    """
+    CNN-based coupling network with FiLM temperature conditioning.
+
+    Takes masked input features and temperature, outputs affine transform
+    parameters (log_scale, shift) for the unmasked features.
+
+    Attributes:
+        temp_cond: Temperature conditioning module
+        input_proj: Input projection layer
+        hidden_layers: ResNet-style hidden layers
+        output_proj: Output projection layer
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int = 64,
+        num_hidden_layers: int = 2,
+        kernel_size: int = 3,
+        H: int = 16,
+        W: int = 16,
+    ):
+        """
+        Args:
+            hidden_channels: Number of channels in hidden layers
+            num_hidden_layers: Number of hidden layers
+            kernel_size: Convolution kernel size
+            H, W: Lattice dimensions
+        """
+        super().__init__()
+        self.H = H
+        self.W = W
+
+        # Temperature conditioning
+        self.temp_cond = TemperatureConditioner(
+            hidden_dim=hidden_channels,
+            output_dim=hidden_channels
+        )
+
+        # Initial projection: 1 channel -> hidden_channels
+        self.input_proj = nn.Conv2d(1, hidden_channels, 1)
+
+        # Hidden layers (ResNet-style)
+        self.hidden_layers = nn.ModuleList()
+        for _ in range(num_hidden_layers):
+            self.hidden_layers.append(nn.Sequential(
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size,
+                         padding=kernel_size // 2),
+                nn.SiLU(),
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size,
+                         padding=kernel_size // 2),
+            ))
+
+        # Output projection: hidden_channels -> 2 (log_scale, shift)
+        self.output_proj = nn.Conv2d(hidden_channels, 2, 1)
+
+        # Zero initialization for stable training (identity transform at start)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(
+        self,
+        x_masked: torch.Tensor,
+        T: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x_masked: Masked input (B, 1, H, W) - unmasked positions are zeroed
+            T: Temperature (B, 1)
+
+        Returns:
+            log_scale: (B, 1, H, W) log-scale parameters
+            shift: (B, 1, H, W) shift parameters
+        """
+        # Compute FiLM parameters
+        gamma, beta = self.temp_cond(T)  # (B, hidden_channels)
+        gamma = gamma.view(-1, gamma.shape[-1], 1, 1)  # (B, C, 1, 1)
+        beta = beta.view(-1, beta.shape[-1], 1, 1)
+
+        # Process input
+        h = self.input_proj(x_masked)  # (B, hidden_channels, H, W)
+
+        # Apply FiLM conditioning
+        h = gamma * h + beta
+
+        # Hidden layers with residual connections
+        for layer in self.hidden_layers:
+            h = h + layer(h)
+            h = F.silu(h)
+
+        # Output
+        params = self.output_proj(h)  # (B, 2, H, W)
+        log_scale, shift = params.chunk(2, dim=1)  # Each (B, 1, H, W)
+
+        # Constrain log_scale for numerical stability
+        log_scale = torch.tanh(log_scale) * 2.0  # Range [-2, 2]
+
+        return log_scale, shift
+
+
+class CheckerboardAffineCoupling(nn.Module):
+    """
+    Affine coupling layer with checkerboard masking for 2D lattice.
+
+    Transform: x_transform = x_transform * exp(s) + t
+    where (s, t) = net(x_frozen, T)
+
+    Attributes:
+        H, W: Lattice dimensions
+        mask: Checkerboard mask (True positions are transformed)
+        coupling_net: Network computing transform parameters
+    """
+
+    def __init__(
+        self,
+        H: int,
+        W: int,
+        parity: int,
+        hidden_channels: int = 64,
+        num_hidden_layers: int = 2,
+    ):
+        """
+        Args:
+            H, W: Lattice dimensions
+            parity: Mask parity (0 or 1)
+            hidden_channels: Hidden channels in coupling network
+            num_hidden_layers: Number of hidden layers in coupling network
+        """
+        super().__init__()
+        self.H = H
+        self.W = W
+
+        # Create and register checkerboard mask
+        self.register_buffer('mask', create_checkerboard_mask(H, W, parity))
+
+        # Coupling network
+        self.coupling_net = ConditionalCouplingNet(
+            hidden_channels=hidden_channels,
+            num_hidden_layers=num_hidden_layers,
+            H=H,
+            W=W,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward transform: z = f(x)
+
+        Args:
+            x: Input tensor (B, 1, H, W)
+            T: Temperature (B, 1)
+
+        Returns:
+            z: Transformed tensor (B, 1, H, W)
+            log_det: Log determinant of Jacobian (B,)
+        """
+        B = x.shape[0]
+        x_flat = x.view(B, -1)  # (B, H*W)
+
+        # Split by mask
+        mask_float = self.mask.float()
+        inv_mask_float = (~self.mask).float()
+
+        x_frozen = x_flat * inv_mask_float  # Frozen features
+        x_transform = x_flat * mask_float   # Features to transform
+
+        # Reshape for CNN
+        x_frozen_2d = x_frozen.view(B, 1, self.H, self.W)
+
+        # Compute transform parameters
+        log_scale, shift = self.coupling_net(x_frozen_2d, T)
+        log_scale_flat = log_scale.view(B, -1) * mask_float
+        shift_flat = shift.view(B, -1) * mask_float
+
+        # Apply affine transform
+        z_transform = x_transform * torch.exp(log_scale_flat) + shift_flat
+        z_flat = z_transform + x_frozen
+        z = z_flat.view(B, 1, self.H, self.W)
+
+        # Log determinant (sum of log_scales for transformed features)
+        log_det = log_scale_flat.sum(dim=-1)
+
+        return z, log_det
+
+    def inverse(self, z: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+        """
+        Inverse transform: x = f^{-1}(z)
+
+        Args:
+            z: Transformed tensor (B, 1, H, W)
+            T: Temperature (B, 1)
+
+        Returns:
+            x: Original tensor (B, 1, H, W)
+        """
+        B = z.shape[0]
+        z_flat = z.view(B, -1)
+
+        mask_float = self.mask.float()
+        inv_mask_float = (~self.mask).float()
+
+        z_frozen = z_flat * inv_mask_float
+        z_transform = z_flat * mask_float
+
+        z_frozen_2d = z_frozen.view(B, 1, self.H, self.W)
+        log_scale, shift = self.coupling_net(z_frozen_2d, T)
+        log_scale_flat = log_scale.view(B, -1) * mask_float
+        shift_flat = shift.view(B, -1) * mask_float
+
+        # Inverse affine transform
+        x_transform = (z_transform - shift_flat) * torch.exp(-log_scale_flat)
+        x_flat = x_transform + z_frozen
+
+        return x_flat.view(B, 1, self.H, self.W)
+
+
+class CheckerboardFlowModel(nn.Module):
+    """
+    Complete Normalizing Flow model for 2D Ising model.
+
+    Features:
+    - Checkerboard-masked affine coupling layers
+    - FiLM-style temperature conditioning
+    - Dequantization for discrete spin handling
+
+    Interface matches DiscretePixelCNN:
+    - sample(batch_size, T) -> (B, 1, H, W) in {-1, +1}
+    - log_prob(samples, T) -> (B, 1)
+
+    Attributes:
+        size: Lattice size (H, W)
+        batch_size: Batch size per temperature
+        num_beta: Number of temperature samples per batch
+        beta_min, beta_max: Inverse temperature range
+        coupling_layers: List of coupling layers
+        dequantizer: Dequantization handler
+    """
+
+    def __init__(self, hparams: dict, device: str = "cpu"):
+        """
+        Args:
+            hparams: Hyperparameter dictionary
+                - size: int or (H, W) tuple, lattice size
+                - batch_size: int, samples per temperature
+                - num_beta: int, temperature samples per batch
+                - beta_min, beta_max: float, inverse temperature range
+                - num_flow_layers: int, number of coupling layers (default: 8)
+                - hidden_channels: int, hidden channels (default: 64)
+                - num_hidden_layers: int, hidden layers in coupling net (default: 2)
+                - dequant_noise: float, dequantization noise scale (default: 0.05)
+            device: Device string
+        """
+        super().__init__()
+        self.hparams = hparams
+        self.device = device
+
+        # Lattice configuration
+        size = hparams.get("size", 16)
+        self.size = (size, size) if isinstance(size, int) else tuple(size)
+        self.H, self.W = self.size
+
+        # Training parameters (same interface as DiscretePixelCNN)
+        self.batch_size = hparams["batch_size"]
+        self.num_beta = hparams["num_beta"]
+        self.beta_min = hparams["beta_min"]
+        self.beta_max = hparams["beta_max"]
+
+        # Flow architecture parameters
+        num_flow_layers = hparams.get("num_flow_layers", 8)
+        hidden_channels = hparams.get("hidden_channels", 64)
+        num_hidden_layers = hparams.get("num_hidden_layers", 2)
+
+        # Dequantization
+        self.dequant_noise = hparams.get("dequant_noise", 0.05)
+        self.dequantizer = Dequantizer(noise_scale=self.dequant_noise)
+
+        # Build coupling layers (alternating parity)
+        self.coupling_layers = nn.ModuleList()
+        for i in range(num_flow_layers):
+            parity = i % 2  # Alternate 0, 1, 0, 1, ...
+            layer = CheckerboardAffineCoupling(
+                H=self.H,
+                W=self.W,
+                parity=parity,
+                hidden_channels=hidden_channels,
+                num_hidden_layers=num_hidden_layers,
+            )
+            self.coupling_layers.append(layer)
+
+        # Base distribution range (accounting for dequantization)
+        self.base_half_width = 1.0 + self.dequant_noise
+
+    def _get_base_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log probability under base distribution (Uniform).
+
+        Args:
+            z: Latent tensor (B, 1, H, W)
+
+        Returns:
+            Log probability (B,)
+        """
+        B = z.shape[0]
+        z_flat = z.view(B, -1)
+
+        # Uniform(-half_width, half_width)
+        half_width = self.base_half_width
+
+        # Uniform distribution log prob: log(1 / (2 * half_width)) * num_dims
+        num_dims = z_flat.shape[-1]
+        log_prob_per_dim = -torch.log(torch.tensor(2 * half_width, device=z.device))
+        log_prob = log_prob_per_dim * num_dims
+
+        # Apply penalty for out-of-bounds values (soft boundary)
+        # This is more stable than hard -inf boundaries
+        out_of_bounds_penalty = torch.relu(z_flat.abs() - half_width).pow(2).sum(dim=-1)
+        log_prob = log_prob - out_of_bounds_penalty
+
+        return log_prob
+
+    def _sample_base(self, batch_size: int) -> torch.Tensor:
+        """
+        Sample from base distribution.
+
+        Args:
+            batch_size: Number of samples
+
+        Returns:
+            Sample tensor (B, 1, H, W)
+        """
+        shape = (batch_size, 1, self.H, self.W)
+        half_width = self.base_half_width
+        return torch.empty(shape, device=self.device).uniform_(-half_width, half_width)
+
+    def _prepare_temperature(
+        self,
+        T: torch.Tensor,
+        batch_size: int
+    ) -> torch.Tensor:
+        """
+        Prepare temperature tensor for conditioning.
+
+        Args:
+            T: Temperature tensor (B,) or (B, 1) or None
+            batch_size: Batch size
+
+        Returns:
+            Prepared temperature tensor (B, 1)
+        """
+        if T is None:
+            # Default: middle of range
+            mid_T = 0.5 * (1 / self.beta_min + 1 / self.beta_max)
+            T = torch.full((batch_size, 1), mid_T, device=self.device)
+        else:
+            T = T.to(self.device)
+            if T.dim() == 1:
+                T = T.unsqueeze(1)
+        return T
+
+    def forward_flow(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass: x -> z (data space to latent space)
+
+        Args:
+            x: Input tensor (B, 1, H, W)
+            T: Temperature (B, 1)
+
+        Returns:
+            z: Latent tensor (B, 1, H, W)
+            log_det_sum: Total log determinant sum (B,)
+        """
+        z = x
+        log_det_sum = torch.zeros(x.shape[0], device=x.device)
+
+        for layer in self.coupling_layers:
+            z, log_det = layer(z, T)
+            log_det_sum = log_det_sum + log_det
+
+        return z, log_det_sum
+
+    def inverse_flow(self, z: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+        """
+        Inverse pass: z -> x (latent space to data space)
+
+        Args:
+            z: Latent tensor (B, 1, H, W)
+            T: Temperature (B, 1)
+
+        Returns:
+            x: Reconstructed data tensor (B, 1, H, W)
+        """
+        x = z
+        for layer in reversed(self.coupling_layers):
+            x = layer.inverse(x, T)
+        return x
+
+    def sample(
+        self,
+        batch_size: int = None,
+        T: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Sample discrete spin configurations.
+
+        Args:
+            batch_size: Number of samples (None uses self.batch_size)
+            T: Temperature tensor (B,) or (B, 1)
+
+        Returns:
+            Tensor of shape (B, 1, H, W) with values in {-1, +1}
+        """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        T = self._prepare_temperature(T, batch_size)
+
+        # Sample from base distribution
+        z = self._sample_base(batch_size)
+
+        # Inverse flow: z -> x (continuous)
+        x_continuous = self.inverse_flow(z, T)
+
+        # Convert to discrete
+        x_discrete = self.dequantizer.quantize(x_continuous)
+
+        return x_discrete
+
+    def sample_continuous(
+        self,
+        batch_size: int = None,
+        T: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Sample continuous values (for gradient flow during training).
+
+        Args:
+            batch_size: Number of samples
+            T: Temperature tensor
+
+        Returns:
+            Continuous tensor (B, 1, H, W)
+        """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        T = self._prepare_temperature(T, batch_size)
+
+        z = self._sample_base(batch_size)
+        x_continuous = self.inverse_flow(z, T)
+
+        return x_continuous
+
+    def log_prob(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Compute log probability of samples.
+
+        Args:
+            samples: Sample tensor (B, 1, H, W) - discrete {-1, +1} or continuous
+            T: Temperature tensor (B,) or (B, 1)
+
+        Returns:
+            Log probability (B, 1)
+        """
+        batch_size = samples.shape[0]
+        T = self._prepare_temperature(T, batch_size)
+
+        # Apply dequantization during training
+        if self.training:
+            x_dequant = self.dequantizer.dequantize(samples)
+        else:
+            # At inference, use continuous values directly
+            x_dequant = samples.float()
+
+        # Forward flow: x -> z
+        z, log_det = self.forward_flow(x_dequant, T)
+
+        # Log probability: log p(x) = log p(z) + log |det df/dx|
+        log_prob_base = self._get_base_log_prob(z)
+        log_prob = log_prob_base + log_det
+
+        return log_prob.unsqueeze(-1)  # (B, 1)
+
+    def to(self, *args, **kwargs):
+        """Override to update self.device."""
+        result = super().to(*args, **kwargs)
+        if args and isinstance(args[0], (torch.device, str)):
+            self.device = str(args[0])
+        elif 'device' in kwargs:
+            self.device = str(kwargs['device'])
+        return result
 
 
 class DiscretePixelCNN(nn.Module):

@@ -193,3 +193,4 @@ urllib3==2.5.0
     #   requests
     #   sentry-sdk
 wandb==0.21.0
+zuko>=1.0.0
