@@ -7,7 +7,7 @@ import wandb
 import optuna
 from tqdm import tqdm
 
-from config import RunConfig, GumbelConfig
+from config import RunConfig
 
 import random
 import os
@@ -147,7 +147,6 @@ class Trainer:
         seed=None,
         pruner=None,
         energy_fn=None,
-        gumbel_config=None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -156,7 +155,6 @@ class Trainer:
         self.trial = trial
         self.seed = seed
         self.pruner = pruner
-        self.gumbel_config = gumbel_config if gumbel_config else GumbelConfig()
 
         # Pre-compute fixed betas for validation (from energy_fn)
         # Validation uses fixed wider range (0.1-2.0) for extrapolation testing
@@ -264,277 +262,6 @@ class Trainer:
 
         return train_loss
 
-    def train_epoch_gumbel(self, energy_fn, temperature=1.0, hard=True):
-        """
-        Training epoch using Gumbel-Softmax for gradient estimation.
-
-        This method uses a hybrid approach:
-        1. Sample discrete configurations using regular PixelCNN sampling
-        2. Compute logits for these samples
-        3. Apply Gumbel-Softmax to create soft reconstructions with gradients
-        4. Use soft samples for energy computation (enables backprop)
-
-        This combines the benefits of:
-        - Discrete sampling for valid configurations
-        - Soft relaxation for gradient flow
-
-        Args:
-            energy_fn: Energy function to evaluate samples
-            temperature (float): Gumbel-Softmax temperature (tau)
-                - Recommended: anneal from 1.0 to 0.1
-                - Lower → closer to discrete, higher → more uniform
-            hard (bool): Use straight-through estimator
-                - True: discrete forward, soft backward (recommended)
-                - False: fully continuous (more biased)
-
-        Returns:
-            float: Training loss (Free Energy)
-        """
-        batch_size = self.model.batch_size
-        beta_min = self.model.beta_min
-        beta_max = self.model.beta_max
-        num_beta = self.model.num_beta
-
-        # Log-uniform sampling for beta
-        log_beta_samples = torch.rand(num_beta, device=self.device) * (
-            math.log(beta_max) - math.log(beta_min)
-        ) + math.log(beta_min)
-        beta_samples = torch.exp(log_beta_samples)
-        T_samples = 1.0 / beta_samples
-        T_expanded = T_samples.repeat_interleave(batch_size)
-        total_size = num_beta * batch_size
-
-        self.model.train()
-        # ScheduleFree Optimizer or SPlus
-        if any(
-            keyword in self.optimizer.__class__.__name__
-            for keyword in ["ScheduleFree", "SPlus"]
-        ):
-            self.optimizer.train()
-
-        # Step 1: Sample discrete configurations
-        with torch.no_grad():
-            samples_discrete = self.model.sample(batch_size=total_size, T=T_expanded)
-
-        # Compute log_prob with gradient for entropy term (REINFORCE)
-        log_prob = self.model.log_prob(samples_discrete, T=T_expanded)
-
-        # Step 2: Get logits for the discrete samples (with gradient tracking)
-        # Convert back to {0,1} space for model input
-        samples_01 = self.model.reverse_mapping(samples_discrete)
-
-        # Add temperature conditioning if needed
-        if T_expanded is not None:
-            T_cond = T_expanded.to(self.device)
-            if T_cond.dim() == 1:
-                T_cond = T_cond.unsqueeze(1)
-            import einops
-            T_spatial = einops.repeat(
-                T_cond, "b c -> b c h w",
-                h=samples_01.shape[2], w=samples_01.shape[3]
-            )
-            samples_input = torch.cat([samples_01, T_spatial], dim=1)
-        else:
-            samples_input = samples_01
-
-        # Get logits with gradients
-        logits = self.model.masked_conv.forward(samples_input)  # (B, Cat, C, H, W)
-
-        # Step 3: Apply Gumbel-Softmax to logits
-        # Sample Gumbel noise
-        gumbel_noise = -torch.log(-torch.log(
-            torch.rand_like(logits) + 1e-20
-        ) + 1e-20)
-
-        # Soft probabilities with temperature
-        soft_probs = F.softmax((logits + gumbel_noise) / temperature, dim=1)
-
-        if hard:
-            # Straight-through estimator
-            # Forward: use discrete samples
-            # Backward: gradients from soft_probs
-            hard_samples = F.one_hot(
-                samples_01.long(), num_classes=self.model.category
-            ).permute(0, 4, 1, 2, 3).float()  # (B, Cat, C, H, W)
-
-            # Straight-through: detach soft, add back with gradient
-            soft_samples = hard_samples - soft_probs.detach() + soft_probs
-        else:
-            # Pure soft samples
-            soft_samples = soft_probs
-
-        # Step 4: Convert soft samples to scalar values for energy computation
-        # For binary case: value = 0 * p(0) + 1 * p(1) = p(1)
-        if hard:
-            # Use discrete samples but with gradient connection to soft_probs
-            samples_01_soft = samples_01 - samples_01.detach() + soft_samples[:, 1, :, :, :]
-        else:
-            # Weighted average
-            samples_01_soft = soft_samples[:, 1, :, :, :]
-
-        # Convert to {-1, +1} space
-        samples_soft = self.model.mapping(samples_01_soft)
-
-        # Step 5: Compute energy with gradient flow
-        energy = energy_fn(samples_soft)
-
-        # Reshape for per-beta computation
-        log_prob_view = log_prob.view(num_beta, batch_size)
-        energy_view = energy.view(num_beta, batch_size)
-        beta_expanded_view = (1.0 / T_expanded).view(num_beta, batch_size)
-
-        self.optimizer.zero_grad()
-
-        # Hybrid gradient computation:
-        # Free Energy: F = E_q[log q(x) + β·E(x)]
-        #
-        # Part 1: Entropy term - REINFORCE gradient
-        # ∇_θ E_q[log q(x)] computed via score function with gradient
-        log_prob_loss = torch.mean(log_prob_view)
-
-        # Part 2: Energy term - Gumbel-Softmax gradient (lower variance)
-        # Direct gradient through soft samples
-        beta_energy = beta_expanded_view * energy_view
-        energy_loss = torch.mean(beta_energy)
-
-        # Combined loss
-        # Note: Both terms contribute gradients now, preventing vanishing gradients at low beta
-        total_loss = log_prob_loss + energy_loss
-        total_loss.backward()
-
-        # Log the actual Free Energy
-        train_loss = (log_prob_view + beta_expanded_view * energy_view).mean().item()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
-
-        return train_loss
-
-    def train_epoch_flow(self, energy_fn):
-        """
-        Training epoch for flow models.
-
-        Flow models support reparameterized sampling, so REINFORCE is not needed.
-        Gradients flow directly through sampling via the reparameterization trick.
-
-        Args:
-            energy_fn: Energy function (samples -> energy)
-
-        Returns:
-            Average loss value
-        """
-        batch_size = self.model.batch_size
-        beta_min = self.model.beta_min
-        beta_max = self.model.beta_max
-        num_beta = self.model.num_beta
-
-        # Log-uniform beta sampling
-        log_beta_samples = torch.rand(num_beta, device=self.device) * (
-            math.log(beta_max) - math.log(beta_min)
-        ) + math.log(beta_min)
-        beta_samples = torch.exp(log_beta_samples)
-        T_samples = 1.0 / beta_samples
-        T_expanded = T_samples.repeat_interleave(batch_size)
-        total_size = num_beta * batch_size
-
-        self.model.train()
-
-        # Generate continuous samples (enables gradient flow)
-        samples_continuous = self.model.sample_continuous(
-            batch_size=total_size,
-            T=T_expanded
-        )
-
-        # Discrete samples (for energy computation validation)
-        samples_discrete = self.model.dequantizer.quantize(samples_continuous)
-
-        # Compute log probability
-        log_prob = self.model.log_prob(samples_continuous, T=T_expanded)
-
-        # Compute energy on continuous samples for gradient flow
-        # Ising energy E = (s^T A s)/2 is bilinear.
-        # CRITICAL FIX: We must bound the samples to (-1, 1) before computing energy
-        # because the Ising Hamiltonian is unbounded for large continuous values.
-        # Without tanh, the energy term pushes samples to infinity to minimize E.
-        # tanh provides a soft relaxation of the spin constraint.
-        energy = energy_fn(torch.tanh(samples_continuous))
-
-        beta = (1.0 / T_expanded).view(-1, 1)
-
-        # Free energy loss: F = E_p[log p(x) + β·E(x)]
-        # This minimizes the variational free energy
-        loss = (log_prob + beta * energy).mean()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-        self.optimizer.step()
-
-        return loss.item()
-
-    def train_epoch_discrete_flow(self, energy_fn):
-        """
-        Training epoch for discrete flow models using Straight-Through Estimator.
-
-        Unlike continuous flows, discrete flows use STE to enable gradient flow
-        through discrete sampling and energy computation.
-
-        Args:
-            energy_fn: Energy function (samples -> energy)
-
-        Returns:
-            Average loss value
-        """
-        batch_size = self.model.batch_size
-        beta_min = self.model.beta_min
-        beta_max = self.model.beta_max
-        num_beta = self.model.num_beta
-
-        # Log-uniform beta sampling (same as continuous flow)
-        log_beta_samples = torch.rand(num_beta, device=self.device) * (
-            math.log(beta_max) - math.log(beta_min)
-        ) + math.log(beta_min)
-        beta_samples = torch.exp(log_beta_samples)
-        T_samples = 1.0 / beta_samples
-        T_expanded = T_samples.repeat_interleave(batch_size)
-        total_size = num_beta * batch_size
-
-        self.model.train()
-
-        # Generate discrete samples with gradient tracking (via STE)
-        # Note: sample() internally uses STE in BinaryCouplingLayer
-        samples_discrete = self.model.sample(
-            batch_size=total_size,
-            T=T_expanded
-        )  # (total_size, 1, H, W) in {-1, +1}
-
-        # Compute log probability with gradients
-        log_prob = self.model.log_prob(samples_discrete, T=T_expanded)
-
-        # Compute energy on discrete samples
-        # STE allows gradients to flow back through the discrete samples
-        energy = energy_fn(samples_discrete)
-
-        beta = (1.0 / T_expanded).view(-1, 1)
-
-        # Free energy loss: F = E_p[log p(x) + β·E(x)]
-        # Both terms have gradients thanks to STE
-        loss = (log_prob + beta * energy).mean()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-        self.optimizer.step()
-
-        return loss.item()
-
     def val_epoch(self, energy_fn):
         """
         Validation epoch with fixed beta values.
@@ -609,26 +336,8 @@ class Trainer:
         val_losses = []
 
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
-            # Detect model type
-            is_discrete_flow = 'DiscreteFlow' in self.model.__class__.__name__
-            is_continuous_flow = 'CheckerboardFlow' in self.model.__class__.__name__
-
-            # Choose training method based on model type and configuration
-            if is_discrete_flow:
-                train_loss = self.train_epoch_discrete_flow(energy_fn)
-            elif is_continuous_flow:
-                train_loss = self.train_epoch_flow(energy_fn)
-            elif self.gumbel_config.use_gumbel:
-                # Gumbel-Softmax with temperature annealing
-                temperature = self.gumbel_config.get_temperature(epoch, epochs)
-                train_loss = self.train_epoch_gumbel(
-                    energy_fn,
-                    temperature=temperature,
-                    hard=self.gumbel_config.hard
-                )
-            else:
-                # Standard REINFORCE
-                train_loss = self.train_epoch(energy_fn)
+            # Standard REINFORCE training
+            train_loss = self.train_epoch(energy_fn)
 
             val_dict = self.val_epoch(energy_fn)
             val_loss = val_dict["val_loss"]
@@ -651,11 +360,6 @@ class Trainer:
                 "val_loss": val_loss,
                 "lr": self.optimizer.param_groups[0]["lr"],
             }
-
-            # Add Gumbel-Softmax temperature if using Gumbel
-            if self.gumbel_config.use_gumbel:
-                temperature = self.gumbel_config.get_temperature(epoch, epochs)
-                log_dict["gumbel_temperature"] = temperature
 
             # Add individual beta losses and beta values
             # Use validation beta count (may differ from training num_beta)
@@ -779,7 +483,6 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 seed=seed,
                 pruner=pruner,
                 energy_fn=energy_fn,
-                gumbel_config=run_config.gumbel_config,
             )
 
             val_loss = trainer.train(energy_fn, epochs=run_config.epochs)
