@@ -457,10 +457,9 @@ class ConditionalCouplingNet(nn.Module):
         log_scale, shift = params.chunk(2, dim=1)  # Each (B, 1, H, W)
 
         # Constrain log_scale for numerical stability
-        # CONSERVATIVE RANGE: [-1.0, 1.0] to prevent log_det explosion
-        # With 6 layers × 128 masked positions × 1.0 = max 768 (very stable)
-        # This is more conservative but ensures stable training
-        log_scale = torch.tanh(log_scale) * 1.0  # Range [-1.0, 1.0]
+        # Range reduced to [-0.1, 0.1] to prevent exponential growth of samples
+        # in inverse flow. Large values cause energy explosion in training.
+        log_scale = torch.tanh(log_scale) * 0.1  # Range [-0.1, 0.1]
 
         return log_scale, shift
 
@@ -1098,11 +1097,10 @@ class CheckerboardFlowModel(nn.Module):
         # Forward flow: x -> z
         z, log_det = self.forward_flow(x_dequant, T)
 
-        # Log probability: log p(x) = log p(z) + log |det dx/dz|
-        # Since forward_flow computes log |det dz/dx|, we need the inverse:
-        # log |det dx/dz| = -log |det dz/dx|
+        # Log probability: log p(x) = log p(z) + log |det dz/dx|
+        # forward_flow returns z and log_det = log |det dz/dx|
         log_prob_base = self._get_base_log_prob(z)
-        log_prob = log_prob_base - log_det  # FIXED: Changed + to -
+        log_prob = log_prob_base + log_det  # Correct change of variables formula
 
         return log_prob.unsqueeze(-1)  # (B, 1)
 
