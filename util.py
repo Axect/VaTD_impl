@@ -466,15 +466,18 @@ class Trainer:
 
         beta = (1.0 / T_expanded).view(-1, 1)
 
-        # Free energy loss: F = E_q[log q(x|T) + beta * E(x)]
-        # For gradient flow, use continuous samples for energy computation
-        energy_for_grad = energy_fn(samples_continuous)
+        # CRITICAL FIX: Use straight-through estimator for energy
+        # Forward pass: discrete samples (correct Ising energy)
+        # Backward pass: continuous samples (gradient flow)
+        # This ensures we optimize the correct objective while maintaining gradients
+        samples_for_energy = samples_discrete - samples_continuous.detach() + samples_continuous
+        energy_for_grad = energy_fn(samples_for_energy)
 
         # DEBUG: Check energies
         if torch.any(energy.abs() > 1000.0):
             print(f"WARNING: Extreme discrete energy! Range: [{energy.min().item():.2e}, {energy.max().item():.2e}]")
         if torch.any(energy_for_grad.abs() > 1000.0):
-            print(f"WARNING: Extreme continuous energy! Range: [{energy_for_grad.min().item():.2e}, {energy_for_grad.max().item():.2e}]")
+            print(f"WARNING: Extreme STE energy! Range: [{energy_for_grad.min().item():.2e}, {energy_for_grad.max().item():.2e}]")
 
         loss = (log_prob + beta * energy_for_grad).mean()
 

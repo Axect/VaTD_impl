@@ -430,9 +430,10 @@ class ConditionalCouplingNet(nn.Module):
         log_scale, shift = params.chunk(2, dim=1)  # Each (B, 1, H, W)
 
         # Constrain log_scale for numerical stability
-        # REDUCED RANGE: [-1.5, 1.5] to prevent log_det explosion
-        # With 8 layers × 128 masked positions × 1.5 = max 1536 (more stable)
-        log_scale = torch.tanh(log_scale) * 1.5  # Range [-1.5, 1.5]
+        # CONSERVATIVE RANGE: [-1.0, 1.0] to prevent log_det explosion
+        # With 6 layers × 128 masked positions × 1.0 = max 768 (very stable)
+        # This is more conservative but ensures stable training
+        log_scale = torch.tanh(log_scale) * 1.0  # Range [-1.0, 1.0]
 
         return log_scale, shift
 
@@ -769,12 +770,12 @@ class CheckerboardFlowModel(nn.Module):
                 print(f"WARNING: Inverse layer {len(self.coupling_layers)-1-i} produced extreme x!")
                 print(f"  Max: {x.abs().max().item():.2e}")
 
-        # CRITICAL: Clamp output to reasonable range to prevent energy explosion
-        # Ising spins are {-1, +1}, so with dequantization noise [-1.05, 1.05]
-        # Using [-2, 2] gives enough margin while preventing extreme energies
-        # Energy with s=2: E ≈ -1.0 × 2² × 256 × 2 = -2,048 (acceptable)
-        # vs. Energy with s=5: E ≈ -12,800 (too extreme)
-        x = torch.clamp(x, min=-2.0, max=2.0)
+        # REMOVED: Clamping breaks gradient flow and bijection
+        # Instead, we rely on:
+        # 1. Proper initialization (weights near zero)
+        # 2. Gradient clipping in training
+        # 3. Constrained log_scale range (tanh * 1.0)
+        # 4. Straight-through estimator in training
 
         return x
 
