@@ -19,14 +19,14 @@ pruner:
 
 search_space:
   net_config:
-    # Flow architecture parameters
+    # Flow architecture parameters (reduced for memory constraints)
     num_flow_layers:
       type: int
       min: 4
-      max: 12
+      max: 8
     hidden_channels:
       type: categorical
-      choices: [32, 64, 96, 128]
+      choices: [32, 48, 64]
     num_hidden_layers:
       type: int
       min: 1
@@ -35,6 +35,8 @@ search_space:
       type: float
       min: 0.01
       max: 0.1
+    # Fixed batch configuration (not searchable due to memory)
+    # batch_size: 128, num_beta: 4
   optimizer_config:
     lr:
       type: float

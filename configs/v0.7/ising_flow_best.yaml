@@ -12,14 +12,14 @@ net_config:
   size: 16      # 16x16 Ising lattice
 
   # Temperature sampling configuration
-  batch_size: 256  # Samples per temperature
-  num_beta: 8     # Number of temperature samples per batch
+  batch_size: 128  # Samples per temperature (reduced from 256 for memory)
+  num_beta: 4     # Number of temperature samples per batch (reduced from 8)
   beta_min: 0.2   # 1/T_max (T_max = 5)
   beta_max: 1.0   # 1/T_min (T_min = 1)
 
   # Flow architecture (placeholder - update with best hyperparameters from TPE)
-  num_flow_layers: 8        # Number of coupling layers
-  hidden_channels: 64       # Hidden channels in coupling networks
+  num_flow_layers: 6        # Number of coupling layers (reduced from 8)
+  hidden_channels: 48       # Hidden channels in coupling networks (reduced from 64)
   num_hidden_layers: 2      # Hidden layers per coupling network
   dequant_noise: 0.05       # Dequantization noise scale
 
