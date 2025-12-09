@@ -44,7 +44,9 @@ def evaluate_at_reference_temps(model, energy_fn, L, device="cpu", batch_size=50
             loss = loss_raw.mean().item()
 
             # Compute exact
-            exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item() / num_pixels
+            exact_logz = (
+                exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item() / num_pixels
+            )
             exact_loss = -exact_logz
 
             # Normalized loss (like reference: loss / (L*L*0.45))

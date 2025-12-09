@@ -262,8 +262,8 @@ class DiscretePixelCNN(nn.Module):
         # Extract device from args/kwargs
         if args and isinstance(args[0], (torch.device, str)):
             self.device = args[0]
-        elif 'device' in kwargs:
-            self.device = kwargs['device']
+        elif "device" in kwargs:
+            self.device = kwargs["device"]
         return self
 
     def sample(self, batch_size=None, T=None):

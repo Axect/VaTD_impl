@@ -52,7 +52,9 @@ def analyze_around_critical(
             loss = loss_raw.mean().item()
 
             # Compute exact
-            exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item() / num_pixels
+            exact_logz = (
+                exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item() / num_pixels
+            )
             exact_loss = -exact_logz
 
             # Error
