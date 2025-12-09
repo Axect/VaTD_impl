@@ -109,6 +109,78 @@ def test_model_ising(
     return pd.DataFrame(results)
 
 
+def visualize_lattice_samples(
+    model,
+    L,
+    temperatures,
+    device="cpu",
+    num_samples=4,
+    output_dir="figs",
+    filename="lattice_samples.png",
+):
+    """
+    Visualize sample lattices from the model at different temperatures.
+
+    Args:
+        model: Trained DiscretePixelCNN model
+        L: Lattice size
+        temperatures: List of temperatures to sample at
+        device: Device to run on
+        num_samples: Number of samples to show per temperature
+        output_dir: Directory to save plots
+        filename: Output filename
+    """
+    Path(output_dir).mkdir(exist_ok=True)
+
+    model.eval()
+    num_temps = len(temperatures)
+
+    fig, axes = plt.subplots(
+        num_temps, num_samples, figsize=(3 * num_samples, 3 * num_temps)
+    )
+
+    # Handle single row case
+    if num_temps == 1:
+        axes = axes.reshape(1, -1)
+    if num_samples == 1:
+        axes = axes.reshape(-1, 1)
+
+    with torch.no_grad():
+        for i, T in enumerate(temperatures):
+            T_tensor = torch.full((num_samples,), T, device=device)
+
+            # Sample from model
+            samples = model.sample(batch_size=num_samples, T=T_tensor)
+
+            # Convert to numpy and reshape
+            samples_np = samples.cpu().numpy()
+
+            for j in range(num_samples):
+                ax = axes[i, j]
+                lattice = samples_np[j].reshape(L, L)
+
+                # Plot lattice (-1: white, +1: black)
+                im = ax.imshow(lattice, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
+
+                if j == 0:
+                    ax.set_ylabel(f"T={T:.3f}\n(T/Tc={T/CRITICAL_TEMPERATURE:.2f})", fontsize=10)
+                else:
+                    ax.set_ylabel("")
+
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+                if i == 0:
+                    ax.set_title(f"Sample {j+1}")
+
+    plt.tight_layout()
+    output_path = f"{output_dir}/{filename}"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    return output_path
+
+
 def plot_model_vs_exact(
     df, output_dir="figs", title_suffix="", filename="model_test_analysis.png"
 ):
@@ -419,6 +491,35 @@ def main():
     output_file_validation = f"{output_dir}/test_results_validation_{seed}.csv"
     df_validation.to_csv(output_file_validation, index=False)
     console.print(f"[green]✓[/green] Saved results to {output_file_validation}")
+
+    # ========================================
+    # Test 3: Visualize Sample Lattices
+    # ========================================
+    console.print("\n[bold cyan]Test 3: Visualizing Sample Lattices[/bold cyan]")
+
+    # Select temperatures across validation range
+    num_temp_samples = 6
+    temperatures = np.linspace(T_val_min, T_val_max, num_temp_samples)
+
+    console.print(f"Generating lattice samples at {num_temp_samples} temperatures across validation range:")
+    for T in temperatures:
+        console.print(f"  T = {T:.4f} (T/Tc = {T/CRITICAL_TEMPERATURE:.2f})")
+
+    console.print("\n[bold]Generating lattice visualizations...[/bold]")
+    lattice_plot_path = visualize_lattice_samples(
+        model,
+        L,
+        temperatures,
+        device=device,
+        num_samples=4,
+        output_dir="figs",
+        filename=f"lattice_samples_{seed}.png",
+    )
+    console.print(f"[green]✓[/green] Saved lattice samples to {lattice_plot_path}")
+
+    console.print(
+        "\n[bold green]Analysis complete! All results saved to output directory.[/bold green]"
+    )
 
 
 if __name__ == "__main__":
