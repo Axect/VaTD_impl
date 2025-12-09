@@ -77,12 +77,11 @@ def test_model_ising(
 
             # Compute loss
             beta_tensor = torch.tensor([beta], device=device).unsqueeze(-1)
-            num_pixels = L * L
-            loss_raw = (log_prob + beta_tensor * energy) / num_pixels
+            loss_raw = log_prob + beta_tensor * energy
             model_loss = loss_raw.mean().item()
 
             # Compute exact values
-            exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item() / num_pixels
+            exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item()
             exact_loss = -exact_logz
 
             # Compute model log Z estimate
