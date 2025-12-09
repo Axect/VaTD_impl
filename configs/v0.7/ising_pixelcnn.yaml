@@ -1,4 +1,4 @@
-project: Ising_VaTD_v0.6
+project: Ising_VaTD_v0.7
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: splus.SPlus
