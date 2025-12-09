@@ -493,29 +493,61 @@ def main():
     console.print(f"[green]✓[/green] Saved results to {output_file_validation}")
 
     # ========================================
-    # Test 3: Visualize Sample Lattices
+    # Test 3: Visualize Sample Lattices (Validation Range)
     # ========================================
-    console.print("\n[bold cyan]Test 3: Visualizing Sample Lattices[/bold cyan]")
+    console.print("\n[bold cyan]Test 3: Visualizing Sample Lattices (Validation Range)[/bold cyan]")
 
     # Select temperatures across validation range
     num_temp_samples = 6
-    temperatures = np.linspace(T_val_min, T_val_max, num_temp_samples)
+    temperatures_val = np.linspace(T_val_min, T_val_max, num_temp_samples)
 
     console.print(f"Generating lattice samples at {num_temp_samples} temperatures across validation range:")
-    for T in temperatures:
+    for T in temperatures_val:
         console.print(f"  T = {T:.4f} (T/Tc = {T/CRITICAL_TEMPERATURE:.2f})")
 
     console.print("\n[bold]Generating lattice visualizations...[/bold]")
-    lattice_plot_path = visualize_lattice_samples(
+    lattice_plot_path_val = visualize_lattice_samples(
         model,
         L,
-        temperatures,
+        temperatures_val,
         device=device,
         num_samples=4,
         output_dir="figs",
-        filename=f"lattice_samples_{seed}.png",
+        filename=f"lattice_samples_validation_{seed}.png",
     )
-    console.print(f"[green]✓[/green] Saved lattice samples to {lattice_plot_path}")
+    console.print(f"[green]✓[/green] Saved validation range lattice samples to {lattice_plot_path_val}")
+
+    # ========================================
+    # Test 4: Visualize Sample Lattices (Critical Range)
+    # ========================================
+    console.print("\n[bold cyan]Test 4: Visualizing Sample Lattices (Critical Range)[/bold cyan]")
+
+    # Select temperatures near critical temperature
+    T_low = 0.8 * CRITICAL_TEMPERATURE
+    T_critical = CRITICAL_TEMPERATURE
+    T_high = 1.2 * CRITICAL_TEMPERATURE
+    temperatures_critical = [T_low, T_critical, T_high]
+
+    console.print(f"Generating lattice samples at temperatures near Tc:")
+    console.print(f"  Low:      T = {T_low:.4f} (T/Tc = {T_low/CRITICAL_TEMPERATURE:.2f})")
+    console.print(
+        f"  Critical: T = {T_critical:.4f} (T/Tc = {T_critical/CRITICAL_TEMPERATURE:.2f})"
+    )
+    console.print(
+        f"  High:     T = {T_high:.4f} (T/Tc = {T_high/CRITICAL_TEMPERATURE:.2f})"
+    )
+
+    console.print("\n[bold]Generating lattice visualizations...[/bold]")
+    lattice_plot_path_critical = visualize_lattice_samples(
+        model,
+        L,
+        temperatures_critical,
+        device=device,
+        num_samples=4,
+        output_dir="figs",
+        filename=f"lattice_samples_critical_{seed}.png",
+    )
+    console.print(f"[green]✓[/green] Saved critical range lattice samples to {lattice_plot_path_critical}")
 
     console.print(
         "\n[bold green]Analysis complete! All results saved to output directory.[/bold green]"
