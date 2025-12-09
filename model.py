@@ -6,6 +6,33 @@ import numpy as np
 from typing import Tuple
 
 
+# ============================================================================
+# Straight-Through Estimator for Discrete Flows
+# ============================================================================
+
+def ste_round(x: torch.Tensor) -> torch.Tensor:
+    """
+    Straight-Through Estimator for rounding operation.
+
+    Forward pass: Returns rounded values (discrete)
+    Backward pass: Gradient passes through as identity
+
+    This enables gradient flow through non-differentiable rounding operations
+    by using a biased but low-variance gradient estimator.
+
+    Args:
+        x: Input tensor (typically in range [0, 1])
+
+    Returns:
+        Rounded tensor with gradient connection to input
+
+    Example:
+        >>> shift_prob = torch.sigmoid(logits)  # [0, 1]
+        >>> shift_discrete = ste_round(shift_prob)  # {0, 1} with gradients
+    """
+    return x + (x.round() - x).detach()
+
+
 
 class MaskedConv2D(nn.Conv2d):
     def __init__(
@@ -438,6 +465,101 @@ class ConditionalCouplingNet(nn.Module):
         return log_scale, shift
 
 
+class BinaryShiftNet(nn.Module):
+    """
+    CNN-based shift network for binary coupling layers with FiLM temperature conditioning.
+
+    Similar to ConditionalCouplingNet but outputs only shift parameters (no log_scale).
+    Used in discrete binary flows with XOR coupling.
+
+    Attributes:
+        temp_cond: Temperature conditioning module
+        input_proj: Input projection layer
+        hidden_layers: ResNet-style hidden layers
+        output_proj: Output projection layer (1 channel for shift only)
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int = 64,
+        num_hidden_layers: int = 2,
+        kernel_size: int = 3,
+        H: int = 16,
+        W: int = 16,
+    ):
+        """
+        Args:
+            hidden_channels: Number of channels in hidden layers
+            num_hidden_layers: Number of hidden layers
+            kernel_size: Convolution kernel size
+            H, W: Lattice dimensions
+        """
+        super().__init__()
+        self.H = H
+        self.W = W
+
+        # Temperature conditioning
+        self.temp_cond = TemperatureConditioner(
+            hidden_dim=hidden_channels,
+            output_dim=hidden_channels
+        )
+
+        # Initial projection: 1 channel -> hidden_channels
+        self.input_proj = nn.Conv2d(1, hidden_channels, 1)
+
+        # Hidden layers (ResNet-style)
+        self.hidden_layers = nn.ModuleList()
+        for _ in range(num_hidden_layers):
+            self.hidden_layers.append(nn.Sequential(
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size,
+                         padding=kernel_size // 2),
+                nn.SiLU(),
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size,
+                         padding=kernel_size // 2),
+            ))
+
+        # Output projection: hidden_channels -> 1 (shift only)
+        self.output_proj = nn.Conv2d(hidden_channels, 1, 1)
+
+        # Zero initialization for stable training (identity transform at start)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(
+        self,
+        x_masked: torch.Tensor,
+        T: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_masked: Masked input (B, 1, H, W) - unmasked positions are zeroed
+            T: Temperature (B, 1)
+
+        Returns:
+            shift: (B, 1, H, W) shift parameters
+        """
+        # Compute FiLM parameters
+        gamma, beta = self.temp_cond(T)  # (B, hidden_channels)
+        gamma = gamma.view(-1, gamma.shape[-1], 1, 1)  # (B, C, 1, 1)
+        beta = beta.view(-1, beta.shape[-1], 1, 1)
+
+        # Process input
+        h = self.input_proj(x_masked)  # (B, hidden_channels, H, W)
+
+        # Apply FiLM conditioning
+        h = gamma * h + beta
+
+        # Hidden layers with residual connections
+        for layer in self.hidden_layers:
+            h = h + layer(h)
+            h = F.silu(h)
+
+        # Output (shift only)
+        shift = self.output_proj(h)  # (B, 1, H, W)
+
+        return shift
+
+
 class CheckerboardAffineCoupling(nn.Module):
     """
     Affine coupling layer with checkerboard masking for 2D lattice.
@@ -555,6 +677,123 @@ class CheckerboardAffineCoupling(nn.Module):
         x_flat = x_transform + z_frozen
 
         return x_flat.view(B, 1, self.H, self.W)
+
+
+class BinaryCouplingLayer(nn.Module):
+    """
+    Binary coupling layer with XOR-based transformation for discrete {0, 1} data.
+
+    Uses modulo-2 arithmetic (XOR) instead of affine transformations:
+        y_active = (x_active + shift) % 2
+
+    Key properties:
+    - Self-inverse: forward and inverse are identical
+    - Volume-preserving: log_det Jacobian is always 0
+    - Uses Straight-Through Estimator for gradient flow
+
+    Attributes:
+        H, W: Lattice dimensions
+        mask: Checkerboard mask (True positions are transformed)
+        shift_net: Network computing binary shift parameters
+    """
+
+    def __init__(
+        self,
+        H: int,
+        W: int,
+        parity: int,
+        hidden_channels: int = 64,
+        num_hidden_layers: int = 2,
+    ):
+        """
+        Args:
+            H, W: Lattice dimensions
+            parity: Mask parity (0 or 1)
+            hidden_channels: Hidden channels in shift network
+            num_hidden_layers: Number of hidden layers in shift network
+        """
+        super().__init__()
+        self.H = H
+        self.W = W
+
+        # Create and register checkerboard mask
+        self.register_buffer('mask', create_checkerboard_mask(H, W, parity))
+
+        # Binary shift network (outputs only shift, no scale)
+        self.shift_net = BinaryShiftNet(
+            hidden_channels=hidden_channels,
+            num_hidden_layers=num_hidden_layers,
+            H=H,
+            W=W,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward transform: z = f(x) using XOR coupling
+
+        Args:
+            x: Input tensor (B, 1, H, W) in {0, 1}
+            T: Temperature (B, 1)
+
+        Returns:
+            z: Transformed tensor (B, 1, H, W) in {0, 1}
+            log_det: Log determinant of Jacobian (B,) - always 0
+        """
+        B = x.shape[0]
+        x_flat = x.view(B, -1)  # (B, H*W)
+
+        # Split by mask
+        mask_float = self.mask.float()
+        inv_mask_float = (~self.mask).float()
+
+        x_frozen = x_flat * inv_mask_float  # Frozen features
+        x_active = x_flat * mask_float   # Features to transform
+
+        # Reshape for CNN
+        x_frozen_2d = x_frozen.view(B, 1, self.H, self.W)
+
+        # Compute shift parameters
+        shift_logits = self.shift_net(x_frozen_2d, T)  # (B, 1, H, W)
+
+        # Convert logits to probabilities, then to binary with STE
+        shift_prob = torch.sigmoid(shift_logits)  # (B, 1, H, W) in [0, 1]
+        shift_discrete = ste_round(shift_prob)  # (B, 1, H, W) in {0, 1} with gradient
+
+        # Flatten and mask
+        shift_flat = shift_discrete.view(B, -1) * mask_float  # (B, H*W)
+
+        # XOR coupling: (x + shift) % 2
+        z_active = (x_active + shift_flat) % 2
+        z_flat = z_active + x_frozen
+        z = z_flat.view(B, 1, self.H, self.W)
+
+        # Log determinant is 0 (permutation is volume-preserving)
+        log_det = torch.zeros(B, device=x.device)
+
+        return z, log_det
+
+    def inverse(self, z: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+        """
+        Inverse transform: x = f^{-1}(z)
+
+        For XOR coupling, inverse is identical to forward (self-inverse property):
+            (z + shift) % 2 = ((x + shift) + shift) % 2 = x
+
+        Args:
+            z: Transformed tensor (B, 1, H, W) in {0, 1}
+            T: Temperature (B, 1)
+
+        Returns:
+            x: Original tensor (B, 1, H, W) in {0, 1}
+        """
+        # For XOR coupling, inverse is the same as forward
+        # This is because (x + shift) + shift = x in mod 2 arithmetic
+        x, _ = self.forward(z, T)
+        return x
 
 
 class CheckerboardFlowModel(nn.Module):
@@ -859,9 +1098,270 @@ class CheckerboardFlowModel(nn.Module):
         # Forward flow: x -> z
         z, log_det = self.forward_flow(x_dequant, T)
 
-        # Log probability: log p(x) = log p(z) + log |det df/dx|
+        # Log probability: log p(x) = log p(z) + log |det dx/dz|
+        # Since forward_flow computes log |det dz/dx|, we need the inverse:
+        # log |det dx/dz| = -log |det dz/dx|
         log_prob_base = self._get_base_log_prob(z)
-        log_prob = log_prob_base + log_det
+        log_prob = log_prob_base - log_det  # FIXED: Changed + to -
+
+        return log_prob.unsqueeze(-1)  # (B, 1)
+
+    def to(self, *args, **kwargs):
+        """Override to update self.device."""
+        result = super().to(*args, **kwargs)
+        if args and isinstance(args[0], (torch.device, str)):
+            self.device = str(args[0])
+        elif 'device' in kwargs:
+            self.device = str(kwargs['device'])
+        return result
+
+
+class DiscreteFlowModel(nn.Module):
+    """
+    Discrete Normalizing Flow model for Ising spins using XOR coupling.
+
+    Unlike continuous flows with dequantization, this model operates directly
+    on discrete binary {0, 1} data using modulo-2 arithmetic (XOR).
+
+    Key features:
+    - XOR-based coupling layers (self-inverse transformations)
+    - T-independent Bernoulli base distribution
+    - Straight-Through Estimator for gradient flow
+    - No dequantization needed
+
+    Interface matches DiscretePixelCNN and CheckerboardFlowModel:
+    - sample(batch_size, T) -> (B, 1, H, W) in {-1, +1}
+    - log_prob(samples, T) -> (B, 1)
+
+    Attributes:
+        size: Lattice size (H, W)
+        batch_size: Batch size per temperature
+        num_beta: Number of temperature samples per batch
+        beta_min, beta_max: Inverse temperature range
+        coupling_layers: List of BinaryCouplingLayer
+        base_logits: Learnable Bernoulli logits (T-independent)
+    """
+
+    def __init__(self, hparams: dict, device: str = "cpu"):
+        """
+        Args:
+            hparams: Hyperparameter dictionary
+                - size: int or (H, W) tuple, lattice size
+                - batch_size: int, samples per temperature
+                - num_beta: int, temperature samples per batch
+                - beta_min, beta_max: float, inverse temperature range
+                - num_flow_layers: int, number of coupling layers (default: 8)
+                - hidden_channels: int, hidden channels (default: 64)
+                - num_hidden_layers: int, hidden layers in coupling net (default: 2)
+            device: Device string
+        """
+        super().__init__()
+        self.hparams = hparams
+        self.device = device
+
+        # Lattice configuration
+        size = hparams.get("size", 16)
+        self.size = (size, size) if isinstance(size, int) else tuple(size)
+        self.H, self.W = self.size
+
+        # Training parameters (same interface as DiscretePixelCNN)
+        self.batch_size = hparams["batch_size"]
+        self.num_beta = hparams["num_beta"]
+        self.beta_min = hparams["beta_min"]
+        self.beta_max = hparams["beta_max"]
+
+        # Flow architecture parameters
+        num_flow_layers = hparams.get("num_flow_layers", 8)
+        hidden_channels = hparams.get("hidden_channels", 64)
+        num_hidden_layers = hparams.get("num_hidden_layers", 2)
+
+        # Build coupling layers (alternating parity)
+        self.coupling_layers = nn.ModuleList()
+        for i in range(num_flow_layers):
+            parity = i % 2  # Alternate 0, 1, 0, 1, ...
+            layer = BinaryCouplingLayer(
+                H=self.H,
+                W=self.W,
+                parity=parity,
+                hidden_channels=hidden_channels,
+                num_hidden_layers=num_hidden_layers,
+            )
+            self.coupling_layers.append(layer)
+
+        # Base distribution: T-independent Bernoulli
+        # Initialize logits to 0 (probability 0.5 for each bit)
+        self.base_logits = nn.Parameter(torch.zeros(1, 1, self.H, self.W))
+
+    def _prepare_temperature(
+        self,
+        T: torch.Tensor,
+        batch_size: int
+    ) -> torch.Tensor:
+        """
+        Prepare temperature tensor for conditioning.
+
+        Args:
+            T: Temperature tensor (B,) or (B, 1) or None
+            batch_size: Batch size
+
+        Returns:
+            Prepared temperature tensor (B, 1)
+        """
+        if T is None:
+            # Default: middle of range
+            mid_T = 0.5 * (1 / self.beta_min + 1 / self.beta_max)
+            T = torch.full((batch_size, 1), mid_T, device=self.device)
+        else:
+            T = T.to(self.device)
+            if T.dim() == 1:
+                T = T.unsqueeze(1)
+        return T
+
+    def _sample_base(self, batch_size: int) -> torch.Tensor:
+        """
+        Sample from base Bernoulli distribution.
+
+        Args:
+            batch_size: Number of samples
+
+        Returns:
+            Binary tensor (B, 1, H, W) in {0, 1}
+        """
+        # Convert logits to probabilities
+        base_probs = torch.sigmoid(self.base_logits)  # (1, 1, H, W)
+
+        # Expand to batch size and sample
+        probs_expanded = base_probs.expand(batch_size, 1, self.H, self.W)
+        z = torch.bernoulli(probs_expanded)  # (B, 1, H, W) in {0, 1}
+
+        return z
+
+    def _get_base_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log probability under base Bernoulli distribution.
+
+        Args:
+            z: Binary tensor (B, 1, H, W) in {0, 1}
+
+        Returns:
+            Log probability (B,)
+        """
+        # Bernoulli log probability: z * log(p) + (1-z) * log(1-p)
+        base_probs = torch.sigmoid(self.base_logits)  # (1, 1, H, W)
+
+        # Numerical stability: add epsilon
+        eps = 1e-8
+        log_p = torch.log(base_probs + eps)
+        log_1_minus_p = torch.log(1 - base_probs + eps)
+
+        # Compute log probability per site
+        log_prob_per_site = z * log_p + (1 - z) * log_1_minus_p  # (B, 1, H, W)
+
+        # Sum over all sites
+        log_prob = log_prob_per_site.sum(dim=[1, 2, 3])  # (B,)
+
+        return log_prob
+
+    def forward_flow(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass: x -> z (data space to latent space)
+
+        Args:
+            x: Input tensor (B, 1, H, W) in {0, 1}
+            T: Temperature (B, 1)
+
+        Returns:
+            z: Latent tensor (B, 1, H, W) in {0, 1}
+            log_det_sum: Total log determinant sum (B,) - always 0 for XOR
+        """
+        z = x
+        log_det_sum = torch.zeros(x.shape[0], device=x.device)
+
+        for layer in self.coupling_layers:
+            z, log_det = layer(z, T)
+            log_det_sum = log_det_sum + log_det  # Always 0 for XOR coupling
+
+        return z, log_det_sum
+
+    def inverse_flow(self, z: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+        """
+        Inverse pass: z -> x (latent space to data space)
+
+        Args:
+            z: Latent tensor (B, 1, H, W) in {0, 1}
+            T: Temperature (B, 1)
+
+        Returns:
+            x: Reconstructed data tensor (B, 1, H, W) in {0, 1}
+        """
+        x = z
+        for layer in reversed(self.coupling_layers):
+            x = layer.inverse(x, T)
+
+        return x
+
+    def sample(
+        self,
+        batch_size: int = None,
+        T: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Sample discrete spin configurations.
+
+        Args:
+            batch_size: Number of samples (None uses self.batch_size)
+            T: Temperature tensor (B,) or (B, 1)
+
+        Returns:
+            Tensor of shape (B, 1, H, W) with values in {-1, +1}
+        """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        T = self._prepare_temperature(T, batch_size)
+
+        # Sample from base Bernoulli distribution
+        z = self._sample_base(batch_size)  # (B, 1, H, W) in {0, 1}
+
+        # Inverse flow: z -> x_bin
+        x_bin = self.inverse_flow(z, T)  # (B, 1, H, W) in {0, 1}
+
+        # Convert {0, 1} -> {-1, +1} for Ising spins
+        x_ising = x_bin * 2 - 1
+
+        return x_ising
+
+    def log_prob(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Compute log probability of samples.
+
+        Args:
+            samples: Sample tensor (B, 1, H, W) in {-1, +1}
+            T: Temperature tensor (B,) or (B, 1)
+
+        Returns:
+            Log probability (B, 1)
+        """
+        batch_size = samples.shape[0]
+        T = self._prepare_temperature(T, batch_size)
+
+        # Convert {-1, +1} -> {0, 1}
+        x_bin = (samples + 1) / 2  # (B, 1, H, W) in {0, 1}
+
+        # Forward flow: x -> z
+        z, log_det_sum = self.forward_flow(x_bin, T)  # log_det_sum is always 0
+
+        # Log probability: log p(x) = log p(z) + log |det dx/dz|
+        # Since forward_flow computes log |det dz/dx|, we need:
+        # log |det dx/dz| = -log |det dz/dx|
+        log_prob_base = self._get_base_log_prob(z)
+        log_prob = log_prob_base - log_det_sum  # log_det_sum = 0, so log_prob = log_prob_base
 
         return log_prob.unsqueeze(-1)  # (B, 1)
 

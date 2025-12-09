@@ -461,25 +461,20 @@ class Trainer:
         if torch.any(log_prob.abs() > 1000.0):
             print(f"WARNING: Extreme log_prob! Range: [{log_prob.min().item():.2e}, {log_prob.max().item():.2e}]")
 
-        # Compute energy (use discrete samples)
-        energy = energy_fn(samples_discrete)
+        # Compute energy on continuous samples for gradient flow
+        # Ising energy E = (s^T A s)/2 is bilinear, so it works with continuous values
+        # This allows gradients to flow through the flow model
+        energy = energy_fn(samples_continuous)
 
         beta = (1.0 / T_expanded).view(-1, 1)
 
-        # CRITICAL FIX: Use straight-through estimator for energy
-        # Forward pass: discrete samples (correct Ising energy)
-        # Backward pass: continuous samples (gradient flow)
-        # This ensures we optimize the correct objective while maintaining gradients
-        samples_for_energy = samples_discrete - samples_continuous.detach() + samples_continuous
-        energy_for_grad = energy_fn(samples_for_energy)
-
         # DEBUG: Check energies
         if torch.any(energy.abs() > 1000.0):
-            print(f"WARNING: Extreme discrete energy! Range: [{energy.min().item():.2e}, {energy.max().item():.2e}]")
-        if torch.any(energy_for_grad.abs() > 1000.0):
-            print(f"WARNING: Extreme STE energy! Range: [{energy_for_grad.min().item():.2e}, {energy_for_grad.max().item():.2e}]")
+            print(f"WARNING: Extreme energy! Range: [{energy.min().item():.2e}, {energy.max().item():.2e}]")
 
-        loss = (log_prob + beta * energy_for_grad).mean()
+        # Free energy loss: F = E_p[log p(x) + β·E(x)]
+        # This minimizes the variational free energy
+        loss = (log_prob + beta * energy).mean()
 
         # DEBUG: Check final loss
         if torch.isnan(loss) or torch.isinf(loss) or loss.abs() > 1e10:
@@ -488,6 +483,65 @@ class Trainer:
             print(f"  beta: mean={beta.mean().item():.2e}, max={beta.max().item():.2e}")
             print(f"  energy_for_grad: mean={energy_for_grad.mean().item():.2e}, max={energy_for_grad.max().item():.2e}")
             print(f"  beta * energy: mean={(beta * energy_for_grad).mean().item():.2e}, max={(beta * energy_for_grad).max().item():.2e}")
+
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+        self.optimizer.step()
+
+        return loss.item()
+
+    def train_epoch_discrete_flow(self, energy_fn):
+        """
+        Training epoch for discrete flow models using Straight-Through Estimator.
+
+        Unlike continuous flows, discrete flows use STE to enable gradient flow
+        through discrete sampling and energy computation.
+
+        Args:
+            energy_fn: Energy function (samples -> energy)
+
+        Returns:
+            Average loss value
+        """
+        batch_size = self.model.batch_size
+        beta_min = self.model.beta_min
+        beta_max = self.model.beta_max
+        num_beta = self.model.num_beta
+
+        # Log-uniform beta sampling (same as continuous flow)
+        log_beta_samples = torch.rand(num_beta, device=self.device) * (
+            math.log(beta_max) - math.log(beta_min)
+        ) + math.log(beta_min)
+        beta_samples = torch.exp(log_beta_samples)
+        T_samples = 1.0 / beta_samples
+        T_expanded = T_samples.repeat_interleave(batch_size)
+        total_size = num_beta * batch_size
+
+        self.model.train()
+
+        # Generate discrete samples with gradient tracking (via STE)
+        # Note: sample() internally uses STE in BinaryCouplingLayer
+        samples_discrete = self.model.sample(
+            batch_size=total_size,
+            T=T_expanded
+        )  # (total_size, 1, H, W) in {-1, +1}
+
+        # Compute log probability with gradients
+        log_prob = self.model.log_prob(samples_discrete, T=T_expanded)
+
+        # Compute energy on discrete samples
+        # STE allows gradients to flow back through the discrete samples
+        energy = energy_fn(samples_discrete)
+
+        beta = (1.0 / T_expanded).view(-1, 1)
+
+        # Free energy loss: F = E_p[log p(x) + β·E(x)]
+        # Both terms have gradients thanks to STE
+        loss = (log_prob + beta * energy).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -573,11 +627,14 @@ class Trainer:
         val_losses = []
 
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
-            # Detect flow model
-            is_flow_model = 'Flow' in self.model.__class__.__name__
+            # Detect model type
+            is_discrete_flow = 'DiscreteFlow' in self.model.__class__.__name__
+            is_continuous_flow = 'CheckerboardFlow' in self.model.__class__.__name__
 
-            # Choose training method based on configuration
-            if is_flow_model:
+            # Choose training method based on model type and configuration
+            if is_discrete_flow:
+                train_loss = self.train_epoch_discrete_flow(energy_fn)
+            elif is_continuous_flow:
                 train_loss = self.train_epoch_flow(energy_fn)
             elif self.gumbel_config.use_gumbel:
                 # Gumbel-Softmax with temperature annealing
