@@ -3,7 +3,7 @@ device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: splus.SPlus
 scheduler: hyperbolic_lr.ExpHyperbolicLR
-epochs: 10
+epochs: 250
 batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
 seeds: [42]
 
@@ -32,7 +32,7 @@ optimizer_config:
 
 scheduler_config:
   upper_bound: 300
-  max_iter: 150
+  max_iter: 250
   infimum_lr: 0.00000142218008727699
 
 early_stopping_config:
