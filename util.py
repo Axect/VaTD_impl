@@ -240,11 +240,19 @@ class Trainer:
         # ∇_θ E_q[β·E] = E_q[∇_θ log q · β·E] since E is independent of θ
         beta_energy = beta_expanded * energy_view
 
-        # Baseline for variance reduction (mean per beta)
-        baseline_energy = beta_energy.mean(dim=1, keepdim=True).detach()
+        # RLOO: Leave-One-Out baseline for variance reduction
+        # For each sample, baseline is mean of all OTHER samples
+        # Shape: beta_energy is (num_beta, batch_size)
 
-        # Advantage MUST be detached to act as fixed reward signal
-        advantage = (beta_energy - baseline_energy).detach()
+        # Compute sum of energies across batch dimension
+        sum_energy = beta_energy.sum(dim=1, keepdim=True)  # (num_beta, 1)
+
+        # Leave-one-out baseline: (sum - current_sample) / (N - 1)
+        loo_baseline = (sum_energy - beta_energy) / (batch_size - 1)
+        loo_baseline = loo_baseline.detach()
+
+        # Advantage with LOO baseline (must be detached)
+        advantage = (beta_energy - loo_baseline).detach()
 
         # REINFORCE gradient for energy term
         energy_reinforce_loss = torch.mean(advantage * log_prob_view)

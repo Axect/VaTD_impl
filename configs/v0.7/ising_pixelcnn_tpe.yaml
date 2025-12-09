@@ -1,4 +1,4 @@
-study_name: TPE_DiscreteFlow
+study_name: TPE
 trials: 100
 seed: 42
 metric: val_loss
@@ -19,21 +19,27 @@ pruner:
 
 search_space:
   net_config:
-    # Discrete Flow architecture parameters
-    num_flow_layers:
-      type: int
-      min: 4
-      max: 8
+    # Model architecture parameters
+    kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9]
     hidden_channels:
       type: categorical
-      choices: [32, 48, 64, 80]
-    num_hidden_layers:
+      choices: [32, 64, 96, 128]
+    hidden_conv_layers:
+      type: int
+      min: 3
+      max: 6
+    hidden_kernel_size:
+      type: categorical
+      choices: [3, 5, 7]
+    hidden_width:
+      type: categorical
+      choices: [128, 256, 512]
+    hidden_fc_layers:
       type: int
       min: 1
       max: 3
-    # Note: No dequant_noise search (discrete flow doesn't use it)
-    # Fixed batch configuration (not searchable due to memory)
-    # batch_size: 128, num_beta: 4
   optimizer_config:
     lr:
       type: float
