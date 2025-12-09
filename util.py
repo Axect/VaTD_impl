@@ -446,11 +446,20 @@ class Trainer:
             T=T_expanded
         )
 
+        # DEBUG: Check continuous samples
+        if torch.any(samples_continuous.abs() > 10.0):
+            print(f"WARNING: Extreme continuous samples! Max: {samples_continuous.abs().max().item():.2e}")
+            print(f"  Range: [{samples_continuous.min().item():.2e}, {samples_continuous.max().item():.2e}]")
+
         # Discrete samples (for energy computation validation)
         samples_discrete = self.model.dequantizer.quantize(samples_continuous)
 
         # Compute log probability
         log_prob = self.model.log_prob(samples_continuous, T=T_expanded)
+
+        # DEBUG: Check log_prob
+        if torch.any(log_prob.abs() > 1000.0):
+            print(f"WARNING: Extreme log_prob! Range: [{log_prob.min().item():.2e}, {log_prob.max().item():.2e}]")
 
         # Compute energy (use discrete samples)
         energy = energy_fn(samples_discrete)
@@ -461,7 +470,21 @@ class Trainer:
         # For gradient flow, use continuous samples for energy computation
         energy_for_grad = energy_fn(samples_continuous)
 
+        # DEBUG: Check energies
+        if torch.any(energy.abs() > 1000.0):
+            print(f"WARNING: Extreme discrete energy! Range: [{energy.min().item():.2e}, {energy.max().item():.2e}]")
+        if torch.any(energy_for_grad.abs() > 1000.0):
+            print(f"WARNING: Extreme continuous energy! Range: [{energy_for_grad.min().item():.2e}, {energy_for_grad.max().item():.2e}]")
+
         loss = (log_prob + beta * energy_for_grad).mean()
+
+        # DEBUG: Check final loss
+        if torch.isnan(loss) or torch.isinf(loss) or loss.abs() > 1e10:
+            print(f"CRITICAL: Loss explosion detected! loss = {loss.item():.2e}")
+            print(f"  log_prob: mean={log_prob.mean().item():.2e}, std={log_prob.std().item():.2e}")
+            print(f"  beta: mean={beta.mean().item():.2e}, max={beta.max().item():.2e}")
+            print(f"  energy_for_grad: mean={energy_for_grad.mean().item():.2e}, max={energy_for_grad.max().item():.2e}")
+            print(f"  beta * energy: mean={(beta * energy_for_grad).mean().item():.2e}, max={(beta * energy_for_grad).max().item():.2e}")
 
         self.optimizer.zero_grad()
         loss.backward()

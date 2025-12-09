@@ -430,7 +430,9 @@ class ConditionalCouplingNet(nn.Module):
         log_scale, shift = params.chunk(2, dim=1)  # Each (B, 1, H, W)
 
         # Constrain log_scale for numerical stability
-        log_scale = torch.tanh(log_scale) * 2.0  # Range [-2, 2]
+        # REDUCED RANGE: [-1.5, 1.5] to prevent log_det explosion
+        # With 8 layers × 128 masked positions × 1.5 = max 1536 (more stable)
+        log_scale = torch.tanh(log_scale) * 1.5  # Range [-1.5, 1.5]
 
         return log_scale, shift
 
@@ -653,7 +655,18 @@ class CheckerboardFlowModel(nn.Module):
 
         # Apply penalty for out-of-bounds values (soft boundary)
         # This is more stable than hard -inf boundaries
-        out_of_bounds_penalty = torch.relu(z_flat.abs() - half_width).pow(2).sum(dim=-1)
+        # CRITICAL FIX: Clamp penalty to prevent explosion to -1e+120
+        out_of_bounds = torch.relu(z_flat.abs() - half_width)
+        out_of_bounds_penalty = out_of_bounds.pow(2).sum(dim=-1)
+
+        # DEBUG: Check for extreme values
+        if torch.any(z_flat.abs() > 10.0):
+            print(f"WARNING: Extreme z values detected! Max: {z_flat.abs().max().item():.2e}")
+            print(f"  z_flat range: [{z_flat.min().item():.2e}, {z_flat.max().item():.2e}]")
+            print(f"  out_of_bounds_penalty: {out_of_bounds_penalty.max().item():.2e}")
+
+        # Clamp penalty to prevent catastrophic explosion
+        out_of_bounds_penalty = torch.clamp(out_of_bounds_penalty, max=1000.0)
         log_prob = log_prob - out_of_bounds_penalty
 
         return log_prob
@@ -716,9 +729,23 @@ class CheckerboardFlowModel(nn.Module):
         z = x
         log_det_sum = torch.zeros(x.shape[0], device=x.device)
 
-        for layer in self.coupling_layers:
+        # DEBUG: Check input
+        if torch.any(x.abs() > 10.0):
+            print(f"WARNING: Extreme input x! Max: {x.abs().max().item():.2e}")
+
+        for i, layer in enumerate(self.coupling_layers):
             z, log_det = layer(z, T)
             log_det_sum = log_det_sum + log_det
+
+            # DEBUG: Check for explosions in flow
+            if torch.any(z.abs() > 100.0):
+                print(f"WARNING: Layer {i} produced extreme z! Max: {z.abs().max().item():.2e}")
+                print(f"  log_det range: [{log_det.min().item():.2e}, {log_det.max().item():.2e}]")
+                print(f"  log_det_sum: [{log_det_sum.min().item():.2e}, {log_det_sum.max().item():.2e}]")
+
+        # DEBUG: Final check
+        if torch.any(log_det_sum.abs() > 1000.0):
+            print(f"WARNING: Extreme log_det_sum! Range: [{log_det_sum.min().item():.2e}, {log_det_sum.max().item():.2e}]")
 
         return z, log_det_sum
 
@@ -734,8 +761,21 @@ class CheckerboardFlowModel(nn.Module):
             x: Reconstructed data tensor (B, 1, H, W)
         """
         x = z
-        for layer in reversed(self.coupling_layers):
+        for i, layer in enumerate(reversed(self.coupling_layers)):
             x = layer.inverse(x, T)
+
+            # DEBUG: Check for extreme values during inverse flow
+            if torch.any(x.abs() > 100.0):
+                print(f"WARNING: Inverse layer {len(self.coupling_layers)-1-i} produced extreme x!")
+                print(f"  Max: {x.abs().max().item():.2e}")
+
+        # CRITICAL: Clamp output to reasonable range to prevent energy explosion
+        # Ising spins are {-1, +1}, so with dequantization noise [-1.05, 1.05]
+        # Using [-2, 2] gives enough margin while preventing extreme energies
+        # Energy with s=2: E ≈ -1.0 × 2² × 256 × 2 = -2,048 (acceptable)
+        # vs. Energy with s=5: E ≈ -12,800 (too extreme)
+        x = torch.clamp(x, min=-2.0, max=2.0)
+
         return x
 
     def sample(
