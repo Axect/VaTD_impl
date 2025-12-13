@@ -243,6 +243,14 @@ class DiscretePixelCNN(nn.Module):
         self.mapping = lambda x: 2 * x - 1  # Map {0,1} to {-1,1}
         self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
 
+        # Curriculum learning settings
+        # High temp (low beta) → Low temp (high beta) progression
+        self.curriculum_enabled = hparams.get("curriculum_enabled", False)
+        self.curriculum_warmup_epochs = hparams.get("curriculum_warmup_epochs", 50)
+        self.curriculum_start_beta_max = hparams.get(
+            "curriculum_start_beta_max", self.beta_min * 1.5
+        )
+
         # Initialize MaskedResConv2D
         self.masked_conv = MaskedResConv2D(
             channel=self.channel,

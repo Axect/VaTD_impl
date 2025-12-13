@@ -147,6 +147,7 @@ class Trainer:
         seed=None,
         pruner=None,
         energy_fn=None,
+        epochs=None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -155,6 +156,16 @@ class Trainer:
         self.trial = trial
         self.seed = seed
         self.pruner = pruner
+        self.epochs = epochs
+
+        # Curriculum learning settings
+        # High temp (low beta) → Low temp (high beta) progression
+        self.curriculum_enabled = getattr(model, "curriculum_enabled", False)
+        self.curriculum_warmup_epochs = getattr(model, "curriculum_warmup_epochs", 50)
+        self.curriculum_start_beta_max = getattr(
+            model, "curriculum_start_beta_max", model.beta_min * 1.5
+        )
+        self.current_epoch = 0
 
         # Pre-compute fixed betas for validation (from energy_fn)
         # Validation uses fixed wider range (0.1-2.0) for extrapolation testing
@@ -188,6 +199,28 @@ class Trainer:
         else:
             self.early_stopping = None
 
+    def get_curriculum_beta_range(self):
+        """
+        Get current beta range based on curriculum learning schedule.
+        Starts with high temperature (low beta) and gradually includes lower temperatures (higher beta).
+
+        Returns:
+            tuple: (beta_min, effective_beta_max)
+        """
+        if not self.curriculum_enabled:
+            return self.model.beta_min, self.model.beta_max
+
+        # Linear interpolation from curriculum_start_beta_max to beta_max
+        progress = min(1.0, self.current_epoch / self.curriculum_warmup_epochs)
+        # Use smooth cosine annealing for gradual transition
+        progress = 0.5 * (1 - math.cos(math.pi * progress))
+
+        effective_beta_max = (
+            self.curriculum_start_beta_max
+            + progress * (self.model.beta_max - self.curriculum_start_beta_max)
+        )
+        return self.model.beta_min, effective_beta_max
+
     def step(self, batch_size, T):
         # Sample from PixelCNN (no gradient tracking needed for sampling)
         with torch.no_grad():
@@ -197,9 +230,11 @@ class Trainer:
 
     def train_epoch(self, energy_fn):
         batch_size = self.model.batch_size
-        beta_min = self.model.beta_min
-        beta_max = self.model.beta_max
         num_beta = self.model.num_beta
+
+        # Get curriculum-adjusted beta range
+        beta_min, beta_max = self.get_curriculum_beta_range()
+
         # Log-uniform sampling for beta (matches validation's log-spaced distribution)
         log_beta_samples = torch.rand(num_beta, device=self.device) * (
             math.log(beta_max) - math.log(beta_min)
@@ -344,6 +379,9 @@ class Trainer:
         val_losses = []
 
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
+            # Update current epoch for curriculum learning
+            self.current_epoch = epoch
+
             # Standard REINFORCE training
             train_loss = self.train_epoch(energy_fn)
 
@@ -363,10 +401,17 @@ class Trainer:
                     tqdm.write(f"Early stopping triggered at epoch {epoch}")
                     break
 
+            # Get current curriculum beta range for logging
+            curr_beta_min, curr_beta_max = self.get_curriculum_beta_range()
+
             log_dict = {
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "lr": self.optimizer.param_groups[0]["lr"],
+                "curriculum_beta_min": curr_beta_min,
+                "curriculum_beta_max": curr_beta_max,
+                "curriculum_T_min": 1.0 / curr_beta_max,
+                "curriculum_T_max": 1.0 / curr_beta_min,
             }
 
             # Add individual beta losses and beta values
@@ -491,6 +536,7 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 seed=seed,
                 pruner=pruner,
                 energy_fn=energy_fn,
+                epochs=run_config.epochs,
             )
 
             val_loss = trainer.train(energy_fn, epochs=run_config.epochs)

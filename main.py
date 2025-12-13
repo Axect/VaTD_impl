@@ -53,6 +53,7 @@ def create_adjacency_matrix(L, d=2):
 def create_ising_energy_fn(L, d=2, device="cpu"):
     """
     Create Ising energy function for a d-dimensional lattice.
+    Uses O(N) sparse computation instead of O(N²) adjacency matrix.
 
     Args:
         L: lattice size
@@ -62,28 +63,29 @@ def create_ising_energy_fn(L, d=2, device="cpu"):
     Returns:
         energy function that takes samples (B, 1, H, W) and returns (B, 1)
     """
-    # Create adjacency matrix and convert to torch
-    Adj = create_adjacency_matrix(L, d)
-    N = (
-        torch.from_numpy(Adj).float().to(device) * -1
-    )  # multiply by -1 like VanillaIsing
 
     def energy_fn(samples):
         """
-        Calculate Ising energy for batch of samples.
+        Calculate Ising energy for batch of samples using sparse nearest-neighbor computation.
+        O(N) complexity instead of O(N²) with adjacency matrix.
 
         Args:
             samples: (B, 1, H, W) tensor with values in {-1, 1}
 
         Returns:
             (B, 1) energy values
-        """
-        # Flatten spatial dimensions: (B, 1, H, W) -> (B, H*W)
-        flat_samples = samples.flatten(-2)  # (B, 1, H*W)
 
-        # Energy calculation: E = sum_ij J_ij * s_i * s_j / 2
-        # = (s @ N) * s / 2 where N is adjacency matrix * -J
-        energy = ((flat_samples @ N) * flat_samples).sum([-2, -1]).unsqueeze(-1) / 2
+        Energy: E = -J * sum_{<i,j>} s_i * s_j  (J=1)
+        With periodic boundary conditions, each bond counted once.
+        """
+        # Count each bond once: right and down neighbors only (periodic BCs via roll)
+        # This avoids double-counting that would require /2
+        right_neighbor = torch.roll(samples, shifts=-1, dims=-1)
+        down_neighbor = torch.roll(samples, shifts=-1, dims=-2)
+
+        # E = -J * sum(s_i * s_j) for each bond, J=1
+        energy = -(samples * right_neighbor + samples * down_neighbor)
+        energy = energy.sum(dim=[-1, -2, -3]).unsqueeze(-1)
 
         return energy
 
