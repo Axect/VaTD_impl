@@ -1,7 +1,7 @@
 project: Ising_VaTD_v0.8
 device: cuda:0
 net: model.DiscretePixelCNN
-optimizer: splus.SPlus
+optimizer: torch.optim.AdamW
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 10
 batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
@@ -34,8 +34,8 @@ net_config:
   hidden_fc_layers: 2   # Number of FC layers
 
 optimizer_config:
-  lr: 1.e-1  # Learning rate
-  eps: 1.e-10
+  lr: 1.e-3
+  weight_decay: 1.e-4
 
 scheduler_config:
   upper_bound: 300

@@ -345,18 +345,17 @@ class DiscretePixelCNN(nn.Module):
             sample = torch.cat([sample, T_expanded], dim=1)
 
         unnormalized = self.masked_conv.forward(sample)  # (B, Cat, C, H, W)
-        prob = torch.softmax(unnormalized, dim=1)
+        # Use log_softmax for numerical stability (avoids log(softmax()) underflow)
+        log_prob = F.log_softmax(unnormalized, dim=1)
 
         if T is not None:
             # Caution: original code has potential bug here, fixed it.
             sample = sample[:, : self.channel, :, :]
 
         # (B, 1, C, H, W)
-        log_prob_selected = torch.log(
-            prob.gather(
-                1, sample.long().unsqueeze(1)
-            )  # Find the probabilities of the selected categories
-        )
+        log_prob_selected = log_prob.gather(
+            1, sample.long().unsqueeze(1)
+        )  # Find the log probabilities of the selected categories
 
         # (B, C, H * W)
         log_prob_selected = einops.rearrange(
