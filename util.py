@@ -264,37 +264,32 @@ class Trainer:
 
         self.optimizer.zero_grad()
 
-        # Separate gradient computation:
+        # VaTD Gradient Computation:
         # Free Energy: F = E_q[log q(x|T) + β·E(x)]
         #
-        # Part 1: log q term - direct gradient (differentiable)
-        # ∇_θ E_q[log q] can be computed directly since q depends on θ
-        log_prob_loss = torch.mean(log_prob_view)
-
-        # Part 2: β·E term - REINFORCE (score function estimator)
-        # ∇_θ E_q[β·E] = E_q[∇_θ log q · β·E] since E is independent of θ
+        # Correct gradient (via Leibniz rule / REINFORCE):
+        # ∇_θ F = E_q[(log q + β·E) · ∇_θ log q]
+        #
+        # Both log q and β·E terms use REINFORCE with (log q + β·E) as weight
         beta_energy = beta_expanded * energy_view
+
+        # Full REINFORCE weight: log q + β·E
+        reinforce_weight = log_prob_view.detach() + beta_energy
 
         # RLOO: Leave-One-Out baseline for variance reduction
         # For each sample, baseline is mean of all OTHER samples
-        # Shape: beta_energy is (num_beta, batch_size)
-
-        # Compute sum of energies across batch dimension
-        sum_energy = beta_energy.sum(dim=1, keepdim=True)  # (num_beta, 1)
+        # Shape: reinforce_weight is (num_beta, batch_size)
+        sum_weight = reinforce_weight.sum(dim=1, keepdim=True)  # (num_beta, 1)
 
         # Leave-one-out baseline: (sum - current_sample) / (N - 1)
-        loo_baseline = (sum_energy - beta_energy) / (batch_size - 1)
-        loo_baseline = loo_baseline.detach()
+        loo_baseline = (sum_weight - reinforce_weight) / (batch_size - 1)
 
-        # Advantage with LOO baseline (must be detached)
-        advantage = (beta_energy - loo_baseline).detach()
+        # Advantage with LOO baseline (must be detached for REINFORCE)
+        advantage = (reinforce_weight - loo_baseline).detach()
 
-        # REINFORCE gradient for energy term
-        energy_reinforce_loss = torch.mean(advantage * log_prob_view)
-
-        # Total loss (combines both gradient estimates)
-        total_loss = log_prob_loss + energy_reinforce_loss
-        total_loss.backward()
+        # REINFORCE loss: gradient is E[(log q + β·E - baseline) · ∇log q]
+        loss = torch.mean(advantage * log_prob_view)
+        loss.backward()
 
         # Log the actual Free Energy (not the surrogate loss)
         train_loss = (log_prob_view + beta_expanded * energy_view).mean().item()
