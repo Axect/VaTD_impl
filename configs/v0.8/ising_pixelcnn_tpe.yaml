@@ -9,13 +9,8 @@ sampler:
   kwargs:
     n_startup_trials: 10
 
-pruner:
-  name: pruner.PFLPruner
-  kwargs:
-    n_startup_trials: 20
-    n_warmup_epochs: 20
-    top_k: 10
-    target_epoch: 100
+# Note: Divergence detection (NaN/Inf, sign flip, plateau) is implemented
+# in util.py and will raise optuna.TrialPruned() for bad trials automatically
 
 search_space:
   net_config:
@@ -52,7 +47,7 @@ search_space:
     lr:
       type: float
       min: 1.e-4
-      max: 1.e-1
+      max: 1.e-2  # Reduced from 1e-1 to avoid divergence
       log: true
     weight_decay:
       type: float

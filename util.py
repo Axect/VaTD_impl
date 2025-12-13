@@ -372,6 +372,9 @@ class Trainer:
     def train(self, energy_fn, epochs):
         val_loss = 0
         val_losses = []
+        initial_train_loss = None
+        plateau_counter = 0
+        last_val_loss = None
 
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
             # Update current epoch for curriculum learning
@@ -384,11 +387,48 @@ class Trainer:
             val_loss = val_dict["val_loss"]
             val_losses.append(val_loss)
 
-            # Early stopping if loss becomes NaN
+            # Track initial train_loss for divergence detection
+            if initial_train_loss is None:
+                initial_train_loss = train_loss
+
+            # Early stopping if loss becomes NaN or Inf
             if math.isnan(train_loss) or math.isnan(val_loss):
                 tqdm.write("Early stopping due to NaN loss")
                 val_loss = math.inf
+                if self.trial is not None:
+                    raise optuna.TrialPruned()
                 break
+
+            if math.isinf(train_loss) or math.isinf(val_loss):
+                tqdm.write("Early stopping due to Inf loss")
+                val_loss = math.inf
+                if self.trial is not None:
+                    raise optuna.TrialPruned()
+                break
+
+            # Divergence detection: train_loss sign changed (negative -> positive)
+            if initial_train_loss < 0 and train_loss > 0:
+                tqdm.write(f"Divergence detected: train_loss sign flipped ({train_loss:.2f})")
+                val_loss = math.inf
+                if self.trial is not None:
+                    raise optuna.TrialPruned()
+                break
+
+            # Plateau detection using relative error (for at least 10 epochs)
+            if last_val_loss is not None and epoch >= 10:
+                rel_change = abs(val_loss - last_val_loss) / (abs(last_val_loss) + 1e-8)
+                if rel_change < 1e-5:
+                    plateau_counter += 1
+                else:
+                    plateau_counter = 0
+
+                if plateau_counter >= 10:
+                    tqdm.write(f"Plateau detected for {plateau_counter} epochs")
+                    if self.trial is not None:
+                        raise optuna.TrialPruned()
+                    break
+
+            last_val_loss = val_loss
 
             # Early stopping check
             if self.early_stopping is not None:
