@@ -85,7 +85,10 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu"):
     model.eval()
     n_temps = len(betas)
 
-    fig, axes = plt.subplots(n_temps, n_samples, figsize=(n_samples * 2, n_temps * 2))
+    # Extra width for temperature labels
+    fig, axes = plt.subplots(
+        n_temps, n_samples, figsize=(n_samples * 2 + 0.8, n_temps * 2)
+    )
     if n_temps == 1:
         axes = axes.reshape(1, -1)
     if n_samples == 1:
@@ -93,17 +96,28 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu"):
 
     with torch.no_grad():
         for i, beta in enumerate(betas):
+            T_val = 1.0 / beta.item()
             T = (1.0 / beta).expand(n_samples).to(device)
             samples = model.sample(batch_size=n_samples, T=T)
 
             for j in range(n_samples):
                 sample = samples[j, 0].cpu().numpy()  # (H, W)
                 axes[i, j].imshow(sample, cmap="coolwarm", vmin=-1, vmax=1)
-                axes[i, j].axis("off")
-                if j == 0:
-                    axes[i, j].set_ylabel(f"T={1/beta.item():.2f}", fontsize=10)
+                axes[i, j].set_xticks([])
+                axes[i, j].set_yticks([])
 
-    plt.suptitle("Ising Samples (blue=-1, red=+1)", fontsize=12)
+                # Add temperature label on the left of first column
+                if j == 0:
+                    axes[i, j].set_ylabel(
+                        f"T={T_val:.2f}\n(β={beta.item():.2f})",
+                        fontsize=9,
+                        rotation=0,
+                        ha="right",
+                        va="center",
+                        labelpad=10,
+                    )
+
+    plt.suptitle("Ising Samples (blue=−1, red=+1)", fontsize=12)
     plt.tight_layout()
     return fig
 
