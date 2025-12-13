@@ -6,6 +6,10 @@ from rich.console import Console
 import wandb
 import optuna
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib
+
+matplotlib.use("Agg")  # Non-interactive backend for server
 
 from config import RunConfig
 
@@ -63,6 +67,45 @@ def sign_log_transform(x):
 
     sign = 1 if x > 0 else -1
     return sign * math.log10(1 + abs(x))
+
+
+def create_sample_grid(model, betas, n_samples=4, device="cpu"):
+    """
+    Generate and visualize Ising model samples at different temperatures.
+
+    Args:
+        model: DiscretePixelCNN model
+        betas: tensor of beta values (1/T)
+        n_samples: number of samples per temperature
+        device: torch device
+
+    Returns:
+        matplotlib figure
+    """
+    model.eval()
+    n_temps = len(betas)
+
+    fig, axes = plt.subplots(n_temps, n_samples, figsize=(n_samples * 2, n_temps * 2))
+    if n_temps == 1:
+        axes = axes.reshape(1, -1)
+    if n_samples == 1:
+        axes = axes.reshape(-1, 1)
+
+    with torch.no_grad():
+        for i, beta in enumerate(betas):
+            T = (1.0 / beta).expand(n_samples).to(device)
+            samples = model.sample(batch_size=n_samples, T=T)
+
+            for j in range(n_samples):
+                sample = samples[j, 0].cpu().numpy()  # (H, W)
+                axes[i, j].imshow(sample, cmap="coolwarm", vmin=-1, vmax=1)
+                axes[i, j].axis("off")
+                if j == 0:
+                    axes[i, j].set_ylabel(f"T={1/beta.item():.2f}", fontsize=10)
+
+    plt.suptitle("Ising Samples (blue=-1, red=+1)", fontsize=12)
+    plt.tight_layout()
+    return fig
 
 
 def set_seed(seed: int):
@@ -298,7 +341,32 @@ class Trainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
-        return train_loss
+        # Compute statistics for debugging (detect mode collapse)
+        with torch.no_grad():
+            log_prob_mean = log_prob_view.mean().item()
+            log_prob_std = log_prob_view.std().item()
+            energy_mean = energy_view.mean().item()
+            energy_std = energy_view.std().item()
+
+            # Sample diversity: variance across samples (low = potential collapse)
+            # samples shape: (total_size, 1, H, W), values in {-1, 1}
+            sample_diversity = samples.var(dim=0).mean().item()
+
+            # Magnetization: mean spin value (|m| close to 1 = ordered/collapsed)
+            magnetization = samples.mean(dim=(1, 2, 3))  # per-sample magnetization
+            magnetization_mean = magnetization.abs().mean().item()
+
+        stats = {
+            "train_loss": train_loss,
+            "log_prob_mean": log_prob_mean,
+            "log_prob_std": log_prob_std,
+            "energy_mean": energy_mean,
+            "energy_std": energy_std,
+            "sample_diversity": sample_diversity,
+            "magnetization_mean": magnetization_mean,
+        }
+
+        return stats
 
     def val_epoch(self, energy_fn):
         """
@@ -380,8 +448,9 @@ class Trainer:
             # Update current epoch for curriculum learning
             self.current_epoch = epoch
 
-            # Standard REINFORCE training
-            train_loss = self.train_epoch(energy_fn)
+            # Standard REINFORCE training (returns dict with stats)
+            train_stats = self.train_epoch(energy_fn)
+            train_loss = train_stats["train_loss"]
 
             val_dict = self.val_epoch(energy_fn)
             val_loss = val_dict["val_loss"]
@@ -449,6 +518,14 @@ class Trainer:
                 "curriculum_T_max": 1.0 / curr_beta_min,
             }
 
+            # Add training statistics for debugging (detect mode collapse)
+            log_dict["log_prob_mean"] = train_stats["log_prob_mean"]
+            log_dict["log_prob_std"] = train_stats["log_prob_std"]
+            log_dict["energy_mean"] = train_stats["energy_mean"]
+            log_dict["energy_std"] = train_stats["energy_std"]
+            log_dict["sample_diversity"] = train_stats["sample_diversity"]
+            log_dict["magnetization_mean"] = train_stats["magnetization_mean"]
+
             # Add individual beta losses and beta values
             # Use validation beta count (may differ from training num_beta)
             val_num_beta = len(self.fixed_val_betas)
@@ -515,6 +592,20 @@ class Trainer:
                 self.scheduler.step(val_loss)
             else:
                 self.scheduler.step()
+
+            # Log sample visualization periodically (every 10 epochs or at start/end)
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                try:
+                    # Use a subset of validation betas for visualization
+                    vis_betas = self.fixed_val_betas[::2]  # Every other beta
+                    fig = create_sample_grid(
+                        self.model, vis_betas, n_samples=4, device=self.device
+                    )
+                    log_dict["samples"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    tqdm.write(f"Sample visualization failed: {e}")
+
             wandb.log(log_dict)
             if epoch % 10 == 0 or epoch == epochs - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
