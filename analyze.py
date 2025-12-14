@@ -233,8 +233,10 @@ def compute_thermodynamic_quantities(
         E_model_AD = grad_loss.item()
 
         # Second derivative for heat capacity
+        # Note: loss ≈ -log Z, so d²(log Z)/dβ² ≈ -d²(loss)/dβ²
+        # Therefore Cv = β² × d²(log Z)/dβ² = -β² × d²(loss)/dβ²
         grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
-        Cv_model_AD = (beta**2) * grad2_loss.item()
+        Cv_model_AD = -(beta**2) * grad2_loss.item()
 
         # Collect results
         results.append(
