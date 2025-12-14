@@ -22,25 +22,25 @@ net_config:
   # High temp (low beta, disordered) -> Low temp (high beta, ordered)
   # Critical temperature: T_c = 2.269, beta_c = 0.44
   curriculum_enabled: true
-  curriculum_warmup_epochs: 100  # Epochs to reach full beta range
-  curriculum_start_beta_max: 0.35  # Start at T ~ 2.86 (slightly above T_c)
+  curriculum_warmup_epochs: 75    # Epochs to reach full beta range
+  curriculum_start_beta_max: 0.4251773887212732
 
   # Model architecture (tuned: wider channels, fewer layers)
-  kernel_size: 9        # First masked conv kernel size
+  kernel_size: 3        # First masked conv kernel size
   hidden_channels: 128  # Wider hidden channels
-  hidden_conv_layers: 3 # Fewer layers for faster training
-  hidden_kernel_size: 5 # Kernel size in residual blocks
-  hidden_width: 512     # Wider FC layers
+  hidden_conv_layers: 6 # Fewer layers for faster training
+  hidden_kernel_size: 3 # Kernel size in residual blocks
+  hidden_width: 256     # Wider FC layers
   hidden_fc_layers: 2   # Number of FC layers
 
 optimizer_config:
-  lr: 1.e-3
-  weight_decay: 1.e-4
+  lr: 0.005029274848552838
+  weight_decay: 6.012611545281924e-06
 
 scheduler_config:
-  upper_bound: 400
+  upper_bound: 300
   max_iter: 250
-  infimum_lr: 1.e-6
+  infimum_lr: 4.324992511939606e-06
 
 early_stopping_config:
   enabled: false

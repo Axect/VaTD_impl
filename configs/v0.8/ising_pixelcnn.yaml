@@ -23,7 +23,7 @@ net_config:
   # Critical temperature: T_c = 2.269, beta_c = 0.44
   curriculum_enabled: true
   curriculum_warmup_epochs: 75    # Epochs to reach full beta range
-  curriculum_start_beta_max: 0.3  # Start at T = 3.33 (disordered phase)
+  curriculum_start_beta_max: 0.4251773887212732
 
   # Model architecture
   kernel_size: 7        # First masked conv kernel size
