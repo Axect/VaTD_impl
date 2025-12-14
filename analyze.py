@@ -109,6 +109,156 @@ def test_model_ising(
     return pd.DataFrame(results)
 
 
+def compute_thermodynamic_quantities(
+    model,
+    energy_fn,
+    L,
+    device="cpu",
+    num_temps=20,
+    batch_size=1000,
+    T_min=None,
+    T_max=None,
+):
+    """
+    Compute thermodynamic quantities using sampling and automatic differentiation.
+
+    Two methods are used:
+    1. Sampling (Monte Carlo): Uses samples from the model
+       - Mean energy: <E> = mean(energy(samples))
+       - Heat capacity: C_v = beta^2 * (<E^2> - <E>^2)
+       - Magnetization: M = <|m|> where m = (1/N) * sum(s_i) per sample
+       - Susceptibility: chi = beta * N * (<m^2> - <|m|>^2)
+
+    2. Automatic Differentiation:
+       - From exact log Z: d(log Z)/d(beta) and d^2(log Z)/d(beta)^2
+       - From model log_prob: differentiating through log_prob(sample, T) w.r.t. beta
+
+    Args:
+        model: Trained DiscretePixelCNN model
+        energy_fn: Ising energy function
+        L: Lattice size
+        device: Device to run on
+        num_temps: Number of temperature points
+        batch_size: Samples per temperature (larger for better statistics)
+        T_min: Minimum temperature (default: 0.7*Tc)
+        T_max: Maximum temperature (default: 1.3*Tc)
+
+    Returns:
+        pandas.DataFrame with columns:
+            - T, beta, T/Tc: Temperature parameters
+            - E_sampling, Cv_sampling, M_sampling, chi_sampling: Sampling-based
+            - E_exact_AD, Cv_exact_AD: Exact log Z via AD
+            - E_model_AD, Cv_model_AD: Model log_prob via AD
+    """
+    # Temperature range
+    if T_min is None:
+        T_min = 0.7 * CRITICAL_TEMPERATURE
+    if T_max is None:
+        T_max = 1.3 * CRITICAL_TEMPERATURE
+
+    T_values = np.linspace(T_min, T_max, num_temps)
+    N = L * L  # Total number of spins
+
+    results = []
+
+    model.eval()
+
+    for T in T_values:
+        beta = 1.0 / T
+        T_tensor = torch.full((batch_size,), T, device=device)
+
+        # ============================================
+        # METHOD 1: Sampling-based quantities
+        # ============================================
+        with torch.no_grad():
+            samples = model.sample(batch_size=batch_size, T=T_tensor)
+            energies = energy_fn(samples).squeeze()  # (batch_size,)
+
+            # Mean energy
+            E_mean = energies.mean().item()
+            E2_mean = (energies**2).mean().item()
+
+            # Heat capacity via fluctuation-dissipation: C_v = beta^2 * Var(E)
+            Cv_sampling = (beta**2) * (E2_mean - E_mean**2)
+
+            # Magnetization per spin: m = (1/N) * sum(s_i)
+            magnetization_per_spin = samples.sum(dim=(1, 2, 3)) / N  # (batch_size,)
+            abs_m = magnetization_per_spin.abs()
+            M_mean = abs_m.mean().item()
+            M2_mean = (magnetization_per_spin**2).mean().item()
+
+            # Susceptibility: chi = beta * N * (<m^2> - <|m|>^2)
+            chi_sampling = beta * N * (M2_mean - M_mean**2)
+
+        # ============================================
+        # METHOD 2a: AD through exact log Z (Onsager)
+        # ============================================
+        # E_exact = -d(log Z)/d(beta)
+        # Cv_exact = beta^2 * d^2(log Z)/d(beta)^2
+
+        beta_tensor = torch.tensor(beta, dtype=torch.float64, requires_grad=True)
+        log_Z = exact_logZ(n=L, j=1.0, beta=beta_tensor)
+
+        # First derivative
+        grad_logZ = torch.autograd.grad(log_Z, beta_tensor, create_graph=True)[0]
+        E_exact_AD = -grad_logZ.item()
+
+        # Second derivative
+        grad2_logZ = torch.autograd.grad(grad_logZ, beta_tensor)[0]
+        Cv_exact_AD = (beta**2) * grad2_logZ.item()
+
+        # ============================================
+        # METHOD 2b: AD through model log_prob
+        # ============================================
+        # Use fixed samples (detached) but differentiate log_prob w.r.t. beta
+        # loss(beta) = <log q(x|T) + beta * E(x)> approx -log Z
+        # d(loss)/d(beta) includes both explicit beta term and implicit T=1/beta
+
+        with torch.no_grad():
+            samples_for_ad = model.sample(batch_size=batch_size, T=T_tensor)
+            energies_for_ad = energy_fn(samples_for_ad).squeeze()
+
+        # Compute log_prob with gradient tracking on beta
+        beta_model = torch.tensor(
+            beta, dtype=torch.float32, device=device, requires_grad=True
+        )
+        T_model = 1.0 / beta_model
+        T_expanded = T_model.expand(batch_size)
+
+        # samples_for_ad is fixed, but T_expanded carries gradient
+        log_prob_ad = model.log_prob(samples_for_ad, T=T_expanded)
+        loss_model = (log_prob_ad + beta_model * energies_for_ad.unsqueeze(-1)).mean()
+
+        grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
+        E_model_AD = grad_loss.item()
+
+        # Second derivative for heat capacity
+        grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
+        Cv_model_AD = (beta**2) * grad2_loss.item()
+
+        # Collect results
+        results.append(
+            {
+                "T": T,
+                "beta": beta,
+                "T/Tc": T / CRITICAL_TEMPERATURE,
+                # Sampling
+                "E_sampling": E_mean,
+                "Cv_sampling": Cv_sampling,
+                "M_sampling": M_mean,
+                "chi_sampling": chi_sampling,
+                # Exact AD
+                "E_exact_AD": E_exact_AD,
+                "Cv_exact_AD": Cv_exact_AD,
+                # Model AD
+                "E_model_AD": E_model_AD,
+                "Cv_model_AD": Cv_model_AD,
+            }
+        )
+
+    return pd.DataFrame(results)
+
+
 def visualize_lattice_samples(
     model,
     L,
@@ -307,6 +457,235 @@ def plot_model_vs_exact(
     plt.tight_layout()
     output_path = f"{output_dir}/{filename}"
     plt.savefig(output_path, dpi=150)
+    plt.close()
+
+    return output_path
+
+
+def plot_thermodynamic_quantities(
+    df,
+    output_dir="figs",
+    title_suffix="",
+    filename="thermodynamic_analysis.png",
+):
+    """
+    Generate comprehensive plots for thermodynamic quantities.
+
+    Creates 2x2 subplot figure:
+    - (0,0): Mean Energy - Sampling vs Exact AD vs Model AD
+    - (0,1): Heat Capacity - Sampling vs Exact AD vs Model AD
+    - (1,0): Magnetization - Sampling only
+    - (1,1): Susceptibility - Sampling only
+
+    Args:
+        df: DataFrame from compute_thermodynamic_quantities()
+        output_dir: Directory to save plots
+        title_suffix: Suffix for plot titles
+        filename: Output filename
+
+    Returns:
+        str: Path to saved plot
+    """
+    Path(output_dir).mkdir(exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+    # ============================================
+    # Plot (0,0): Mean Energy Comparison
+    # ============================================
+    ax = axes[0, 0]
+    ax.plot(df["T"], df["E_sampling"], "o-", label="Sampling", markersize=4)
+    ax.plot(df["T"], df["E_exact_AD"], "s--", label="Exact (AD)", markersize=4)
+    ax.plot(df["T"], df["E_model_AD"], "^:", label="Model (AD)", markersize=4)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Mean Energy ⟨E⟩")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Mean Energy{title_suffix}")
+
+    # ============================================
+    # Plot (0,1): Heat Capacity Comparison
+    # ============================================
+    ax = axes[0, 1]
+    ax.plot(df["T"], df["Cv_sampling"], "o-", label="Sampling", markersize=4)
+    ax.plot(df["T"], df["Cv_exact_AD"], "s--", label="Exact (AD)", markersize=4)
+    ax.plot(df["T"], df["Cv_model_AD"], "^:", label="Model (AD)", markersize=4)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Heat Capacity Cv")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Heat Capacity{title_suffix}")
+
+    # ============================================
+    # Plot (1,0): Magnetization (Sampling only)
+    # ============================================
+    ax = axes[1, 0]
+    ax.plot(df["T"], df["M_sampling"], "o-", label="Sampling ⟨|m|⟩", markersize=4)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.axhline(0, color="k", linestyle="-", alpha=0.2)
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Magnetization ⟨|m|⟩")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Magnetization{title_suffix}")
+
+    # ============================================
+    # Plot (1,1): Susceptibility (Sampling only)
+    # ============================================
+    ax = axes[1, 1]
+    ax.plot(df["T"], df["chi_sampling"], "o-", label="Sampling", markersize=4)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Susceptibility χ")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Susceptibility{title_suffix}")
+
+    plt.tight_layout()
+    output_path = f"{output_dir}/{filename}"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    return output_path
+
+
+def plot_thermodynamic_errors(
+    df,
+    output_dir="figs",
+    title_suffix="",
+    filename="thermodynamic_errors.png",
+):
+    """
+    Generate error comparison plots for thermodynamic quantities.
+
+    Creates 2x2 subplot figure comparing:
+    - Energy: Sampling vs Exact AD, Model AD vs Exact AD
+    - Heat Capacity: Sampling vs Exact AD, Model AD vs Exact AD
+
+    Args:
+        df: DataFrame from compute_thermodynamic_quantities()
+        output_dir: Directory to save plots
+        title_suffix: Suffix for plot titles
+        filename: Output filename
+
+    Returns:
+        str: Path to saved plot
+    """
+    Path(output_dir).mkdir(exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Compute errors
+    E_sampling_error = df["E_sampling"] - df["E_exact_AD"]
+    E_model_error = df["E_model_AD"] - df["E_exact_AD"]
+    Cv_sampling_error = df["Cv_sampling"] - df["Cv_exact_AD"]
+    Cv_model_error = df["Cv_model_AD"] - df["Cv_exact_AD"]
+
+    # ============================================
+    # Plot (0,0): Energy - Sampling Error
+    # ============================================
+    ax = axes[0, 0]
+    ax.plot(df["T"], E_sampling_error, "o-", markersize=4)
+    ax.axhline(0, color="k", linestyle="-", alpha=0.3)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Error (Sampling - Exact)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Energy: Sampling Error{title_suffix}")
+
+    # ============================================
+    # Plot (0,1): Energy - Model AD Error
+    # ============================================
+    ax = axes[0, 1]
+    ax.plot(df["T"], E_model_error, "o-", markersize=4, color="orange")
+    ax.axhline(0, color="k", linestyle="-", alpha=0.3)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Error (Model AD - Exact)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Energy: Model AD Error{title_suffix}")
+
+    # ============================================
+    # Plot (1,0): Heat Capacity - Sampling Error
+    # ============================================
+    ax = axes[1, 0]
+    ax.plot(df["T"], Cv_sampling_error, "o-", markersize=4)
+    ax.axhline(0, color="k", linestyle="-", alpha=0.3)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Error (Sampling - Exact)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Heat Capacity: Sampling Error{title_suffix}")
+
+    # ============================================
+    # Plot (1,1): Heat Capacity - Model AD Error
+    # ============================================
+    ax = axes[1, 1]
+    ax.plot(df["T"], Cv_model_error, "o-", markersize=4, color="orange")
+    ax.axhline(0, color="k", linestyle="-", alpha=0.3)
+    ax.axvline(
+        CRITICAL_TEMPERATURE,
+        color="r",
+        linestyle="--",
+        alpha=0.5,
+        label=f"Tc = {CRITICAL_TEMPERATURE:.3f}",
+    )
+    ax.set_xlabel("Temperature T")
+    ax.set_ylabel("Error (Model AD - Exact)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Heat Capacity: Model AD Error{title_suffix}")
+
+    plt.tight_layout()
+    output_path = f"{output_dir}/{filename}"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
     return output_path
@@ -564,6 +943,84 @@ def main():
     console.print(
         f"[green]✓[/green] Saved critical range lattice samples to {lattice_plot_path_critical}"
     )
+
+    # ========================================
+    # Test 5: Thermodynamic Quantities Analysis
+    # ========================================
+    console.print(
+        "\n[bold cyan]Test 5: Thermodynamic Quantities Analysis[/bold cyan]"
+    )
+    console.print(
+        "Computing thermodynamic quantities (sampling + automatic differentiation)..."
+    )
+
+    df_thermo = compute_thermodynamic_quantities(
+        model,
+        energy_fn,
+        L,
+        device=device,
+        num_temps=20,
+        batch_size=1000,
+        T_min=0.7 * CRITICAL_TEMPERATURE,
+        T_max=1.3 * CRITICAL_TEMPERATURE,
+    )
+
+    # Display results
+    console.print("\n" + "=" * 80)
+    console.print("THERMODYNAMIC QUANTITIES")
+    console.print("=" * 80)
+    # Show selected columns for readability
+    display_cols = [
+        "T",
+        "T/Tc",
+        "E_sampling",
+        "E_exact_AD",
+        "Cv_sampling",
+        "Cv_exact_AD",
+        "M_sampling",
+        "chi_sampling",
+    ]
+    console.print(df_thermo[display_cols].to_string(index=False))
+    console.print("=" * 80)
+
+    # Generate plots
+    console.print("\n[bold]Generating thermodynamic quantity plots...[/bold]")
+    thermo_plot_path = plot_thermodynamic_quantities(
+        df_thermo,
+        title_suffix=" (Critical Range)",
+        filename=f"thermodynamic_analysis_{seed}.png",
+    )
+    console.print(f"[green]✓[/green] Saved plot to {thermo_plot_path}")
+
+    thermo_error_path = plot_thermodynamic_errors(
+        df_thermo,
+        title_suffix=" (Critical Range)",
+        filename=f"thermodynamic_errors_{seed}.png",
+    )
+    console.print(f"[green]✓[/green] Saved error plot to {thermo_error_path}")
+
+    # Save results
+    thermo_output_file = f"{output_dir}/thermodynamic_results_{seed}.csv"
+    df_thermo.to_csv(thermo_output_file, index=False)
+    console.print(f"[green]✓[/green] Saved results to {thermo_output_file}")
+
+    # Summary statistics at critical temperature
+    idx_tc = (df_thermo["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
+    row_tc = df_thermo.loc[idx_tc]
+    console.print(f"\n[bold yellow]Summary at Critical Temperature:[/bold yellow]")
+    console.print(f"  T = {row_tc['T']:.4f} (T/Tc = {row_tc['T/Tc']:.3f})")
+    console.print(
+        f"  Energy: Sampling={row_tc['E_sampling']:.4f}, "
+        f"Exact AD={row_tc['E_exact_AD']:.4f}, "
+        f"Model AD={row_tc['E_model_AD']:.4f}"
+    )
+    console.print(
+        f"  Heat Capacity: Sampling={row_tc['Cv_sampling']:.4f}, "
+        f"Exact AD={row_tc['Cv_exact_AD']:.4f}, "
+        f"Model AD={row_tc['Cv_model_AD']:.4f}"
+    )
+    console.print(f"  Magnetization: {row_tc['M_sampling']:.4f}")
+    console.print(f"  Susceptibility: {row_tc['chi_sampling']:.4f}")
 
     console.print(
         "\n[bold green]Analysis complete! All results saved to output directory.[/bold green]"
