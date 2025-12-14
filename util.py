@@ -216,13 +216,22 @@ class Trainer:
         self.epochs = epochs
 
         # Curriculum learning settings
-        # High temp (low beta) → Low temp (high beta) progression
+        # 3-Phase curriculum: High temp only → Full expansion → Tc-focused
         self.curriculum_enabled = getattr(model, "curriculum_enabled", False)
-        self.curriculum_warmup_epochs = getattr(model, "curriculum_warmup_epochs", 50)
-        self.curriculum_start_beta_max = getattr(
-            model, "curriculum_start_beta_max", model.beta_min * 1.5
-        )
         self.current_epoch = 0
+
+        # Phase 1: High temperature only (disordered phase)
+        self.phase1_epochs = getattr(model, "phase1_epochs", 50)
+        self.phase1_beta_max = getattr(model, "phase1_beta_max", 0.35)
+
+        # Phase 2: Expand to full range
+        self.phase2_epochs = getattr(model, "phase2_epochs", 100)  # Duration, not end
+
+        # Phase 3: Mixed sampling with Tc focus
+        # tc_focus_ratio: fraction of samples from Tc region
+        self.tc_focus_ratio = getattr(model, "tc_focus_ratio", 0.3)
+        self.tc_beta_min = getattr(model, "tc_beta_min", 0.38)
+        self.tc_beta_max = getattr(model, "tc_beta_max", 0.52)
 
         # Pre-compute fixed betas for validation (from energy_fn)
         # Validation uses fixed wider range (0.1-2.0) for extrapolation testing
@@ -256,10 +265,27 @@ class Trainer:
         else:
             self.early_stopping = None
 
+    def get_curriculum_phase(self):
+        """
+        Determine current curriculum phase based on epoch.
+
+        Returns:
+            int: Phase number (1, 2, or 3)
+        """
+        if self.current_epoch < self.phase1_epochs:
+            return 1
+        elif self.current_epoch < self.phase1_epochs + self.phase2_epochs:
+            return 2
+        else:
+            return 3
+
     def get_curriculum_beta_range(self):
         """
-        Get current beta range based on curriculum learning schedule.
-        Starts with high temperature (low beta) and gradually includes lower temperatures (higher beta).
+        Get current beta range based on 3-phase curriculum learning schedule.
+
+        Phase 1: High temp only (β ∈ [beta_min, phase1_beta_max])
+        Phase 2: Gradual expansion to full range (β ∈ [beta_min, beta_max])
+        Phase 3: Full range (used with mixed sampling in train_epoch)
 
         Returns:
             tuple: (beta_min, effective_beta_max)
@@ -267,16 +293,29 @@ class Trainer:
         if not self.curriculum_enabled:
             return self.model.beta_min, self.model.beta_max
 
-        # Linear interpolation from curriculum_start_beta_max to beta_max
-        progress = min(1.0, self.current_epoch / self.curriculum_warmup_epochs)
-        # Use smooth cosine annealing for gradual transition
-        progress = 0.5 * (1 - math.cos(math.pi * progress))
+        phase = self.get_curriculum_phase()
 
-        effective_beta_max = (
-            self.curriculum_start_beta_max
-            + progress * (self.model.beta_max - self.curriculum_start_beta_max)
-        )
-        return self.model.beta_min, effective_beta_max
+        if phase == 1:
+            # Phase 1: High temperature only
+            return self.model.beta_min, self.phase1_beta_max
+
+        elif phase == 2:
+            # Phase 2: Gradual expansion from phase1_beta_max to full beta_max
+            phase2_start = self.phase1_epochs
+            phase2_progress = (self.current_epoch - phase2_start) / self.phase2_epochs
+            phase2_progress = min(1.0, phase2_progress)
+            # Cosine annealing for smooth transition
+            phase2_progress = 0.5 * (1 - math.cos(math.pi * phase2_progress))
+
+            effective_beta_max = (
+                self.phase1_beta_max
+                + phase2_progress * (self.model.beta_max - self.phase1_beta_max)
+            )
+            return self.model.beta_min, effective_beta_max
+
+        else:
+            # Phase 3: Full range (mixed sampling handled in train_epoch)
+            return self.model.beta_min, self.model.beta_max
 
     def step(self, batch_size, T):
         # Sample from PixelCNN (no gradient tracking needed for sampling)
@@ -291,12 +330,40 @@ class Trainer:
 
         # Get curriculum-adjusted beta range
         beta_min, beta_max = self.get_curriculum_beta_range()
+        phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
 
-        # Log-uniform sampling for beta (matches validation's log-spaced distribution)
-        log_beta_samples = torch.rand(num_beta, device=self.device) * (
-            math.log(beta_max) - math.log(beta_min)
-        ) + math.log(beta_min)
-        beta_samples = torch.exp(log_beta_samples)
+        # Phase 3: Mixed sampling (tc_focus_ratio from Tc region, rest from full range)
+        if phase == 3 and self.tc_focus_ratio > 0:
+            # Calculate number of samples for each region
+            num_tc_samples = max(1, int(num_beta * self.tc_focus_ratio))
+            num_full_samples = num_beta - num_tc_samples
+
+            # Sample from full range (log-uniform)
+            if num_full_samples > 0:
+                log_beta_full = torch.rand(num_full_samples, device=self.device) * (
+                    math.log(beta_max) - math.log(beta_min)
+                ) + math.log(beta_min)
+                beta_full = torch.exp(log_beta_full)
+            else:
+                beta_full = torch.tensor([], device=self.device)
+
+            # Sample from Tc-focused region (log-uniform within narrow range)
+            log_beta_tc = torch.rand(num_tc_samples, device=self.device) * (
+                math.log(self.tc_beta_max) - math.log(self.tc_beta_min)
+            ) + math.log(self.tc_beta_min)
+            beta_tc = torch.exp(log_beta_tc)
+
+            # Concatenate and shuffle
+            beta_samples = torch.cat([beta_full, beta_tc])
+            shuffle_idx = torch.randperm(num_beta, device=self.device)
+            beta_samples = beta_samples[shuffle_idx]
+        else:
+            # Phase 1 & 2: Standard log-uniform sampling
+            log_beta_samples = torch.rand(num_beta, device=self.device) * (
+                math.log(beta_max) - math.log(beta_min)
+            ) + math.log(beta_min)
+            beta_samples = torch.exp(log_beta_samples)
+
         T_samples = 1.0 / beta_samples
         T_expanded = T_samples.repeat_interleave(batch_size)
         total_size = num_beta * batch_size
@@ -519,13 +586,15 @@ class Trainer:
                     tqdm.write(f"Early stopping triggered at epoch {epoch}")
                     break
 
-            # Get current curriculum beta range for logging
+            # Get current curriculum beta range and phase for logging
             curr_beta_min, curr_beta_max = self.get_curriculum_beta_range()
+            curr_phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
 
             log_dict = {
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "lr": self.optimizer.param_groups[0]["lr"],
+                "curriculum_phase": curr_phase,
                 "curriculum_beta_min": curr_beta_min,
                 "curriculum_beta_max": curr_beta_max,
                 "curriculum_T_min": 1.0 / curr_beta_max,
