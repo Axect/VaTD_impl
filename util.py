@@ -614,73 +614,90 @@ class Trainer:
             curr_beta_min, curr_beta_max = self.get_curriculum_beta_range()
             curr_phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
 
-            log_dict = {
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "lr": self.optimizer.param_groups[0]["lr"],
-                "curriculum_phase": curr_phase,
-                "curriculum_beta_min": curr_beta_min,
-                "curriculum_beta_max": curr_beta_max,
-                "curriculum_T_min": 1.0 / curr_beta_max,
-                "curriculum_T_max": 1.0 / curr_beta_min,
-            }
-
-            # Add training statistics for debugging (detect mode collapse)
-            log_dict["log_prob_mean"] = train_stats["log_prob_mean"]
-            log_dict["log_prob_std"] = train_stats["log_prob_std"]
-            log_dict["energy_mean"] = train_stats["energy_mean"]
-            log_dict["energy_std"] = train_stats["energy_std"]
-            log_dict["sample_diversity"] = train_stats["sample_diversity"]
-            log_dict["magnetization_mean"] = train_stats["magnetization_mean"]
-
-            # Add Tc-focus sampling diagnostics
-            log_dict["num_tc_samples_forced"] = train_stats["num_tc_samples_forced"]
-            log_dict["num_in_tc_region"] = train_stats["num_in_tc_region"]
-            log_dict["tc_focus_ratio_config"] = train_stats["tc_focus_ratio_config"]
-            log_dict["beta_samples_mean"] = train_stats["beta_samples_mean"]
-            log_dict["beta_samples_min"] = train_stats["beta_samples_min"]
-            log_dict["beta_samples_max"] = train_stats["beta_samples_max"]
-
-            # Add individual beta losses and beta values
             # Use validation beta count (may differ from training num_beta)
             val_num_beta = len(self.fixed_val_betas)
-            for i in range(val_num_beta):
-                log_dict[f"val_loss_beta_{i}"] = val_dict[f"val_loss_beta_{i}"]
-                log_dict[f"val_beta_{i}"] = self.fixed_val_betas[i].item()
 
-            # Add sign-log transforms
-            log_dict["train_loss_signlog"] = sign_log_transform(train_loss)
-            log_dict["val_loss_signlog"] = sign_log_transform(val_loss)
-            for i in range(val_num_beta):
-                loss_val = val_dict[f"val_loss_beta_{i}"]
-                log_dict[f"val_loss_beta_{i}_signlog"] = sign_log_transform(loss_val)
+            # ========== Organized wandb logging by section ==========
+            log_dict = {}
 
-            # Add exact error metrics
+            # --- train/ section ---
+            log_dict["train/loss"] = train_loss
+            log_dict["train/loss_signlog"] = sign_log_transform(train_loss)
+            log_dict["train/log_prob_mean"] = train_stats["log_prob_mean"]
+            log_dict["train/log_prob_std"] = train_stats["log_prob_std"]
+            log_dict["train/energy_mean"] = train_stats["energy_mean"]
+            log_dict["train/energy_std"] = train_stats["energy_std"]
+            log_dict["train/lr"] = self.optimizer.param_groups[0]["lr"]
+
+            # --- val/ section ---
+            log_dict["val/loss"] = val_loss
+            log_dict["val/loss_signlog"] = sign_log_transform(val_loss)
+            for i in range(val_num_beta):
+                log_dict[f"val/loss_beta_{i}"] = val_dict[f"val_loss_beta_{i}"]
+                log_dict[f"val/loss_beta_{i}_signlog"] = sign_log_transform(
+                    val_dict[f"val_loss_beta_{i}"]
+                )
+                log_dict[f"val/beta_{i}"] = self.fixed_val_betas[i].item()
+
+            # --- curriculum/ section ---
+            log_dict["curriculum/phase"] = curr_phase
+            log_dict["curriculum/beta_min"] = curr_beta_min
+            log_dict["curriculum/beta_max"] = curr_beta_max
+            log_dict["curriculum/T_min"] = 1.0 / curr_beta_max
+            log_dict["curriculum/T_max"] = 1.0 / curr_beta_min
+
+            # --- diversity/ section ---
+            log_dict["diversity/sample_diversity"] = train_stats["sample_diversity"]
+            log_dict["diversity/magnetization_mean"] = train_stats["magnetization_mean"]
+
+            # --- sampling/ section (Tc-focus diagnostics) ---
+            log_dict["sampling/num_tc_samples_forced"] = train_stats["num_tc_samples_forced"]
+            log_dict["sampling/num_in_tc_region"] = train_stats["num_in_tc_region"]
+            log_dict["sampling/tc_focus_ratio_config"] = train_stats["tc_focus_ratio_config"]
+            log_dict["sampling/beta_samples_mean"] = train_stats["beta_samples_mean"]
+            log_dict["sampling/beta_samples_min"] = train_stats["beta_samples_min"]
+            log_dict["sampling/beta_samples_max"] = train_stats["beta_samples_max"]
+
+            # --- exact/ section (exact error metrics) ---
             if self.exact_logz_values is not None:
                 for i in range(val_num_beta):
                     if f"val_error_exact_beta_{i}" in val_dict:
-                        log_dict[f"val_error_exact_beta_{i}"] = val_dict[
-                            f"val_error_exact_beta_{i}"
-                        ]
-                        log_dict[f"val_error_exact_beta_{i}_signlog"] = (
-                            sign_log_transform(val_dict[f"val_error_exact_beta_{i}"])
+                        log_dict[f"exact/error_beta_{i}"] = val_dict[f"val_error_exact_beta_{i}"]
+                        log_dict[f"exact/error_beta_{i}_signlog"] = sign_log_transform(
+                            val_dict[f"val_error_exact_beta_{i}"]
                         )
                     if f"val_exact_logz_beta_{i}" in val_dict:
-                        log_dict[f"val_exact_logz_beta_{i}"] = val_dict[
-                            f"val_exact_logz_beta_{i}"
-                        ]
+                        log_dict[f"exact/logz_beta_{i}"] = val_dict[f"val_exact_logz_beta_{i}"]
 
-                # Add mean absolute error across all betas
-                errors = [
-                    val_dict[f"val_error_exact_beta_{i}"] for i in range(val_num_beta)
-                ]
-                log_dict["val_error_exact_mean"] = sum(errors) / len(errors)
-                log_dict["val_error_exact_abs_mean"] = sum(
-                    abs(e) for e in errors
-                ) / len(errors)
-                log_dict["val_error_exact_abs_mean_signlog"] = sign_log_transform(
-                    log_dict["val_error_exact_abs_mean"]
+                # Mean absolute error across all betas
+                errors = [val_dict[f"val_error_exact_beta_{i}"] for i in range(val_num_beta)]
+                log_dict["exact/error_mean"] = sum(errors) / len(errors)
+                log_dict["exact/error_abs_mean"] = sum(abs(e) for e in errors) / len(errors)
+                log_dict["exact/error_abs_mean_signlog"] = sign_log_transform(
+                    log_dict["exact/error_abs_mean"]
                 )
+
+            # --- compare/ section: val_loss vs exact comparison ---
+            # val_loss ≈ -ln(Z), so compare val_loss_signlog with sign_log_transform(-exact_logz)
+            if self.exact_logz_values is not None:
+                # Group 1: beta 0-3 (low beta / high temperature)
+                for i in range(min(4, val_num_beta)):
+                    exact_logz = val_dict.get(f"val_exact_logz_beta_{i}", None)
+                    if exact_logz is not None:
+                        # exact: -ln(Z) = -exact_logz, apply sign_log_transform
+                        log_dict[f"compare_0_3/exact_beta_{i}"] = sign_log_transform(-exact_logz)
+                        log_dict[f"compare_0_3/val_beta_{i}"] = sign_log_transform(
+                            val_dict[f"val_loss_beta_{i}"]
+                        )
+
+                # Group 2: beta 4-7 (high beta / low temperature)
+                for i in range(4, min(8, val_num_beta)):
+                    exact_logz = val_dict.get(f"val_exact_logz_beta_{i}", None)
+                    if exact_logz is not None:
+                        log_dict[f"compare_4_7/exact_beta_{i}"] = sign_log_transform(-exact_logz)
+                        log_dict[f"compare_4_7/val_beta_{i}"] = sign_log_transform(
+                            val_dict[f"val_loss_beta_{i}"]
+                        )
 
             if epoch >= 10:
                 log_dict["predicted_final_loss"] = predict_final_loss(
