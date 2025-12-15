@@ -1,0 +1,68 @@
+project: Ising_VaTD_v0.9
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 250
+batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16      # 16x16 Ising lattice
+  fix_first: 1  # Fix first spin to break symmetry (1 = spin up)
+
+  # Temperature sampling configuration
+  batch_size: 256  # Samples per temperature
+  num_beta: 8     # Number of temperature samples per batch
+  beta_min: 0.2   # 1/T_max (T_max = 5)
+  beta_max: 1.0   # 1/T_min (T_min = 1)
+
+  # 3-Phase Curriculum Learning
+  # Phase 1: High temp only (disordered) - easier learning
+  # Phase 2: Gradual expansion to full range
+  # Phase 3: Mixed sampling with Tc focus - reinforce critical region
+  # Critical temperature: T_c = 2.269, beta_c = 0.44
+  curriculum_enabled: true
+
+  # Phase 1: High temperature only (epochs 0-50)
+  phase1_epochs: 50
+  phase1_beta_max: 0.35  # T_min = 2.86 (above Tc)
+
+  # Phase 2: Expand to full range (epochs 50-150)
+  phase2_epochs: 100  # Duration (not end epoch)
+
+  # Phase 3: Mixed sampling (epochs 150-250)
+  # 70% full range + 30% Tc-focused
+  tc_focus_ratio: 0.3
+  tc_beta_min: 0.38     # T = 2.63 (just above Tc)
+  tc_beta_max: 0.52     # T = 1.92 (just below Tc)
+
+  # Model architecture (tuned: wider channels, fewer layers)
+  kernel_size: 3        # First masked conv kernel size
+  hidden_channels: 128  # Wider hidden channels
+  hidden_conv_layers: 6 # Fewer layers for faster training
+  hidden_kernel_size: 3 # Kernel size in residual blocks
+  hidden_width: 256     # Wider FC layers
+  hidden_fc_layers: 2   # Number of FC layers
+
+  # Causal Self-Attention for long-range correlations (critical for Tc)
+  use_attention: true
+  attention_heads: 4              # Number of attention heads
+  attention_every_n_layers: 2     # Add attention after every N conv layers
+  attention_dropout: 0.0          # Dropout in attention (0 for deterministic)
+
+optimizer_config:
+  lr: 0.005029274848552838
+  weight_decay: 6.012611545281924e-06
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 250
+  infimum_lr: 4.324992511939606e-06
+
+early_stopping_config:
+  enabled: false
+  patience: 50
+  mode: min
+  min_delta: 0.0001

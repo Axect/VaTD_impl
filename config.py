@@ -78,6 +78,11 @@ class RunConfig:
                 if k in self.net_config:
                     v = self.net_config[k]
                     name += f"_{k[0]}_{v}"
+            # Add attention indicator if enabled
+            if self.net_config.get("use_attention", False):
+                attn_heads = self.net_config.get("attention_heads", 4)
+                attn_every = self.net_config.get("attention_every_n_layers", 2)
+                name += f"_attn{attn_heads}e{attn_every}"
         else:
             # For other models, include all net_config parameters
             for k, v in self.net_config.items():

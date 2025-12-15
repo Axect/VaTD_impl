@@ -333,9 +333,11 @@ class Trainer:
         phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
 
         # Phase 3: Mixed sampling (tc_focus_ratio from Tc region, rest from full range)
+        num_tc_samples_actual = 0  # Track for logging
         if phase == 3 and self.tc_focus_ratio > 0:
             # Calculate number of samples for each region
             num_tc_samples = max(1, int(num_beta * self.tc_focus_ratio))
+            num_tc_samples_actual = num_tc_samples
             num_full_samples = num_beta - num_tc_samples
 
             # Sample from full range (log-uniform)
@@ -437,6 +439,12 @@ class Trainer:
             magnetization = samples.mean(dim=(1, 2, 3))  # per-sample magnetization
             magnetization_mean = magnetization.abs().mean().item()
 
+        # Count samples in Tc region for monitoring
+        tc_region_mask = (beta_samples >= self.tc_beta_min) & (
+            beta_samples <= self.tc_beta_max
+        )
+        num_in_tc_region = tc_region_mask.sum().item()
+
         stats = {
             "train_loss": train_loss,
             "log_prob_mean": log_prob_mean,
@@ -445,6 +453,13 @@ class Trainer:
             "energy_std": energy_std,
             "sample_diversity": sample_diversity,
             "magnetization_mean": magnetization_mean,
+            # Sampling diagnostics
+            "num_tc_samples_forced": num_tc_samples_actual,  # Forced Tc samples (Phase 3)
+            "num_in_tc_region": num_in_tc_region,  # Actual samples in Tc region
+            "tc_focus_ratio_config": self.tc_focus_ratio,
+            "beta_samples_mean": beta_samples.mean().item(),
+            "beta_samples_min": beta_samples.min().item(),
+            "beta_samples_max": beta_samples.max().item(),
         }
 
         return stats
@@ -524,6 +539,15 @@ class Trainer:
         initial_train_loss = None
         plateau_counter = 0
         last_val_loss = None
+
+        # Log curriculum settings at start
+        if self.curriculum_enabled:
+            tqdm.write(f"[Curriculum] 3-Phase enabled:")
+            tqdm.write(f"  Phase 1: epochs 0-{self.phase1_epochs}, beta_max={self.phase1_beta_max:.3f}")
+            tqdm.write(f"  Phase 2: epochs {self.phase1_epochs}-{self.phase1_epochs + self.phase2_epochs}")
+            tqdm.write(f"  Phase 3: epochs {self.phase1_epochs + self.phase2_epochs}+, "
+                       f"tc_focus_ratio={self.tc_focus_ratio:.2f}, "
+                       f"tc_beta=[{self.tc_beta_min:.3f}, {self.tc_beta_max:.3f}]")
 
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
             # Update current epoch for curriculum learning
@@ -608,6 +632,14 @@ class Trainer:
             log_dict["energy_std"] = train_stats["energy_std"]
             log_dict["sample_diversity"] = train_stats["sample_diversity"]
             log_dict["magnetization_mean"] = train_stats["magnetization_mean"]
+
+            # Add Tc-focus sampling diagnostics
+            log_dict["num_tc_samples_forced"] = train_stats["num_tc_samples_forced"]
+            log_dict["num_in_tc_region"] = train_stats["num_in_tc_region"]
+            log_dict["tc_focus_ratio_config"] = train_stats["tc_focus_ratio_config"]
+            log_dict["beta_samples_mean"] = train_stats["beta_samples_mean"]
+            log_dict["beta_samples_min"] = train_stats["beta_samples_min"]
+            log_dict["beta_samples_max"] = train_stats["beta_samples_max"]
 
             # Add individual beta losses and beta values
             # Use validation beta count (may differ from training num_beta)
