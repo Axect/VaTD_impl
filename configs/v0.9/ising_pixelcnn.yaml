@@ -27,14 +27,14 @@ net_config:
 
   # Phase 1: High temperature only
   phase1_epochs: 50
-  phase1_beta_max: 0.35  # T_min = 2.86 (above Tc)
+  phase1_beta_max: 0.4  # T_min = 2.5 (above Tc)
 
   # Phase 2: Expand to full range
   phase2_epochs: 100  # Duration (not end epoch)
 
   # Phase 3: Mixed sampling
-  # 70% full range + 30% Tc-focused
-  tc_focus_ratio: 0.3
+  # 50% full range + 50% Tc-focused
+  tc_focus_ratio: 0.5
   tc_beta_min: 0.38     # T = 2.63 (just above Tc)
   tc_beta_max: 0.52     # T = 1.92 (just below Tc)
 
