@@ -1024,6 +1024,89 @@ def main():
     console.print(f"  Magnetization: {row_tc['M_sampling']:.4f}")
     console.print(f"  Susceptibility: {row_tc['chi_sampling']:.4f}")
 
+    # ========================================
+    # Test 6: Thermodynamic Quantities (Full Validation Range)
+    # ========================================
+    console.print(
+        "\n[bold cyan]Test 6: Thermodynamic Quantities (Full Validation Range)[/bold cyan]"
+    )
+    console.print(
+        f"Computing thermodynamic quantities for T = [{T_val_min:.4f}, {T_val_max:.4f}]..."
+    )
+
+    df_thermo_full = compute_thermodynamic_quantities(
+        model,
+        energy_fn,
+        L,
+        device=device,
+        num_temps=30,
+        batch_size=1000,
+        T_min=T_val_min,
+        T_max=T_val_max,
+    )
+
+    # Display results
+    console.print("\n" + "=" * 80)
+    console.print("THERMODYNAMIC QUANTITIES (FULL VALIDATION RANGE)")
+    console.print("=" * 80)
+    display_cols = [
+        "T",
+        "T/Tc",
+        "E_sampling",
+        "E_exact_AD",
+        "Cv_sampling",
+        "Cv_exact_AD",
+        "M_sampling",
+        "chi_sampling",
+    ]
+    console.print(df_thermo_full[display_cols].to_string(index=False))
+    console.print("=" * 80)
+
+    # Generate plots for full validation range
+    console.print("\n[bold]Generating thermodynamic quantity plots (full range)...[/bold]")
+    thermo_full_plot_path = plot_thermodynamic_quantities(
+        df_thermo_full,
+        title_suffix=" (Full Validation Range)",
+        filename=f"thermodynamic_analysis_full_{seed}.png",
+    )
+    console.print(f"[green]✓[/green] Saved plot to {thermo_full_plot_path}")
+
+    thermo_full_error_path = plot_thermodynamic_errors(
+        df_thermo_full,
+        title_suffix=" (Full Validation Range)",
+        filename=f"thermodynamic_errors_full_{seed}.png",
+    )
+    console.print(f"[green]✓[/green] Saved error plot to {thermo_full_error_path}")
+
+    # Save results
+    thermo_full_output_file = f"{output_dir}/thermodynamic_results_full_{seed}.csv"
+    df_thermo_full.to_csv(thermo_full_output_file, index=False)
+    console.print(f"[green]✓[/green] Saved results to {thermo_full_output_file}")
+
+    # Summary: compare accuracy at different temperature regions
+    console.print(f"\n[bold yellow]Summary across temperature regions:[/bold yellow]")
+
+    # Low temperature region (T < 0.8*Tc)
+    low_T_mask = df_thermo_full["T/Tc"] < 0.8
+    if low_T_mask.any():
+        low_T_data = df_thermo_full[low_T_mask]
+        E_error_low = (low_T_data["E_sampling"] - low_T_data["E_exact_AD"]).abs().mean()
+        console.print(f"  Low T (T/Tc < 0.8): Mean |E error| = {E_error_low:.4f}")
+
+    # Critical region (0.8*Tc < T < 1.2*Tc)
+    crit_mask = (df_thermo_full["T/Tc"] >= 0.8) & (df_thermo_full["T/Tc"] <= 1.2)
+    if crit_mask.any():
+        crit_data = df_thermo_full[crit_mask]
+        E_error_crit = (crit_data["E_sampling"] - crit_data["E_exact_AD"]).abs().mean()
+        console.print(f"  Critical (0.8 ≤ T/Tc ≤ 1.2): Mean |E error| = {E_error_crit:.4f}")
+
+    # High temperature region (T > 1.2*Tc)
+    high_T_mask = df_thermo_full["T/Tc"] > 1.2
+    if high_T_mask.any():
+        high_T_data = df_thermo_full[high_T_mask]
+        E_error_high = (high_T_data["E_sampling"] - high_T_data["E_exact_AD"]).abs().mean()
+        console.print(f"  High T (T/Tc > 1.2): Mean |E error| = {E_error_high:.4f}")
+
     console.print(
         "\n[bold green]Analysis complete! All results saved to output directory.[/bold green]"
     )
