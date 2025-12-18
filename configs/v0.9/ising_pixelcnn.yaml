@@ -46,12 +46,6 @@ net_config:
   hidden_width: 128     # Width of FC layers
   hidden_fc_layers: 2   # Number of FC layers
 
-  # Causal Self-Attention for long-range correlations
-  use_attention: true
-  attention_heads: 4              # Number of attention heads
-  attention_every_n_layers: 2     # Add attention after every N conv layers
-  attention_dropout: 0.0          # Dropout in attention
-
 optimizer_config:
   lr: 1.e-3
   weight_decay: 1.e-4

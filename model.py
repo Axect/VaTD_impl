@@ -7,102 +7,6 @@ from typing import Tuple
 import math
 
 
-class CausalSelfAttention2D(nn.Module):
-    """
-    Causal Self-Attention for 2D grids (raster scan order).
-
-    For autoregressive models like PixelCNN, position (i,j) can only attend to
-    positions that come before it in raster scan order:
-    - All positions in rows < i
-    - Positions (i, j') where j' < j
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int = 4,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        # QKV projection
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        # Cache for causal mask (will be created on first forward)
-        self._causal_mask = None
-        self._mask_size = None
-
-    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """
-        Create causal mask for raster scan order.
-        Position i can attend to positions j where j <= i (type-B behavior).
-        This allows each position to see itself and all previous positions.
-        """
-        if self._causal_mask is not None and self._mask_size == seq_len:
-            return self._causal_mask.to(device)
-
-        # Lower triangular mask including diagonal (type-B behavior)
-        # Each position can attend to itself and all previous positions
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=device), diagonal=0)
-        # Convert to attention mask format (0 = attend, -inf = mask)
-        mask = mask.masked_fill(mask == 0, float('-inf'))
-        mask = mask.masked_fill(mask == 1, 0.0)
-
-        self._causal_mask = mask
-        self._mask_size = seq_len
-        return mask
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, H, W) tensor
-        Returns:
-            (B, C, H, W) tensor
-        """
-        B, C, H, W = x.shape
-        seq_len = H * W
-
-        # Reshape to sequence: (B, C, H, W) -> (B, H*W, C)
-        x_seq = einops.rearrange(x, 'b c h w -> b (h w) c')
-
-        # QKV projection
-        qkv = self.qkv(x_seq)  # (B, seq_len, 3 * embed_dim)
-        qkv = einops.rearrange(qkv, 'b n (three h d) -> three b h n d',
-                               three=3, h=self.num_heads)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (B, num_heads, seq_len, head_dim)
-
-        # Attention scores
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, seq_len, seq_len)
-
-        # Apply causal mask
-        causal_mask = self._get_causal_mask(seq_len, x.device)
-        attn = attn + causal_mask.unsqueeze(0).unsqueeze(0)
-
-        # Softmax and dropout
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # (B, num_heads, seq_len, head_dim)
-        out = einops.rearrange(out, 'b h n d -> b n (h d)')
-
-        # Output projection
-        out = self.proj(out)  # (B, seq_len, embed_dim)
-
-        # Reshape back to 2D: (B, H*W, C) -> (B, C, H, W)
-        out = einops.rearrange(out, 'b (h w) c -> b c h w', h=H, w=W)
-
-        return out
-
-
 class MaskedConv2D(nn.Conv2d):
     def __init__(
         self,
@@ -203,19 +107,12 @@ class MaskedResConv2D(nn.Module):
         hidden_fc_layers,
         category,
         augment_channels=0,
-        # Attention parameters
-        use_attention=False,
-        attention_heads=4,
-        attention_every_n_layers=2,
-        attention_dropout=0.0,
     ):
 
         super().__init__()
 
         self.channel = channel
         self.category = category
-        self.use_attention = use_attention
-        self.attention_every_n_layers = attention_every_n_layers
 
         self.first_conv = MaskedConv2D(
             in_channels=channel + augment_channels,
@@ -229,8 +126,6 @@ class MaskedResConv2D(nn.Module):
         )
 
         hidden_convs = []
-        attention_layers = []
-        attention_norms = []
 
         for i in range(hidden_conv_layers):
             hidden_convs.append(
@@ -270,32 +165,7 @@ class MaskedResConv2D(nn.Module):
                 )
             )
 
-            # Add attention after every N conv layers
-            if use_attention and (i + 1) % attention_every_n_layers == 0:
-                attention_layers.append(
-                    CausalSelfAttention2D(
-                        embed_dim=2 * hidden_channels,
-                        num_heads=attention_heads,
-                        dropout=attention_dropout,
-                    )
-                )
-                # LayerNorm for attention (applied channel-wise)
-                attention_norms.append(nn.LayerNorm(2 * hidden_channels))
-            else:
-                attention_layers.append(None)
-                attention_norms.append(None)
-
         self.hidden_convs = nn.ModuleList(hidden_convs)
-        self.attention_layers = nn.ModuleList(
-            [layer for layer in attention_layers if layer is not None]
-        )
-        self.attention_norms = nn.ModuleList(
-            [norm for norm in attention_norms if norm is not None]
-        )
-        # Track which conv layers have attention
-        self.attention_indices = [
-            i for i, layer in enumerate(attention_layers) if layer is not None
-        ]
 
         self.first_fc = MaskedConv2D(
             in_channels=2 * hidden_channels,
@@ -337,22 +207,11 @@ class MaskedResConv2D(nn.Module):
         x = self.first_conv(x)
         x = F.gelu(x)
 
-        attn_idx = 0
-        for i, layer in enumerate(self.hidden_convs):
+        for layer in self.hidden_convs:
             # Conv residual block
             tmp = layer(x)
             tmp = F.gelu(tmp)
             x = x + tmp
-
-            # Apply attention if this layer has one
-            if self.use_attention and i in self.attention_indices:
-                # Pre-norm attention with residual
-                B, C, H, W = x.shape
-                x_norm = einops.rearrange(x, 'b c h w -> b (h w) c')
-                x_norm = self.attention_norms[attn_idx](x_norm)
-                x_norm = einops.rearrange(x_norm, 'b (h w) c -> b c h w', h=H, w=W)
-                x = x + self.attention_layers[attn_idx](x_norm)
-                attn_idx += 1
 
         x = self.first_fc(x)
         x = F.gelu(x)
@@ -418,11 +277,6 @@ class DiscretePixelCNN(nn.Module):
             hidden_fc_layers=hparams.get("hidden_fc_layers", 2),
             category=self.category,
             augment_channels=self.augment_channels,
-            # Attention parameters
-            use_attention=hparams.get("use_attention", False),
-            attention_heads=hparams.get("attention_heads", 4),
-            attention_every_n_layers=hparams.get("attention_every_n_layers", 2),
-            attention_dropout=hparams.get("attention_dropout", 0.0),
         )
 
     def to(self, *args, **kwargs):
