@@ -51,9 +51,9 @@ optimizer_config:
   weight_decay: 0.00000601261154528192
 
 scheduler_config:
-  upper_bound: 300
-  max_iter: 250
-  infimum_lr: 0.00000432499251193961
+  upper_bound: 600
+  max_iter: 500
+  infimum_lr: 3.7193354492678383e-09
 
 early_stopping_config:
   enabled: false
