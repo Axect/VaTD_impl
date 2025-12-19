@@ -2,6 +2,8 @@ from dataclasses import dataclass, asdict, field
 import optuna
 import yaml
 import importlib
+import hashlib
+import json
 
 
 @dataclass
@@ -64,37 +66,59 @@ class RunConfig:
         return scheduler_class(optimizer, **self.scheduler_config)
 
     def gen_group_name(self):
-        name = f"{self.net.split('.')[-1]}"
+        """
+        Generate a concise group name with key params + hash for uniqueness.
 
-        # For DiscretePixelCNN, only include key architecture parameters to keep name short
-        if "DiscretePixelCNN" in self.net:
-            key_params = [
-                "size",
-                "hidden_channels",
-                "hidden_conv_layers",
-                "hidden_width",
-            ]
-            for k in key_params:
-                if k in self.net_config:
-                    v = self.net_config[k]
-                    name += f"_{k[0]}_{v}"
-            # Add attention indicator if enabled
-            if self.net_config.get("use_attention", False):
-                attn_heads = self.net_config.get("attention_heads", 4)
-                attn_every = self.net_config.get("attention_every_n_layers", 2)
-                name += f"_attn{attn_heads}e{attn_every}"
-        else:
-            # For other models, include all net_config parameters
-            for k, v in self.net_config.items():
-                name += f"_{k[0]}_{v}"
+        Format: {ModelName}_lr{lr}_e{epochs}_{hash}
 
-        name += f"_{abbreviate(self.optimizer.split('.')[-1])}"
-        for k, v in self.optimizer_config.items():
-            name += f"_{k[0]}_{v:.4e}" if isinstance(v, float) else f"_{k[0]}_{v}"
-        name += f"_{abbreviate(self.scheduler.split('.')[-1])}"
-        for k, v in self.scheduler_config.items():
-            name += f"_{k[0]}_{v:.4e}" if isinstance(v, float) else f"_{k[0]}_{v}"
+        The hash is computed from the entire config (net_config, optimizer_config,
+        scheduler_config, etc.) ensuring uniqueness for any configuration change
+        including curriculum learning phase parameters.
+        """
+        # Model name
+        model_name = self.net.split(".")[-1]
+
+        # Key params: lr and epochs
+        lr = self.optimizer_config.get("lr", 0)
+        lr_str = f"{lr:.0e}".replace("+", "").replace("0", "")  # e.g., "5e-3"
+
+        # Compute hash from full config for uniqueness
+        config_hash = self._compute_config_hash()
+
+        name = f"{model_name}_lr{lr_str}_e{self.epochs}_{config_hash}"
         return name
+
+    def _compute_config_hash(self, length=6):
+        """
+        Compute a short hash from the full config for uniqueness.
+
+        Includes all config values: net_config (with phase info), optimizer_config,
+        scheduler_config, early_stopping_config, etc.
+
+        Args:
+            length: Number of characters for the hash (default: 6)
+
+        Returns:
+            str: Short hash string (hex)
+        """
+        # Collect all config values that affect training behavior
+        hash_dict = {
+            "net": self.net,
+            "optimizer": self.optimizer,
+            "scheduler": self.scheduler,
+            "batch_size": self.batch_size,
+            "net_config": self.net_config,
+            "optimizer_config": self.optimizer_config,
+            "scheduler_config": self.scheduler_config,
+            "early_stopping_config": asdict(self.early_stopping_config),
+        }
+
+        # Convert to sorted JSON string for deterministic hashing
+        config_str = json.dumps(hash_dict, sort_keys=True, default=str)
+
+        # Compute SHA256 hash and take first `length` characters
+        hash_bytes = hashlib.sha256(config_str.encode()).hexdigest()
+        return hash_bytes[:length]
 
     def gen_tags(self):
         return [
