@@ -3,7 +3,7 @@ device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
 scheduler: hyperbolic_lr.ExpHyperbolicLR
-epochs: 250
+epochs: 500
 batch_size: 512  # Not used for DiscretePixelCNN, but required by RunConfig
 seeds: [42]
 
