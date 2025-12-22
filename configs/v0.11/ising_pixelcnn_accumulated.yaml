@@ -1,0 +1,68 @@
+# v0.11: Gradient Accumulation + AMP Training
+#
+# Key improvements from v0.9/v0.10:
+# - Gradient Accumulation (16 micro-steps): 16x more gradient information per epoch
+# - AMP (Mixed Precision): ~50% memory reduction
+# - kernel_size=13: Large receptive field covering almost entire 16x16 lattice
+# - Simple mean baseline (refs/vatd style)
+# - Curriculum learning retained (3-phase)
+#
+# Expected effect:
+# - beta-steps per epoch: 128 (vs 8 in v0.9)
+# - Total beta-steps: 64,000 (vs 4,000 in v0.9)
+# - Better Tc learning due to larger receptive field and more gradient accumulation
+
+project: Ising_VaTD_v0.11
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 256       # Samples per temperature (per micro-step)
+  num_beta: 8           # Number of temperature samples per micro-step
+  beta_min: 0.2         # 1/T_max (T_max = 5)
+  beta_max: 1.0         # 1/T_min (T_min = 1)
+
+  # v0.11 Training Mode: Gradient Accumulation + AMP
+  training_mode: accumulated
+  accumulation_steps: 16    # 16 micro-steps per optimizer update
+  use_amp: true             # Enable mixed precision training
+
+  # 3-Phase Curriculum Learning (retained from v0.9)
+  curriculum_enabled: true
+  phase1_epochs: 50         # Phase 1: High temp only
+  phase1_beta_max: 0.35     # T_min = 2.86 (above Tc)
+  phase2_epochs: 100        # Phase 2: Gradual expansion
+  tc_focus_ratio: 0.5       # Phase 3: 50% Tc region focus
+  tc_beta_min: 0.38         # T = 2.63
+  tc_beta_max: 0.52         # T = 1.92
+
+  # Model architecture (refs/vatd style with large kernel)
+  kernel_size: 13           # Large receptive field (almost entire 16x16)
+  hidden_channels: 64       # refs/vatd default
+  hidden_conv_layers: 6     # refs/vatd default
+  hidden_kernel_size: 13    # Large kernel in residual blocks
+  hidden_width: 64          # refs/vatd default
+  hidden_fc_layers: 2       # refs/vatd default
+
+optimizer_config:
+  lr: 5.e-4                 # refs/vatd default
+  weight_decay: 0.0         # No weight decay (refs/vatd style)
+
+scheduler_config:
+  factor: 0.92              # refs/vatd default
+  patience: 70              # refs/vatd default
+  threshold: 1.e-4
+  min_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

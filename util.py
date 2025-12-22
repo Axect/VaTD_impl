@@ -205,6 +205,10 @@ class Trainer:
         pruner=None,
         energy_fn=None,
         epochs=None,
+        # v0.11 parameters
+        accumulation_steps=1,      # Default: no accumulation (backward compatible)
+        use_amp=False,             # Default: no AMP (backward compatible)
+        training_mode="standard",  # "standard" or "accumulated"
     ):
         self.model = model
         self.optimizer = optimizer
@@ -214,6 +218,17 @@ class Trainer:
         self.seed = seed
         self.pruner = pruner
         self.epochs = epochs
+
+        # v0.11: Gradient Accumulation + AMP settings
+        self.accumulation_steps = accumulation_steps
+        self.use_amp = use_amp
+        self.training_mode = training_mode
+
+        # Initialize GradScaler for AMP if enabled and on GPU
+        if use_amp and device != "cpu":
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
 
         # Curriculum learning settings
         # 3-Phase curriculum: High temp only → Full expansion → Tc-focused
@@ -464,6 +479,172 @@ class Trainer:
 
         return stats
 
+    def train_epoch_accumulated(self, energy_fn):
+        """
+        Training epoch with gradient accumulation and optional AMP.
+
+        Follows refs/vatd training pattern:
+        - Multiple micro-steps accumulate gradients before optimizer.step()
+        - Simple mean baseline (batch mean) instead of RLOO
+        - Curriculum learning supported via get_curriculum_beta_range()
+
+        Key difference from train_epoch():
+        - Gradient accumulation: 16 micro-steps per optimizer update
+        - AMP support for memory efficiency
+        - Simple baseline instead of RLOO (refs/vatd style)
+
+        Returns:
+            dict: Training statistics
+        """
+        batch_size = self.model.batch_size
+        num_beta = self.model.num_beta
+        accumulation_steps = self.accumulation_steps
+
+        # Get curriculum-adjusted beta range
+        beta_min, beta_max = self.get_curriculum_beta_range()
+        phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
+
+        self.model.train()
+        # ScheduleFree Optimizer or SPlus support
+        if any(
+            keyword in self.optimizer.__class__.__name__
+            for keyword in ["ScheduleFree", "SPlus"]
+        ):
+            self.optimizer.train()
+
+        self.optimizer.zero_grad()
+
+        # Accumulators for statistics
+        accumulated_loss = 0.0
+        accumulated_log_prob = 0.0
+        accumulated_energy = 0.0
+        all_beta_samples = []
+        num_tc_samples_total = 0
+
+        for micro_step in range(accumulation_steps):
+            # Phase 3: Mixed sampling with Tc focus (same logic as train_epoch)
+            if phase == 3 and self.tc_focus_ratio > 0:
+                num_tc_samples = max(1, int(num_beta * self.tc_focus_ratio))
+                num_full_samples = num_beta - num_tc_samples
+
+                # Sample from full range (log-uniform)
+                if num_full_samples > 0:
+                    log_beta_full = torch.rand(num_full_samples, device=self.device) * (
+                        math.log(beta_max) - math.log(beta_min)
+                    ) + math.log(beta_min)
+                    beta_full = torch.exp(log_beta_full)
+                else:
+                    beta_full = torch.tensor([], device=self.device)
+
+                # Sample from Tc-focused region
+                log_beta_tc = torch.rand(num_tc_samples, device=self.device) * (
+                    math.log(self.tc_beta_max) - math.log(self.tc_beta_min)
+                ) + math.log(self.tc_beta_min)
+                beta_tc = torch.exp(log_beta_tc)
+
+                beta_samples = torch.cat([beta_full, beta_tc])
+                shuffle_idx = torch.randperm(num_beta, device=self.device)
+                beta_samples = beta_samples[shuffle_idx]
+            else:
+                # Phase 1 & 2: Standard log-uniform sampling
+                log_beta = torch.rand(num_beta, device=self.device) * (
+                    math.log(beta_max) - math.log(beta_min)
+                ) + math.log(beta_min)
+                beta_samples = torch.exp(log_beta)
+
+            all_beta_samples.append(beta_samples.clone())
+
+            T_samples = 1.0 / beta_samples
+            T_expanded = T_samples.repeat_interleave(batch_size)
+            total_size = num_beta * batch_size
+
+            # Forward pass with optional AMP
+            with torch.amp.autocast(device_type="cuda", enabled=self.use_amp and self.device != "cpu"):
+                # Sample (no gradient needed)
+                with torch.no_grad():
+                    samples = self.model.sample(batch_size=total_size, T=T_expanded)
+
+                # Log probability (needs gradient for REINFORCE)
+                log_prob = self.model.log_prob(samples, T=T_expanded)
+
+                # Energy (no gradient needed)
+                with torch.no_grad():
+                    energy = energy_fn(samples)
+
+                # Reshape for per-beta computation
+                log_prob_view = log_prob.view(num_beta, batch_size)
+                energy_view = energy.view(num_beta, batch_size)
+                beta_expanded = (1.0 / T_expanded).view(num_beta, batch_size)
+                beta_energy = beta_expanded * energy_view
+
+                # REINFORCE weight: log q + beta * E
+                reinforce_weight = log_prob_view.detach() + beta_energy
+
+                # Simple mean baseline (refs/vatd style)
+                baseline = reinforce_weight.mean()
+                advantage = (reinforce_weight - baseline).detach()
+
+                # REINFORCE loss (scaled for accumulation)
+                loss = (advantage * log_prob_view).mean() / accumulation_steps
+
+            # Backward pass with optional AMP scaling
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            # Accumulate statistics (detached)
+            with torch.no_grad():
+                actual_loss = (log_prob_view + beta_energy).mean().item()
+                accumulated_loss += actual_loss / accumulation_steps
+                accumulated_log_prob += log_prob_view.mean().item() / accumulation_steps
+                accumulated_energy += energy_view.mean().item() / accumulation_steps
+
+                # Count Tc samples
+                tc_mask = (beta_samples >= self.tc_beta_min) & (beta_samples <= self.tc_beta_max)
+                num_tc_samples_total += tc_mask.sum().item()
+
+        # Gradient clipping and optimizer step
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        # Compute final statistics
+        all_betas = torch.cat(all_beta_samples)
+
+        # Sample diversity metrics (from last micro-step samples)
+        with torch.no_grad():
+            sample_diversity = samples.var(dim=0).mean().item()
+            magnetization = samples.mean(dim=(1, 2, 3)).abs().mean().item()
+
+        stats = {
+            "train_loss": accumulated_loss,
+            "log_prob_mean": accumulated_log_prob,
+            "log_prob_std": 0.0,  # Not tracked per micro-step
+            "energy_mean": accumulated_energy,
+            "energy_std": 0.0,  # Not tracked per micro-step
+            "sample_diversity": sample_diversity,
+            "magnetization_mean": magnetization,
+            "num_tc_samples_forced": num_tc_samples_total,
+            "num_in_tc_region": num_tc_samples_total,
+            "tc_focus_ratio_config": self.tc_focus_ratio,
+            "beta_samples_mean": all_betas.mean().item(),
+            "beta_samples_min": all_betas.min().item(),
+            "beta_samples_max": all_betas.max().item(),
+            # v0.11 specific stats
+            "accumulation_steps": accumulation_steps,
+            "use_amp": self.use_amp,
+        }
+
+        return stats
+
     def val_epoch(self, energy_fn):
         """
         Validation epoch with fixed beta values.
@@ -549,12 +730,21 @@ class Trainer:
                        f"tc_focus_ratio={self.tc_focus_ratio:.2f}, "
                        f"tc_beta=[{self.tc_beta_min:.3f}, {self.tc_beta_max:.3f}]")
 
+        # Log training mode at start
+        if self.training_mode == "accumulated":
+            tqdm.write(f"[v0.11] Accumulated training mode enabled:")
+            tqdm.write(f"  accumulation_steps={self.accumulation_steps}, use_amp={self.use_amp}")
+
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
             # Update current epoch for curriculum learning
             self.current_epoch = epoch
 
-            # Standard REINFORCE training (returns dict with stats)
-            train_stats = self.train_epoch(energy_fn)
+            # Select training method based on training_mode
+            if self.training_mode == "accumulated":
+                train_stats = self.train_epoch_accumulated(energy_fn)
+            else:
+                # Standard REINFORCE training (backward compatible)
+                train_stats = self.train_epoch(energy_fn)
             train_loss = train_stats["train_loss"]
 
             val_dict = self.val_epoch(energy_fn)
@@ -784,6 +974,12 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 config=run_config.gen_config(),
             )
 
+            # Extract v0.11 training parameters from net_config
+            net_config = run_config.gen_config().get("net_config", {})
+            accumulation_steps = net_config.get("accumulation_steps", 1)
+            use_amp = net_config.get("use_amp", False)
+            training_mode = net_config.get("training_mode", "standard")
+
             trainer = Trainer(
                 model,
                 optimizer,
@@ -795,6 +991,10 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 pruner=pruner,
                 energy_fn=energy_fn,
                 epochs=run_config.epochs,
+                # v0.11 parameters
+                accumulation_steps=accumulation_steps,
+                use_amp=use_amp,
+                training_mode=training_mode,
             )
 
             val_loss = trainer.train(energy_fn, epochs=run_config.epochs)
