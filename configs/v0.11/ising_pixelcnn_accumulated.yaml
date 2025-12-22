@@ -27,14 +27,14 @@ net_config:
   fix_first: 1
 
   # Temperature sampling configuration
-  batch_size: 256       # Samples per temperature (per micro-step)
+  batch_size: 128       # Samples per temperature (per micro-step)
   num_beta: 8           # Number of temperature samples per micro-step
   beta_min: 0.2         # 1/T_max (T_max = 5)
   beta_max: 1.0         # 1/T_min (T_min = 1)
 
   # v0.11 Training Mode: Gradient Accumulation + AMP
   training_mode: accumulated
-  accumulation_steps: 16    # 16 micro-steps per optimizer update
+  accumulation_steps: 4    # 16 micro-steps per optimizer update
   use_amp: true             # Enable mixed precision training
 
   # 3-Phase Curriculum Learning (retained from v0.9)
