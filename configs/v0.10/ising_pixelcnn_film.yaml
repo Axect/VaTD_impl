@@ -1,4 +1,4 @@
-# v1.0: FiLM-based PixelCNN with Temperature Embedding
+# v0.10: FiLM-based PixelCNN with Temperature Embedding
 # Key improvement: No Tc focus needed - model learns temperature sensitivity automatically
 #
 # Changes from v0.9:
@@ -7,7 +7,7 @@
 # - Simpler curriculum: just 2 phases (warm-up + full range)
 # - Temperature embedding replaces raw T concatenation
 
-project: Ising_VaTD_v1.0
+project: Ising_VaTD_v0.10
 device: cuda:0
 net: model.DiscretePixelCNNFiLM
 optimizer: torch.optim.AdamW
@@ -56,13 +56,13 @@ net_config:
   hidden_fc_layers: 2     # Number of FC layers
 
 optimizer_config:
-  lr: 0.005
+  lr: 5.e-3
   weight_decay: 0.00001
 
 scheduler_config:
   upper_bound: 600
   max_iter: 500
-  infimum_lr: 0.00001
+  infimum_lr: 1.e-6
 
 early_stopping_config:
   enabled: false
