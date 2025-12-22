@@ -1,16 +1,14 @@
-# v0.11: Gradient Accumulation + AMP Training
+# v0.11: Gradient Accumulation Training (Fixed)
 #
-# Key improvements from v0.9/v0.10:
-# - Gradient Accumulation (16 micro-steps): 16x more gradient information per epoch
-# - AMP (Mixed Precision): ~50% memory reduction
-# - kernel_size=13: Large receptive field covering almost entire 16x16 lattice
-# - Simple mean baseline (refs/vatd style)
-# - Curriculum learning retained (3-phase)
+# Key fixes from original v0.11:
+# - Multiple optimizer steps per epoch (like refs/vatd)
+# - RLOO baseline (better variance reduction than simple mean)
+# - AMP disabled (numerical stability for REINFORCE)
+# - Moderate kernel size (balance between local/global correlation)
+# - Extended Phase 1 for better high-temp learning
 #
-# Expected effect:
-# - beta-steps per epoch: 128 (vs 8 in v0.9)
-# - Total beta-steps: 64,000 (vs 4,000 in v0.9)
-# - Better Tc learning due to larger receptive field and more gradient accumulation
+# refs/vatd does 19 optimizer steps per epoch (115 betas / 6)
+# This version: num_batches_per_epoch optimizer steps
 
 project: Ising_VaTD_v0.11
 device: cuda:0
@@ -32,31 +30,32 @@ net_config:
   beta_min: 0.2         # 1/T_max (T_max = 5)
   beta_max: 1.0         # 1/T_min (T_min = 1)
 
-  # v0.11 Training Mode: Gradient Accumulation + AMP
+  # v0.11 Training Mode: Gradient Accumulation (Fixed)
   training_mode: accumulated
-  accumulation_steps: 4    # 16 micro-steps per optimizer update
-  use_amp: true             # Enable mixed precision training
+  accumulation_steps: 4       # Micro-steps per optimizer update
+  num_batches_per_epoch: 16   # Optimizer steps per epoch (like refs/vatd's 19)
+  use_amp: false              # Disabled for numerical stability
 
-  # 3-Phase Curriculum Learning (retained from v0.9)
+  # 3-Phase Curriculum Learning (extended Phase 1)
   curriculum_enabled: true
-  phase1_epochs: 50         # Phase 1: High temp only
-  phase1_beta_max: 0.35     # T_min = 2.86 (above Tc)
-  phase2_epochs: 100        # Phase 2: Gradual expansion
-  tc_focus_ratio: 0.5       # Phase 3: 50% Tc region focus
-  tc_beta_min: 0.38         # T = 2.63
-  tc_beta_max: 0.52         # T = 1.92
+  phase1_epochs: 100          # Extended: High temp learning (was 50)
+  phase1_beta_max: 0.35       # T_min = 2.86 (above Tc)
+  phase2_epochs: 150          # Extended: Gradual expansion (was 100)
+  tc_focus_ratio: 0.5         # Phase 3: 50% Tc region focus
+  tc_beta_min: 0.38           # T = 2.63
+  tc_beta_max: 0.52           # T = 1.92
 
-  # Model architecture (refs/vatd style with large kernel)
-  kernel_size: 13           # Large receptive field (almost entire 16x16)
-  hidden_channels: 64       # refs/vatd default
-  hidden_conv_layers: 6     # refs/vatd default
-  hidden_kernel_size: 13    # Large kernel in residual blocks
-  hidden_width: 64          # refs/vatd default
-  hidden_fc_layers: 2       # refs/vatd default
+  # Model architecture (balanced kernel for all temperatures)
+  kernel_size: 7              # Moderate receptive field (was 13)
+  hidden_channels: 96         # Increased capacity (was 64)
+  hidden_conv_layers: 6       # refs/vatd default
+  hidden_kernel_size: 5       # Smaller for high-temp local correlation (was 13)
+  hidden_width: 128           # Increased capacity (was 64)
+  hidden_fc_layers: 2         # refs/vatd default
 
 optimizer_config:
   lr: 1.e-3
-  weight_decay: 0.0         # No weight decay (refs/vatd style)
+  weight_decay: 0.0           # No weight decay (refs/vatd style)
 
 scheduler_config:
   upper_bound: 600
