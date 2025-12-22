@@ -32,8 +32,7 @@ net_config:
 
   # v0.11 Training Mode: Gradient Accumulation (Fixed)
   training_mode: accumulated
-  accumulation_steps: 4       # Micro-steps per optimizer update
-  num_batches_per_epoch: 16   # Optimizer steps per epoch (like refs/vatd's 19)
+  accumulation_steps: 16      # Each micro-step does optimizer.step() (like refs/vatd's 19)
   use_amp: false              # Disabled for numerical stability
 
   # 3-Phase Curriculum Learning (extended Phase 1)
