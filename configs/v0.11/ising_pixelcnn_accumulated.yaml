@@ -55,13 +55,13 @@ net_config:
   hidden_fc_layers: 2       # refs/vatd default
 
 optimizer_config:
-  lr: 5.e-4                 # refs/vatd default
+  lr: 1.e-3
   weight_decay: 0.0         # No weight decay (refs/vatd style)
 
 scheduler_config:
   upper_bound: 600
   max_iter: 500
-  infimum_lr: 1.e-7
+  infimum_lr: 1.e-6
 
 early_stopping_config:
   enabled: false
