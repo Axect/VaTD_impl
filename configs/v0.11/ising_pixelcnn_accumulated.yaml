@@ -16,7 +16,7 @@ project: Ising_VaTD_v0.11
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
-scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau
+scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 500
 batch_size: 512
 seeds: [42]
@@ -59,10 +59,9 @@ optimizer_config:
   weight_decay: 0.0         # No weight decay (refs/vatd style)
 
 scheduler_config:
-  factor: 0.92              # refs/vatd default
-  patience: 70              # refs/vatd default
-  threshold: 1.e-4
-  min_lr: 1.e-6
+  upper_bound: 600
+  max_iter: 500
+  infimum_lr: 1.e-7
 
 early_stopping_config:
   enabled: false

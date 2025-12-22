@@ -7,5 +7,6 @@ runs/
 runs
 figs/
 figs
+refs/
 wandb/
 __pycache__/
