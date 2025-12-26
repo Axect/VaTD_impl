@@ -1,0 +1,72 @@
+# v0.12: Temperature-dependent Output Scaling
+#
+# Key improvements from v0.11:
+# - Removed tc_focus (was causing high-temp sample starvation)
+# - 2-Phase Curriculum: High temp → Gradual expansion (simpler)
+# - Temperature-dependent Output Scaling for logits
+#   * High temp: scale < 1 → logits smaller → softmax closer to 0.5
+#   * Low temp: scale > 1 → logits larger → softmax sharper
+#
+# This addresses the fundamental issue: high temp requires p ≈ 0.5,
+# but small bias accumulates over 255 spins causing ~5 error.
+
+project: Ising_VaTD_v0.12
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 128       # Samples per temperature
+  num_beta: 8           # Number of temperature samples per step
+  beta_min: 0.2         # 1/T_max (T_max = 5)
+  beta_max: 1.0         # 1/T_min (T_min = 1)
+
+  # Training Mode: Multiple optimizer steps per epoch
+  training_mode: accumulated
+  accumulation_steps: 16      # Optimizer steps per epoch (like refs/vatd's 19)
+
+  # 2-Phase Curriculum Learning (simplified from v0.11's 3-phase)
+  # Phase 1: High temp only (beta_min ~ phase1_beta_max)
+  # Phase 2: Gradual expansion to full range
+  curriculum_enabled: true
+  phase1_epochs: 100          # High temp learning
+  phase1_beta_max: 0.35       # T_min = 2.86 (above Tc)
+  phase2_epochs: 150          # Gradual expansion to full range
+
+  # Model architecture
+  kernel_size: 7              # Moderate receptive field
+  hidden_channels: 96         # Increased capacity
+  hidden_conv_layers: 6
+  hidden_kernel_size: 5       # Smaller for high-temp local correlation
+  hidden_width: 128           # Increased capacity
+  hidden_fc_layers: 2
+
+  # Temperature-dependent Output Scaling (NEW in v0.12)
+  # Addresses high-temp learning difficulty by scaling logits
+  # scale = (T_ref / T)^power
+  logit_temp_scale: true
+  temp_ref: 2.27              # Reference temperature (Tc)
+  temp_scale_power: 0.5       # Smooth scaling
+  temp_scale_min: 0.1         # Clamp minimum
+  temp_scale_max: 10.0        # Clamp maximum
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 0.0
+
+scheduler_config:
+  upper_bound: 600
+  max_iter: 500
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

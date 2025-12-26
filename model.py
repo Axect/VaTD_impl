@@ -258,13 +258,19 @@ class DiscretePixelCNN(nn.Module):
             "curriculum_start_beta_max", self.beta_min * 1.5
         )
 
-        # 3-Phase Curriculum Learning settings
+        # Curriculum Learning settings
         self.phase1_epochs = hparams.get("phase1_epochs", 50)
         self.phase1_beta_max = hparams.get("phase1_beta_max", 0.35)
         self.phase2_epochs = hparams.get("phase2_epochs", 100)
-        self.tc_focus_ratio = hparams.get("tc_focus_ratio", 0.3)
-        self.tc_beta_min = hparams.get("tc_beta_min", 0.38)
-        self.tc_beta_max = hparams.get("tc_beta_max", 0.52)
+
+        # Temperature-dependent Output Scaling
+        # High temp: scale < 1 → logits smaller → softmax closer to 0.5
+        # Low temp: scale > 1 → logits larger → softmax sharper
+        self.logit_temp_scale = hparams.get("logit_temp_scale", False)
+        self.temp_ref = hparams.get("temp_ref", 2.27)  # Reference temp (Tc by default)
+        self.temp_scale_power = hparams.get("temp_scale_power", 0.5)  # scale = (T_ref/T)^power
+        self.temp_scale_min = hparams.get("temp_scale_min", 0.1)
+        self.temp_scale_max = hparams.get("temp_scale_max", 10.0)
 
         # Initialize MaskedResConv2D
         self.masked_conv = MaskedResConv2D(
@@ -289,14 +295,51 @@ class DiscretePixelCNN(nn.Module):
             self.device = kwargs["device"]
         return self
 
+    def _compute_temp_scale(self, T):
+        """
+        Compute temperature-dependent scaling factor for logits.
+
+        scale = (T_ref / T)^power
+        - High temp (T > T_ref): scale < 1 → logits smaller → softmax closer to 0.5
+        - Low temp (T < T_ref): scale > 1 → logits larger → softmax sharper
+
+        Args:
+            T: Temperature tensor of shape (B,) or (B, 1)
+
+        Returns:
+            scale: Scaling factor of shape (B, 1, 1, 1) for broadcasting with logits
+        """
+        if not self.logit_temp_scale:
+            return 1.0
+
+        # Ensure T is the right shape
+        if T.dim() == 1:
+            T = T.unsqueeze(1)
+
+        # Compute scale = (T_ref / T)^power
+        scale = (self.temp_ref / T) ** self.temp_scale_power
+
+        # Clamp to prevent extreme values
+        scale = scale.clamp(min=self.temp_scale_min, max=self.temp_scale_max)
+
+        # Reshape for broadcasting: (B, 1) → (B, 1, 1, 1)
+        scale = scale.unsqueeze(-1).unsqueeze(-1)
+
+        return scale
+
     def sample(self, batch_size=None, T=None):
         batch_size = batch_size if batch_size is not None else self.batch_size
         sample = torch.zeros(batch_size, self.channel, self.size[0], self.size[1]).to(
             self.device
         )
+
+        # Compute temperature-dependent scaling
+        temp_scale = 1.0
         if T is not None:
-            # (B, C) -> (B, C, H, W)
             T = T.to(self.device)
+            temp_scale = self._compute_temp_scale(T)
+
+            # (B, C) -> (B, C, H, W)
             if T.dim() == 1:
                 T = T.unsqueeze(1)
 
@@ -310,15 +353,19 @@ class DiscretePixelCNN(nn.Module):
                 # Fix the first element of the samples to be a fixed value
                 if self.fix_first is not None and i == 0 and j == 0:
                     if T is not None:
-                        # Caution: original code has potential bug here, fixed it.
                         sample[:, : self.channel, 0, 0] = self.fix_first
                     else:
                         sample[:, :, 0, 0] = self.fix_first
                     continue
 
                 # Compute predictions for all channels at once (B, Cat, C, H, W)
-                # Optimization: move forward pass outside of channel loop to avoid redundant computation
                 unnormalized = self.masked_conv.forward(sample)
+
+                # Apply temperature-dependent scaling
+                # High temp: scale < 1 → logits smaller → softmax closer to 0.5
+                if self.logit_temp_scale and T is not None:
+                    # temp_scale shape: (B, 1, 1, 1), unnormalized: (B, Cat, C, H, W)
+                    unnormalized = unnormalized * temp_scale
 
                 for k in range(self.channel):
                     # Use multinomial instead of argmax to allow stochastic sampling
@@ -332,7 +379,6 @@ class DiscretePixelCNN(nn.Module):
                     )
 
         if T is not None:
-            # Caution: original code has potential bug here, fixed it.
             sample = sample[:, : self.channel, :, :]
 
         sample = self.mapping(sample)  # Map {0,1} to {-1,1}
@@ -348,9 +394,13 @@ class DiscretePixelCNN(nn.Module):
                 sample[:, :, 0, 0] == self.fix_first
             ).all(), "The first element of the sample does not match fix_first value."
 
+        # Compute temperature-dependent scaling
+        temp_scale = 1.0
         if T is not None:
-            # (B, C) -> (B, C, H, W)
             T = T.to(self.device)
+            temp_scale = self._compute_temp_scale(T)
+
+            # (B, C) -> (B, C, H, W)
             if T.dim() == 1:
                 T = T.unsqueeze(1)
 
@@ -360,11 +410,16 @@ class DiscretePixelCNN(nn.Module):
             sample = torch.cat([sample, T_expanded], dim=1)
 
         unnormalized = self.masked_conv.forward(sample)  # (B, Cat, C, H, W)
+
+        # Apply temperature-dependent scaling
+        # High temp: scale < 1 → logits smaller → softmax closer to 0.5
+        if self.logit_temp_scale and T is not None:
+            unnormalized = unnormalized * temp_scale
+
         # Use log_softmax for numerical stability (avoids log(softmax()) underflow)
         log_prob = F.log_softmax(unnormalized, dim=1)
 
         if T is not None:
-            # Caution: original code has potential bug here, fixed it.
             sample = sample[:, : self.channel, :, :]
 
         # (B, 1, C, H, W)

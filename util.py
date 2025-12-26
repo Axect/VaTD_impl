@@ -223,7 +223,7 @@ class Trainer:
         self.training_mode = training_mode
 
         # Curriculum learning settings
-        # 3-Phase curriculum: High temp only → Full expansion → Tc-focused
+        # 2-Phase curriculum: High temp only → Gradual expansion to full range
         self.curriculum_enabled = getattr(model, "curriculum_enabled", False)
         self.current_epoch = 0
 
@@ -231,14 +231,8 @@ class Trainer:
         self.phase1_epochs = getattr(model, "phase1_epochs", 50)
         self.phase1_beta_max = getattr(model, "phase1_beta_max", 0.35)
 
-        # Phase 2: Expand to full range
-        self.phase2_epochs = getattr(model, "phase2_epochs", 100)  # Duration, not end
-
-        # Phase 3: Mixed sampling with Tc focus
-        # tc_focus_ratio: fraction of samples from Tc region
-        self.tc_focus_ratio = getattr(model, "tc_focus_ratio", 0.3)
-        self.tc_beta_min = getattr(model, "tc_beta_min", 0.38)
-        self.tc_beta_max = getattr(model, "tc_beta_max", 0.52)
+        # Phase 2: Gradual expansion to full range
+        self.phase2_epochs = getattr(model, "phase2_epochs", 100)
 
         # Pre-compute fixed betas for validation (from energy_fn)
         # Validation uses fixed wider range (0.1-2.0) for extrapolation testing
@@ -277,22 +271,19 @@ class Trainer:
         Determine current curriculum phase based on epoch.
 
         Returns:
-            int: Phase number (1, 2, or 3)
+            int: Phase number (1 or 2)
         """
         if self.current_epoch < self.phase1_epochs:
             return 1
-        elif self.current_epoch < self.phase1_epochs + self.phase2_epochs:
-            return 2
         else:
-            return 3
+            return 2
 
     def get_curriculum_beta_range(self):
         """
-        Get current beta range based on 3-phase curriculum learning schedule.
+        Get current beta range based on 2-phase curriculum learning schedule.
 
         Phase 1: High temp only (β ∈ [beta_min, phase1_beta_max])
-        Phase 2: Gradual expansion to full range (β ∈ [beta_min, beta_max])
-        Phase 3: Full range (used with mixed sampling in train_epoch)
+        Phase 2: Gradual expansion to full range, then stay at full range
 
         Returns:
             tuple: (beta_min, effective_beta_max)
@@ -306,7 +297,7 @@ class Trainer:
             # Phase 1: High temperature only
             return self.model.beta_min, self.phase1_beta_max
 
-        elif phase == 2:
+        else:
             # Phase 2: Gradual expansion from phase1_beta_max to full beta_max
             phase2_start = self.phase1_epochs
             phase2_progress = (self.current_epoch - phase2_start) / self.phase2_epochs
@@ -319,10 +310,6 @@ class Trainer:
                 + phase2_progress * (self.model.beta_max - self.phase1_beta_max)
             )
             return self.model.beta_min, effective_beta_max
-
-        else:
-            # Phase 3: Full range (mixed sampling handled in train_epoch)
-            return self.model.beta_min, self.model.beta_max
 
     def step(self, batch_size, T):
         # Sample from PixelCNN (no gradient tracking needed for sampling)
@@ -337,41 +324,12 @@ class Trainer:
 
         # Get curriculum-adjusted beta range
         beta_min, beta_max = self.get_curriculum_beta_range()
-        phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
 
-        # Phase 3: Mixed sampling (tc_focus_ratio from Tc region, rest from full range)
-        num_tc_samples_actual = 0  # Track for logging
-        if phase == 3 and self.tc_focus_ratio > 0:
-            # Calculate number of samples for each region
-            num_tc_samples = max(1, int(num_beta * self.tc_focus_ratio))
-            num_tc_samples_actual = num_tc_samples
-            num_full_samples = num_beta - num_tc_samples
-
-            # Sample from full range (log-uniform)
-            if num_full_samples > 0:
-                log_beta_full = torch.rand(num_full_samples, device=self.device) * (
-                    math.log(beta_max) - math.log(beta_min)
-                ) + math.log(beta_min)
-                beta_full = torch.exp(log_beta_full)
-            else:
-                beta_full = torch.tensor([], device=self.device)
-
-            # Sample from Tc-focused region (log-uniform within narrow range)
-            log_beta_tc = torch.rand(num_tc_samples, device=self.device) * (
-                math.log(self.tc_beta_max) - math.log(self.tc_beta_min)
-            ) + math.log(self.tc_beta_min)
-            beta_tc = torch.exp(log_beta_tc)
-
-            # Concatenate and shuffle
-            beta_samples = torch.cat([beta_full, beta_tc])
-            shuffle_idx = torch.randperm(num_beta, device=self.device)
-            beta_samples = beta_samples[shuffle_idx]
-        else:
-            # Phase 1 & 2: Standard log-uniform sampling
-            log_beta_samples = torch.rand(num_beta, device=self.device) * (
-                math.log(beta_max) - math.log(beta_min)
-            ) + math.log(beta_min)
-            beta_samples = torch.exp(log_beta_samples)
+        # Log-uniform sampling over current beta range
+        log_beta_samples = torch.rand(num_beta, device=self.device) * (
+            math.log(beta_max) - math.log(beta_min)
+        ) + math.log(beta_min)
+        beta_samples = torch.exp(log_beta_samples)
 
         T_samples = 1.0 / beta_samples
         T_expanded = T_samples.repeat_interleave(batch_size)
@@ -446,12 +404,6 @@ class Trainer:
             magnetization = samples.mean(dim=(1, 2, 3))  # per-sample magnetization
             magnetization_mean = magnetization.abs().mean().item()
 
-        # Count samples in Tc region for monitoring
-        tc_region_mask = (beta_samples >= self.tc_beta_min) & (
-            beta_samples <= self.tc_beta_max
-        )
-        num_in_tc_region = tc_region_mask.sum().item()
-
         stats = {
             "train_loss": train_loss,
             "log_prob_mean": log_prob_mean,
@@ -460,10 +412,6 @@ class Trainer:
             "energy_std": energy_std,
             "sample_diversity": sample_diversity,
             "magnetization_mean": magnetization_mean,
-            # Sampling diagnostics
-            "num_tc_samples_forced": num_tc_samples_actual,  # Forced Tc samples (Phase 3)
-            "num_in_tc_region": num_in_tc_region,  # Actual samples in Tc region
-            "tc_focus_ratio_config": self.tc_focus_ratio,
             "beta_samples_mean": beta_samples.mean().item(),
             "beta_samples_min": beta_samples.min().item(),
             "beta_samples_max": beta_samples.max().item(),
@@ -488,11 +436,10 @@ class Trainer:
         """
         batch_size = self.model.batch_size
         num_beta = self.model.num_beta
-        num_steps = self.accumulation_steps  # Now means optimizer steps per epoch
+        num_steps = self.accumulation_steps
 
         # Get curriculum-adjusted beta range
         beta_min, beta_max = self.get_curriculum_beta_range()
-        phase = self.get_curriculum_phase() if self.curriculum_enabled else 0
 
         self.model.train()
         # ScheduleFree Optimizer or SPlus support
@@ -507,38 +454,15 @@ class Trainer:
         epoch_log_prob = 0.0
         epoch_energy = 0.0
         all_beta_samples = []
-        num_tc_samples_total = 0
         last_samples = None
 
         # Multiple optimizer steps per epoch (like refs/vatd)
         for step in range(num_steps):
-            # Phase 3: Mixed sampling with Tc focus
-            if phase == 3 and self.tc_focus_ratio > 0:
-                num_tc_samples = max(1, int(num_beta * self.tc_focus_ratio))
-                num_full_samples = num_beta - num_tc_samples
-
-                if num_full_samples > 0:
-                    log_beta_full = torch.rand(num_full_samples, device=self.device) * (
-                        math.log(beta_max) - math.log(beta_min)
-                    ) + math.log(beta_min)
-                    beta_full = torch.exp(log_beta_full)
-                else:
-                    beta_full = torch.tensor([], device=self.device)
-
-                log_beta_tc = torch.rand(num_tc_samples, device=self.device) * (
-                    math.log(self.tc_beta_max) - math.log(self.tc_beta_min)
-                ) + math.log(self.tc_beta_min)
-                beta_tc = torch.exp(log_beta_tc)
-
-                beta_samples = torch.cat([beta_full, beta_tc])
-                shuffle_idx = torch.randperm(num_beta, device=self.device)
-                beta_samples = beta_samples[shuffle_idx]
-            else:
-                # Phase 1 & 2: Standard log-uniform sampling
-                log_beta = torch.rand(num_beta, device=self.device) * (
-                    math.log(beta_max) - math.log(beta_min)
-                ) + math.log(beta_min)
-                beta_samples = torch.exp(log_beta)
+            # Log-uniform sampling over current beta range
+            log_beta = torch.rand(num_beta, device=self.device) * (
+                math.log(beta_max) - math.log(beta_min)
+            ) + math.log(beta_min)
+            beta_samples = torch.exp(log_beta)
 
             all_beta_samples.append(beta_samples.clone())
 
@@ -588,9 +512,6 @@ class Trainer:
                 epoch_log_prob += log_prob_view.mean().item() / num_steps
                 epoch_energy += energy_view.mean().item() / num_steps
 
-                tc_mask = (beta_samples >= self.tc_beta_min) & (beta_samples <= self.tc_beta_max)
-                num_tc_samples_total += tc_mask.sum().item()
-
         # Compute final statistics
         all_betas = torch.cat(all_beta_samples)
 
@@ -610,9 +531,6 @@ class Trainer:
             "energy_std": 0.0,
             "sample_diversity": sample_diversity,
             "magnetization_mean": magnetization,
-            "num_tc_samples_forced": num_tc_samples_total,
-            "num_in_tc_region": num_tc_samples_total,
-            "tc_focus_ratio_config": self.tc_focus_ratio,
             "beta_samples_mean": all_betas.mean().item(),
             "beta_samples_min": all_betas.min().item(),
             "beta_samples_max": all_betas.max().item(),
@@ -699,12 +617,9 @@ class Trainer:
 
         # Log curriculum settings at start
         if self.curriculum_enabled:
-            tqdm.write(f"[Curriculum] 3-Phase enabled:")
-            tqdm.write(f"  Phase 1: epochs 0-{self.phase1_epochs}, beta_max={self.phase1_beta_max:.3f}")
-            tqdm.write(f"  Phase 2: epochs {self.phase1_epochs}-{self.phase1_epochs + self.phase2_epochs}")
-            tqdm.write(f"  Phase 3: epochs {self.phase1_epochs + self.phase2_epochs}+, "
-                       f"tc_focus_ratio={self.tc_focus_ratio:.2f}, "
-                       f"tc_beta=[{self.tc_beta_min:.3f}, {self.tc_beta_max:.3f}]")
+            tqdm.write(f"[Curriculum] 2-Phase enabled:")
+            tqdm.write(f"  Phase 1: epochs 0-{self.phase1_epochs}, beta_max={self.phase1_beta_max:.3f} (high temp)")
+            tqdm.write(f"  Phase 2: epochs {self.phase1_epochs}+, gradual expansion to full range")
 
         # Log training mode at start
         if self.training_mode == "accumulated":
@@ -818,10 +733,7 @@ class Trainer:
             log_dict["diversity/sample_diversity"] = train_stats["sample_diversity"]
             log_dict["diversity/magnetization_mean"] = train_stats["magnetization_mean"]
 
-            # --- sampling/ section (Tc-focus diagnostics) ---
-            log_dict["sampling/num_tc_samples_forced"] = train_stats["num_tc_samples_forced"]
-            log_dict["sampling/num_in_tc_region"] = train_stats["num_in_tc_region"]
-            log_dict["sampling/tc_focus_ratio_config"] = train_stats["tc_focus_ratio_config"]
+            # --- sampling/ section ---
             log_dict["sampling/beta_samples_mean"] = train_stats["beta_samples_mean"]
             log_dict["sampling/beta_samples_min"] = train_stats["beta_samples_min"]
             log_dict["sampling/beta_samples_max"] = train_stats["beta_samples_max"]
