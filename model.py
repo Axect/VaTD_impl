@@ -307,12 +307,12 @@ class DiscretePixelCNN(nn.Module):
             T: Temperature tensor of shape (B,) or (B, 1)
 
         Returns:
-            scale: Scaling factor of shape (B, 1, 1, 1) for broadcasting with logits
+            scale: Scaling factor of shape (B, 1, 1, 1, 1) for broadcasting with logits (B, Cat, C, H, W)
         """
         if not self.logit_temp_scale:
             return 1.0
 
-        # Ensure T is the right shape
+        # Ensure T is the right shape: (B,) → (B, 1)
         if T.dim() == 1:
             T = T.unsqueeze(1)
 
@@ -322,8 +322,8 @@ class DiscretePixelCNN(nn.Module):
         # Clamp to prevent extreme values
         scale = scale.clamp(min=self.temp_scale_min, max=self.temp_scale_max)
 
-        # Reshape for broadcasting: (B, 1) → (B, 1, 1, 1)
-        scale = scale.unsqueeze(-1).unsqueeze(-1)
+        # Reshape for broadcasting with (B, Cat, C, H, W): (B, 1) → (B, 1, 1, 1, 1)
+        scale = scale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
         return scale
 
