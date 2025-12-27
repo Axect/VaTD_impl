@@ -53,9 +53,12 @@ net_config:
   # Temperature-dependent Output Scaling (NEW in v0.12)
   # Addresses high-temp learning difficulty by scaling logits
   # scale = (T_ref / T)^power
+  # v0.12.1: Increased power from 0.5 to 1.0 for stronger high-temp scaling
+  #   T=5.0: scale = 0.45 (was 0.67) → logits much smaller → p closer to 0.5
+  #   T=2.86: scale = 0.79 (was 0.89)
   logit_temp_scale: true
   temp_ref: 2.27              # Reference temperature (Tc)
-  temp_scale_power: 0.5       # Smooth scaling
+  temp_scale_power: 1.0       # Increased from 0.5 for stronger high-temp suppression
   temp_scale_min: 0.1         # Clamp minimum
   temp_scale_max: 10.0        # Clamp maximum
 
