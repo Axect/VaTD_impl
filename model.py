@@ -202,6 +202,17 @@ class MaskedResConv2D(nn.Module):
             augment_output=False,
         )
 
+        # Initialize ALL biases to 0 for symmetric initialization
+        # This ensures initial prediction is p=0.5 (unbiased) and prevents
+        # systematic bias accumulation through the network
+        self._init_zero_bias()
+
+    def _init_zero_bias(self):
+        """Initialize all biases to 0 for spin symmetry."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
     def forward(self, x):
         size = x.shape
         x = self.first_conv(x)

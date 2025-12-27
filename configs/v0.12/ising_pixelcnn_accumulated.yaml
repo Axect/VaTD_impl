@@ -1,4 +1,4 @@
-# v0.12: Temperature-dependent Output Scaling
+# v0.12: Temperature-dependent Output Scaling + Symmetric Initialization
 #
 # Key improvements from v0.11:
 # - Removed tc_focus (was causing high-temp sample starvation)
@@ -6,6 +6,12 @@
 # - Temperature-dependent Output Scaling for logits
 #   * High temp: scale < 1 → logits smaller → softmax closer to 0.5
 #   * Low temp: scale > 1 → logits larger → softmax sharper
+#
+# v0.12.1: Increased temp_scale_power 0.5 → 1.0
+# v0.12.2: Zero bias initialization for spin symmetry
+#   * All Conv2D biases initialized to 0
+#   * Prevents systematic bias accumulation through the network
+#   * Initial prediction is exactly p=0.5 (unbiased)
 #
 # This addresses the fundamental issue: high temp requires p ≈ 0.5,
 # but small bias accumulates over 255 spins causing ~5 error.
