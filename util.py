@@ -539,6 +539,141 @@ class Trainer:
 
         return stats
 
+    def train_epoch_sequential(self, energy_fn):
+        """
+        Hybrid training: Parallel sampling + Sequential backward per temperature.
+
+        This matches refs/vatd behavior where each temperature gets its own
+        forward/backward pass, preventing crosstalk between temperature groups.
+
+        Key insight: Sampling (255 autoregressive steps) is expensive,
+        but log_prob computation is relatively cheap.
+
+        Algorithm:
+        1. Sample ALL temperatures in parallel (fast - one pass)
+        2. For each temperature separately:
+           - Compute log_prob (forward pass with single T)
+           - Compute RLOO baseline within this T group
+           - Backward (gradients accumulate)
+        3. optimizer.step() after all T processed
+
+        Returns:
+            dict: Training statistics
+        """
+        batch_size = self.model.batch_size
+        num_beta = self.model.num_beta
+        num_steps = self.accumulation_steps
+
+        # Get curriculum-adjusted beta range
+        beta_min, beta_max = self.get_curriculum_beta_range()
+
+        self.model.train()
+        if any(
+            keyword in self.optimizer.__class__.__name__
+            for keyword in ["ScheduleFree", "SPlus"]
+        ):
+            self.optimizer.train()
+
+        # Epoch-level accumulators
+        epoch_loss = 0.0
+        epoch_log_prob = 0.0
+        epoch_energy = 0.0
+        all_beta_samples = []
+        last_samples = None
+
+        for step in range(num_steps):
+            # Log-uniform sampling over current beta range
+            log_beta = torch.rand(num_beta, device=self.device) * (
+                math.log(beta_max) - math.log(beta_min)
+            ) + math.log(beta_min)
+            beta_samples = torch.exp(log_beta)
+            all_beta_samples.append(beta_samples.clone())
+
+            T_samples = 1.0 / beta_samples
+            T_expanded = T_samples.repeat_interleave(batch_size)
+            total_size = num_beta * batch_size
+
+            # Step 1: Parallel sampling (expensive part - done once)
+            with torch.no_grad():
+                samples = self.model.sample(batch_size=total_size, T=T_expanded)
+                last_samples = samples
+                # Pre-compute energy for all samples
+                energy_all = energy_fn(samples)
+
+            # Step 2: Sequential backward per temperature
+            self.optimizer.zero_grad()
+            step_loss = 0.0
+            step_log_prob = 0.0
+            step_energy = 0.0
+
+            for i in range(num_beta):
+                start_idx = i * batch_size
+                end_idx = (i + 1) * batch_size
+
+                # Extract samples and energy for this temperature
+                samples_i = samples[start_idx:end_idx]
+                energy_i = energy_all[start_idx:end_idx]
+                T_i = T_samples[i].expand(batch_size)
+                beta_i = beta_samples[i]
+
+                # Forward pass with single temperature (no crosstalk)
+                log_prob_i = self.model.log_prob(samples_i, T=T_i)
+
+                # REINFORCE weight: log q + beta * E
+                beta_energy_i = beta_i * energy_i
+                reinforce_weight_i = log_prob_i.detach() + beta_energy_i
+
+                # RLOO baseline within this temperature group
+                sum_weight = reinforce_weight_i.sum()
+                loo_baseline_i = (sum_weight - reinforce_weight_i) / (batch_size - 1)
+                advantage_i = (reinforce_weight_i - loo_baseline_i).detach()
+
+                # REINFORCE loss for this temperature
+                loss_i = (advantage_i * log_prob_i).mean()
+                loss_i.backward()  # Gradients accumulate
+
+                # Accumulate statistics
+                with torch.no_grad():
+                    step_loss += (log_prob_i + beta_energy_i).mean().item() / num_beta
+                    step_log_prob += log_prob_i.mean().item() / num_beta
+                    step_energy += energy_i.mean().item() / num_beta
+
+            # Gradient clipping and optimizer step (after all T processed)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            # Accumulate epoch statistics
+            epoch_loss += step_loss / num_steps
+            epoch_log_prob += step_log_prob / num_steps
+            epoch_energy += step_energy / num_steps
+
+        # Compute final statistics
+        all_betas = torch.cat(all_beta_samples)
+
+        with torch.no_grad():
+            if last_samples is not None:
+                sample_diversity = last_samples.var(dim=0).mean().item()
+                magnetization = last_samples.mean(dim=(1, 2, 3)).abs().mean().item()
+            else:
+                sample_diversity = 0.0
+                magnetization = 0.0
+
+        stats = {
+            "train_loss": epoch_loss,
+            "log_prob_mean": epoch_log_prob,
+            "log_prob_std": 0.0,
+            "energy_mean": epoch_energy,
+            "energy_std": 0.0,
+            "sample_diversity": sample_diversity,
+            "magnetization_mean": magnetization,
+            "beta_samples_mean": all_betas.mean().item(),
+            "beta_samples_min": all_betas.min().item(),
+            "beta_samples_max": all_betas.max().item(),
+            "optimizer_steps_per_epoch": num_steps,
+        }
+
+        return stats
+
     def val_epoch(self, energy_fn):
         """
         Validation epoch with fixed beta values.
@@ -627,13 +762,21 @@ class Trainer:
             tqdm.write(f"  optimizer_steps_per_epoch={self.accumulation_steps}")
             tqdm.write(f"  total_optimizer_steps={self.accumulation_steps * self.epochs}")
             tqdm.write(f"  baseline=RLOO")
+        elif self.training_mode == "sequential":
+            tqdm.write(f"[v0.13] Sequential training mode enabled:")
+            tqdm.write(f"  Parallel sampling + Sequential backward per temperature")
+            tqdm.write(f"  optimizer_steps_per_epoch={self.accumulation_steps}")
+            tqdm.write(f"  baseline=RLOO (per temperature)")
 
         for epoch in tqdm(range(epochs), desc="Overall Progress"):
             # Update current epoch for curriculum learning
             self.current_epoch = epoch
 
             # Select training method based on training_mode
-            if self.training_mode == "accumulated":
+            if self.training_mode == "sequential":
+                # v0.13: Parallel sampling + Sequential backward per T
+                train_stats = self.train_epoch_sequential(energy_fn)
+            elif self.training_mode == "accumulated":
                 train_stats = self.train_epoch_accumulated(energy_fn)
             else:
                 # Standard REINFORCE training (backward compatible)

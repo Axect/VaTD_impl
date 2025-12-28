@@ -1,0 +1,74 @@
+# v0.13: Sequential Training (refs/vatd style)
+#
+# Key improvements from v0.12:
+# - Sequential backward per temperature (no crosstalk)
+#   * Parallel sampling (fast - 255 autoregressive steps done once)
+#   * Sequential log_prob + backward per T (correct gradients)
+#   * Matches refs/vatd behavior exactly
+#
+# Previous features retained:
+# - Temperature-dependent Output Scaling (logit_temp_scale)
+# - Zero bias initialization for spin symmetry
+# - 2-Phase Curriculum Learning
+#
+# This addresses the fundamental issue: parallelized T processing
+# caused crosstalk between temperature groups, preventing proper
+# high-temp learning.
+
+project: Ising_VaTD_v0.13
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 128       # Samples per temperature
+  num_beta: 8           # Number of temperature samples per step
+  beta_min: 0.2         # 1/T_max (T_max = 5)
+  beta_max: 1.0         # 1/T_min (T_min = 1)
+
+  # Training Mode: Sequential (v0.13)
+  # Parallel sampling + Sequential backward per T
+  training_mode: sequential
+  accumulation_steps: 16      # Optimizer steps per epoch
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 100          # High temp learning
+  phase1_beta_max: 0.35       # T_min = 2.86 (above Tc)
+  phase2_epochs: 150          # Gradual expansion to full range
+
+  # Model architecture
+  kernel_size: 7              # Moderate receptive field
+  hidden_channels: 96         # Increased capacity
+  hidden_conv_layers: 6
+  hidden_kernel_size: 5       # Smaller for high-temp local correlation
+  hidden_width: 128           # Increased capacity
+  hidden_fc_layers: 2
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_ref: 2.27              # Reference temperature (Tc)
+  temp_scale_power: 1.0       # Strong high-temp suppression
+  temp_scale_min: 0.1         # Clamp minimum
+  temp_scale_max: 10.0        # Clamp maximum
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 0.0
+
+scheduler_config:
+  upper_bound: 600
+  max_iter: 500
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false
