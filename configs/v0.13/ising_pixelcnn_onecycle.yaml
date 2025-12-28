@@ -13,7 +13,7 @@
 # - Zero bias initialization for spin symmetry
 # - 2-Phase Curriculum Learning
 
-project: Ising_VaTD_v0.13_onecycle
+project: Ising_VaTD_v0.13
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
