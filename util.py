@@ -505,6 +505,10 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
+            # Step scheduler for OneCycleLR (needs per-step updates)
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                self.scheduler.step()
+
             # Accumulate statistics
             with torch.no_grad():
                 actual_loss = (log_prob_view + beta_energy).mean().item()
@@ -641,6 +645,10 @@ class Trainer:
             # Gradient clipping and optimizer step (after all T processed)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
+
+            # Step scheduler for OneCycleLR (needs per-step updates)
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                self.scheduler.step()
 
             # Accumulate epoch statistics
             epoch_loss += step_loss / num_steps
@@ -942,9 +950,14 @@ class Trainer:
                 if self.pruner.should_prune():
                     raise optuna.TrialPruned()
 
-            # ReduceLROnPlateau requires metrics, other schedulers don't
+            # Scheduler stepping:
+            # - ReduceLROnPlateau: requires metrics, step per epoch
+            # - OneCycleLR: stepped per optimizer step (inside train_epoch_sequential)
+            # - Others: step per epoch
             if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step(val_loss)
+            elif isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                pass  # Already stepped inside train_epoch_sequential
             else:
                 self.scheduler.step()
 

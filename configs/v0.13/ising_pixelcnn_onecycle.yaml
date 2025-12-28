@@ -1,0 +1,73 @@
+# v0.13.2: Sequential Training + OneCycleLR
+#
+# Key changes from v0.13.1:
+# - OneCycleLR scheduler for better convergence
+#   * Warmup phase: stabilizes noisy gradients (especially high temp)
+#   * High LR phase: escapes local minima, explores landscape
+#   * Annealing phase: fine-tunes to convergence
+#
+# Previous features retained:
+# - Sequential backward per temperature (no crosstalk)
+# - Increased training intensity (batch_size=256, accumulation_steps=64)
+# - Temperature-dependent Output Scaling
+# - Zero bias initialization for spin symmetry
+# - 2-Phase Curriculum Learning
+
+project: Ising_VaTD_v0.13_onecycle
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: torch.optim.lr_scheduler.OneCycleLR
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 256       # Samples per temperature
+  num_beta: 8           # Number of temperature samples per step
+  beta_min: 0.2         # 1/T_max (T_max = 5)
+  beta_max: 1.0         # 1/T_min (T_min = 1)
+
+  # Training Mode: Sequential (v0.13)
+  training_mode: sequential
+  accumulation_steps: 64      # Optimizer steps per epoch
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 100          # High temp learning
+  phase1_beta_max: 0.35       # T_min = 2.86 (above Tc)
+  phase2_epochs: 150          # Gradual expansion to full range
+
+  # Model architecture
+  kernel_size: 7
+  hidden_channels: 96
+  hidden_conv_layers: 6
+  hidden_kernel_size: 5
+  hidden_width: 128
+  hidden_fc_layers: 2
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_ref: 2.27
+  temp_scale_power: 1.0
+  temp_scale_min: 0.1
+  temp_scale_max: 10.0
+
+optimizer_config:
+  lr: 1.e-3               # Base LR (used as max_lr reference)
+  weight_decay: 0.0
+
+scheduler_config:
+  max_lr: 3.e-3           # Peak LR (3x base)
+  pct_start: 0.3          # 30% warmup (150 epochs)
+  anneal_strategy: cos    # Cosine annealing
+  div_factor: 10          # initial_lr = 3e-4
+  final_div_factor: 100   # final_lr = 3e-6
+
+early_stopping_config:
+  enabled: false

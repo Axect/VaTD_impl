@@ -60,9 +60,19 @@ class RunConfig:
         return optimizer_class(model.parameters(), **self.optimizer_config)
 
     def create_scheduler(self, optimizer):
-        scheduler_module, scheduler_class = self.scheduler.rsplit(".", 1)
+        scheduler_module, scheduler_class_name = self.scheduler.rsplit(".", 1)
         scheduler_module = importlib.import_module(scheduler_module)
-        scheduler_class = getattr(scheduler_module, scheduler_class)
+        scheduler_class = getattr(scheduler_module, scheduler_class_name)
+
+        # Special handling for OneCycleLR which requires total_steps
+        if scheduler_class_name == "OneCycleLR":
+            scheduler_config = self.scheduler_config.copy()
+            # Calculate total_steps from epochs and accumulation_steps
+            accumulation_steps = self.net_config.get("accumulation_steps", 1)
+            total_steps = self.epochs * accumulation_steps
+            scheduler_config["total_steps"] = total_steps
+            return scheduler_class(optimizer, **scheduler_config)
+
         return scheduler_class(optimizer, **self.scheduler_config)
 
     def gen_group_name(self):
