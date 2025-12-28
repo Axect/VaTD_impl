@@ -6,14 +6,15 @@
 #   * Sequential log_prob + backward per T (correct gradients)
 #   * Matches refs/vatd behavior exactly
 #
+# v0.13.1: Increased training intensity
+# - accumulation_steps: 16 → 64 (4x more optimizer steps)
+# - batch_size per T: 128 → 256 (2x more samples, more stable RLOO)
+# - Total optimizer steps: 64 × 500 = 32,000 (vs 8,000 before)
+#
 # Previous features retained:
 # - Temperature-dependent Output Scaling (logit_temp_scale)
 # - Zero bias initialization for spin symmetry
 # - 2-Phase Curriculum Learning
-#
-# This addresses the fundamental issue: parallelized T processing
-# caused crosstalk between temperature groups, preventing proper
-# high-temp learning.
 
 project: Ising_VaTD_v0.13
 device: cuda:0
@@ -30,7 +31,7 @@ net_config:
   fix_first: 1
 
   # Temperature sampling configuration
-  batch_size: 128       # Samples per temperature
+  batch_size: 256       # Samples per temperature (increased from 128)
   num_beta: 8           # Number of temperature samples per step
   beta_min: 0.2         # 1/T_max (T_max = 5)
   beta_max: 1.0         # 1/T_min (T_min = 1)
@@ -38,7 +39,7 @@ net_config:
   # Training Mode: Sequential (v0.13)
   # Parallel sampling + Sequential backward per T
   training_mode: sequential
-  accumulation_steps: 16      # Optimizer steps per epoch
+  accumulation_steps: 64      # Optimizer steps per epoch (increased from 16)
 
   # 2-Phase Curriculum Learning
   curriculum_enabled: true
