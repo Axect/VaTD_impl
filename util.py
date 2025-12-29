@@ -12,6 +12,7 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for server
 
 from config import RunConfig
+from ising import swendsen_wang_update  # Import Swendsen-Wang
 
 import random
 import os
@@ -221,6 +222,13 @@ class Trainer:
         # v0.11: Training mode settings
         self.accumulation_steps = accumulation_steps
         self.training_mode = training_mode
+
+        # Hybrid Training / MCMC Correction Settings
+        # Checks if model hparams has mcmc_enabled, else defaults to False
+        self.mcmc_enabled = getattr(model, "hparams", {}).get("mcmc_enabled", False)
+        self.mcmc_freq = getattr(model, "hparams", {}).get("mcmc_freq", 5)
+        self.mcmc_steps = getattr(model, "hparams", {}).get("mcmc_steps", 10)
+        self.mcmc_weight = getattr(model, "hparams", {}).get("mcmc_weight", 1.0)
 
         # Curriculum learning settings
         # 2-Phase curriculum: High temp only → Gradual expansion to full range
@@ -546,6 +554,7 @@ class Trainer:
     def train_epoch_sequential(self, energy_fn):
         """
         Hybrid training: Parallel sampling + Sequential backward per temperature.
+        Now supports MCMC Correction (Kalman Filter style) if enabled.
 
         This matches refs/vatd behavior where each temperature gets its own
         forward/backward pass, preventing crosstalk between temperature groups.
@@ -559,7 +568,11 @@ class Trainer:
            - Compute log_prob (forward pass with single T)
            - Compute RLOO baseline within this T group
            - Backward (gradients accumulate)
-        3. optimizer.step() after all T processed
+        3. (Optional) MCMC Correction:
+           - Every K steps, run Swendsen-Wang on current samples
+           - Compute MLE loss on these MCMC samples
+           - Backward (Supervised Learning signal)
+        4. optimizer.step() after all T processed
 
         Returns:
             dict: Training statistics
@@ -582,6 +595,7 @@ class Trainer:
         epoch_loss = 0.0
         epoch_log_prob = 0.0
         epoch_energy = 0.0
+        mcmc_loss_acc = 0.0
         all_beta_samples = []
         last_samples = None
 
@@ -642,6 +656,26 @@ class Trainer:
                     step_log_prob += log_prob_i.mean().item() / num_beta
                     step_energy += energy_i.mean().item() / num_beta
 
+            # Step 3: MCMC Correction (Kalman Filter Update)
+            # Only run periodically
+            if self.mcmc_enabled and self.current_epoch % self.mcmc_freq == 0:
+                with torch.no_grad():
+                    # Run Swendsen-Wang to equilibrate samples
+                    # Start from current model samples (warm start)
+                    mcmc_samples = swendsen_wang_update(
+                        samples, T_expanded, n_sweeps=self.mcmc_steps, fix_first=(self.model.fix_first is not None)
+                    )
+
+                # Teacher Forcing: Maximize likelihood of MCMC samples
+                # Treat MCMC samples as "ground truth"
+                log_prob_mcmc = self.model.log_prob(mcmc_samples, T=T_expanded)
+                loss_mle = -log_prob_mcmc.mean()
+
+                # Backward MLE loss with weight
+                (loss_mle * self.mcmc_weight).backward()
+
+                mcmc_loss_acc += loss_mle.item() / num_steps
+
             # Gradient clipping and optimizer step (after all T processed)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
@@ -679,6 +713,9 @@ class Trainer:
             "beta_samples_max": all_betas.max().item(),
             "optimizer_steps_per_epoch": num_steps,
         }
+        
+        if self.mcmc_enabled:
+             stats["mcmc_loss"] = mcmc_loss_acc
 
         return stats
 
