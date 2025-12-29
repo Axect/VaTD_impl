@@ -868,25 +868,28 @@ class DiscreteFlowMatcher(nn.Module):
         B, C, H, W = x.shape
         div = torch.zeros(B, device=x.device)
         
-        # Enable gradient computation for x
-        x.requires_grad_(True)
-        
-        for _ in range(num_samples):
-            # Rademacher noise (random {-1, 1})
-            epsilon = torch.randint_like(x, low=0, high=2).float() * 2 - 1
+        # Enable gradient computation locally, even if context is no_grad
+        with torch.enable_grad():
+            # Enable gradient computation for x
+            x.requires_grad_(True)
             
-            # Compute velocity
-            v = self.velocity_field(x, t, T)
+            for _ in range(num_samples):
+                # Rademacher noise (random {-1, 1})
+                epsilon = torch.randint_like(x, low=0, high=2).float() * 2 - 1
+                
+                # Compute velocity
+                v = self.velocity_field(x, t, T)
+                
+                # Compute vector-Jacobian product: eps^T * (dv/dx)
+                # We compute grad(v_eps, x) where v_eps = v * eps
+                v_eps = (v * epsilon).sum()
+                grad_x = torch.autograd.grad(v_eps, x, create_graph=False)[0]
+                
+                # Trace estimate: eps^T * grad_x
+                div += (grad_x * epsilon).sum(dim=[1, 2, 3])
             
-            # Compute vector-Jacobian product: eps^T * (dv/dx)
-            # We compute grad(v_eps, x) where v_eps = v * eps
-            v_eps = (v * epsilon).sum()
-            grad_x = torch.autograd.grad(v_eps, x, create_graph=True)[0]
+            x.requires_grad_(False)
             
-            # Trace estimate: eps^T * grad_x
-            div += (grad_x * epsilon).sum(dim=[1, 2, 3])
-            
-        x.requires_grad_(False)
         return div / num_samples
 
     def log_prob_ode(
