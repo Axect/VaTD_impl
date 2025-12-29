@@ -779,97 +779,9 @@ class DiscreteFlowMatcher(nn.Module):
         T: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Generate samples via DDPM-style iterative denoising.
-
-        This avoids the diminishing velocity problem of ODE integration
-        by using a discrete-time denoising process:
-
-        Algorithm:
-        1. Start at high noise level (t_max)
-        2. For each step, denoise and re-noise at lower level
-        3. Final step: take argmax of predicted clean distribution
-
-        Args:
-            batch_size: Number of samples to generate
-            T: Temperature tensor of shape (B,) or (B, 1)
-
-        Returns:
-            Samples of shape (B, 1, H, W) in {-1, +1}
+        Generate samples. Defaults to ODE integration which is more stable.
         """
-        batch_size = batch_size if batch_size is not None else self.batch_size
-        H, W = self.size
-
-        # Handle temperature
-        if T is None:
-            T = torch.ones(batch_size, device=self.device) * self.temp_ref
-        else:
-            T = T.to(self.device)
-            if T.dim() == 2:
-                T = T.squeeze(-1)
-            if T.shape[0] == 1 and batch_size > 1:
-                T = T.expand(batch_size)
-
-        # Initialize with random Dirichlet samples (high noise level t_max)
-        # At t_max, the Dirichlet concentration is (1 + t_max, 1) or (1, 1 + t_max)
-        # We sample from Dir(1, 1) which is uniform on simplex
-        alpha_init = torch.ones(batch_size, H, W, 2, device=self.device)
-        x = torch.distributions.Dirichlet(alpha_init).sample()  # (B, H, W, 2)
-        x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
-
-        # Time schedule: from t_max down to t_min
-        # Use cosine schedule for smoother denoising
-        steps = torch.linspace(0, 1, self.num_flow_steps + 1, device=self.device)
-        # Cosine schedule
-        t_schedule = self.t_min + (self.t_max - self.t_min) * (1 - torch.cos(steps * math.pi / 2))
-        # t_schedule goes from t_min to t_max (Noise to Data) - Do NOT flip!
-
-        # DDPM-style denoising
-        with torch.no_grad():
-            for i in range(self.num_flow_steps):
-                t_current = t_schedule[i]
-                t_next = t_schedule[i + 1]
-
-                t_batch = torch.full((batch_size,), t_current.item(), device=self.device)
-
-                # Predict clean state distribution
-                logits = self.denoise(x, t_batch, T)  # (B, 2, H, W)
-                x_clean_pred = F.softmax(logits, dim=1)
-
-                if t_next > self.t_min:
-                    # Re-noise using Dirichlet distribution for proper stochasticity
-                    # Use SOFT predictions to allow uncertainty to propagate
-                    t_val = t_next.item()
-
-                    # Use soft predictions - uncertain predictions give more uniform Dirichlet
-                    # Normalize to ensure proper Dirichlet parameters
-                    # Scale t to get reasonable concentration (cap at ~20 for numerical stability)
-                    effective_t = min(t_val, 20.0)
-
-                    # alpha = 1 + t * p, where p is the soft probability
-                    alpha = 1.0 + effective_t * x_clean_pred  # (B, 2, H, W)
-                    alpha = alpha.permute(0, 2, 3, 1)  # (B, H, W, 2)
-
-                    # Sample from Dirichlet
-                    x = torch.distributions.Dirichlet(alpha).sample()
-                    x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
-                else:
-                    # Final step: use predicted clean distribution
-                    x = x_clean_pred
-
-        # Convert to discrete spins by SAMPLING from predicted distribution
-        # This preserves stochasticity and respects uncertainty
-        # x[:, 1] is probability of spin +1
-        samples = (torch.rand_like(x[:, 1]) < x[:, 1]).float()
-        samples = samples.unsqueeze(1)
-
-        # Apply fixed first spin if configured
-        if self.fix_first is not None:
-            samples[:, 0, 0, 0] = float(self.fix_first)
-
-        # Map to {-1, +1}
-        samples = self.mapping(samples)
-
-        return samples
+        return self.sample_ode(batch_size, T)
 
     def sample_ode(
         self,
