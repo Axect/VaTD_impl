@@ -1,0 +1,74 @@
+# v0.14.2: Discrete Flow Matching - Large Model
+#
+# High-capacity version for maximum accuracy:
+# - Larger network (hidden_channels: 96, conv_layers: 6)
+# - More flow steps (80) for better sample quality
+# - Extended training (500 epochs)
+# - More samples per temperature for stable RLOO
+#
+# Recommended for:
+# - Final training runs
+# - Accurate partition function estimation
+# - Comparison with exact Onsager solution
+
+project: Ising_DFM_v0.14
+device: cuda:0
+net: model_dfm.DiscreteFlowMatcher
+optimizer: torch.optim.AdamW
+scheduler: torch.optim.lr_scheduler.CosineAnnealingLR
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 128           # More samples for stable RLOO
+  num_beta: 4               # Temperature points per batch
+  beta_min: 0.2             # 1/T_max (T_max = 5)
+  beta_max: 1.0             # 1/T_min (T_min = 1)
+
+  # Flow Matching Parameters
+  num_flow_steps: 80        # More steps for better samples
+  t_max: 7.0                # Extended integration time
+  t_min: 0.01
+  time_dim: 128             # Larger time embedding
+
+  # Training Mode
+  training_mode: hybrid
+  lambda_reinforce: 0.1
+  accumulation_steps: 16    # More gradient accumulation
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 100        # Extended high-temp phase
+  phase1_beta_max: 0.35
+  phase2_epochs: 150        # Gradual expansion
+
+  # Model architecture - Large
+  hidden_channels: 96       # Increased capacity
+  hidden_conv_layers: 6     # Deeper network
+  hidden_kernel_size: 5     # Larger kernels
+  hidden_width: 192         # Wider FC layers
+  hidden_fc_layers: 3       # More FC layers
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_ref: 2.27
+  temp_scale_power: 0.5
+  temp_scale_min: 0.1
+  temp_scale_max: 10.0
+
+optimizer_config:
+  lr: 5.e-4                 # Lower LR for larger model
+  weight_decay: 1.e-4
+
+scheduler_config:
+  T_max: 500
+  eta_min: 1.e-6
+
+early_stopping_config:
+  enabled: false

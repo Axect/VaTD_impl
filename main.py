@@ -3,10 +3,15 @@ import wandb
 import numpy as np
 import math
 
-from util import run
 from config import RunConfig, OptimizeConfig
 
 import argparse
+
+
+def is_dfm_model(net_name: str) -> bool:
+    """Check if the model is a Discrete Flow Matching model."""
+    net_lower = net_name.lower()
+    return "dfm" in net_lower or "flowmatch" in net_lower or "discreteflowmatcher" in net_lower
 
 
 def create_adjacency_matrix(L, d=2):
@@ -173,6 +178,15 @@ def main():
     energy_fn.critical_temperature = CRITICAL_TEMPERATURE
     print("Exact partition function values attached to energy_fn\n")
 
+    # Select run function based on model type
+    use_dfm = is_dfm_model(base_config.net)
+    if use_dfm:
+        from util_dfm import run as run_fn
+        print(f"[DFM] Using Discrete Flow Matching trainer for {base_config.net}")
+    else:
+        from util import run as run_fn
+        print(f"[PixelCNN] Using standard trainer for {base_config.net}")
+
     # Run
     if args.optimize_config:
         optimize_config = OptimizeConfig.from_yaml(args.optimize_config)
@@ -192,7 +206,7 @@ def main():
 
             trial.set_user_attr("group_name", group_name)
 
-            return run(run_config, energy_fn, group_name, trial=trial, pruner=pruner)
+            return run_fn(run_config, energy_fn, group_name, trial=trial, pruner=pruner)
 
         study = optimize_config.create_study(project=f"{base_config.project}_Opt")
         study.optimize(
@@ -211,7 +225,7 @@ def main():
         )
 
     else:
-        run(base_config, energy_fn)
+        run_fn(base_config, energy_fn)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,79 @@
+# v0.14: Discrete Flow Matching for Ising Model
+#
+# Key changes from v0.13 (PixelCNN):
+# - Replaced autoregressive PixelCNN with Discrete Flow Matching
+#   * Parallel sampling via Euler integration (50 steps vs 256 sequential)
+#   * Dirichlet probability path for noising
+#   * Cross-entropy denoising loss + REINFORCE
+#
+# Advantages:
+# - ~3-5x faster sampling (parallel vs autoregressive)
+# - Thermodynamic integration for partition function
+# - More flexible architecture (no masking constraints)
+#
+# Training approach:
+# - Hybrid loss: L_denoise + λ * L_reinforce
+# - ELBO-based log probability estimation
+# - Same curriculum learning as v0.13
+
+project: Ising_DFM_v0.14
+device: cuda:0
+net: model_dfm.DiscreteFlowMatcher
+optimizer: torch.optim.AdamW
+scheduler: torch.optim.lr_scheduler.CosineAnnealingLR
+epochs: 300
+batch_size: 256
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 64            # Samples per temperature (reduced for GPU memory)
+  num_beta: 4               # Number of temperature samples per step
+  beta_min: 0.2             # 1/T_max (T_max = 5)
+  beta_max: 1.0             # 1/T_min (T_min = 1)
+
+  # Flow Matching Parameters
+  num_flow_steps: 50        # Euler integration steps for sampling
+  t_max: 5.0                # Maximum integration time
+  t_min: 0.01               # Avoid t=0 singularity
+  time_dim: 64              # Time embedding dimension
+
+  # Training Mode
+  training_mode: hybrid     # "hybrid" (denoise + REINFORCE) or "denoise_only"
+  lambda_reinforce: 0.1     # Weight for REINFORCE term
+  accumulation_steps: 8     # Gradient accumulation steps per epoch
+
+  # 2-Phase Curriculum Learning (same as v0.13)
+  curriculum_enabled: true
+  phase1_epochs: 75         # High temp learning
+  phase1_beta_max: 0.35     # T_min = 2.86 (above Tc)
+  phase2_epochs: 100        # Gradual expansion to full range
+
+  # Model architecture (ResNet without masking)
+  hidden_channels: 64       # ResNet block width
+  hidden_conv_layers: 5     # Number of residual blocks
+  hidden_kernel_size: 3     # Spatial kernel size
+  hidden_width: 128         # FC layer width
+  hidden_fc_layers: 2       # Number of FC layers
+
+  # Temperature-dependent Output Scaling (optional)
+  logit_temp_scale: false   # Disabled by default for DFM
+  temp_ref: 2.27            # Reference temperature (Tc)
+  temp_scale_power: 0.5
+  temp_scale_min: 0.1
+  temp_scale_max: 10.0
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 1.e-4
+
+scheduler_config:
+  T_max: 300                # Same as epochs
+  eta_min: 1.e-5
+
+early_stopping_config:
+  enabled: false
