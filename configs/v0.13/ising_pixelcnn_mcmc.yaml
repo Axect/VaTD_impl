@@ -20,7 +20,7 @@
 # - Periodically corrects samples using Swendsen-Wang MCMC
 # - Applies MLE loss (Teacher Forcing) to guide model towards true distribution
 
-project: Ising_VaTD_v0.13_MCMC
+project: Ising_VaTD_v0.13
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
