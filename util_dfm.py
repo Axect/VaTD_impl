@@ -166,7 +166,9 @@ class FlowMatchingTrainer:
         epochs=None,
         lambda_reinforce=0.1,
         accumulation_steps=1,
-        training_mode="hybrid",  # "hybrid" or "denoise_only"
+        training_mode="energy_guided",  # "energy_guided", "reinforce", "hybrid", or "denoise_only"
+        energy_weight=1.0,  # Weight for energy-guided velocity matching
+        mh_steps=10,  # Metropolis-Hastings steps for sample improvement
     ):
         self.model = model
         self.optimizer = optimizer
@@ -179,6 +181,8 @@ class FlowMatchingTrainer:
         self.lambda_reinforce = lambda_reinforce
         self.accumulation_steps = accumulation_steps
         self.training_mode = training_mode
+        self.energy_weight = energy_weight
+        self.mh_steps = mh_steps
 
         # Curriculum learning
         self.curriculum_enabled = getattr(model, "curriculum_enabled", False)
@@ -292,6 +296,8 @@ class FlowMatchingTrainer:
                 energy_fn=energy_fn,
                 lambda_reinforce=self.lambda_reinforce,
                 training_mode=self.training_mode,
+                energy_weight=self.energy_weight,
+                mh_steps=self.mh_steps,
             )
 
             # Backward
@@ -309,11 +315,11 @@ class FlowMatchingTrainer:
                 self.scheduler.step()
 
             # Accumulate stats
-            for key in ["denoise_loss", "total_loss"]:
+            for key in ["denoise_loss", "total_loss", "reinforce_loss", "log_prob_mean",
+                        "free_energy_mean", "advantage_std", "velocity_loss",
+                        "improved_energy_mean", "energy_improvement"]:
                 if key in metrics:
-                    epoch_stats[key] += metrics[key] / num_steps
-            if "reinforce_loss" in metrics:
-                epoch_stats["reinforce_loss"] += metrics[key] / num_steps
+                    epoch_stats[key] = epoch_stats.get(key, 0.0) + metrics[key] / num_steps
             if "energy_mean" in metrics:
                 epoch_stats["energy_mean"] += metrics["energy_mean"] / num_steps
 
@@ -403,7 +409,7 @@ class FlowMatchingTrainer:
 
     def train(self, energy_fn, epochs, log_every=1, save_path=None, wandb_log=True):
         """
-        Full training loop.
+        Full training loop with organized wandb logging (same structure as util.py).
 
         Args:
             energy_fn: Energy function
@@ -417,19 +423,24 @@ class FlowMatchingTrainer:
         """
         best_val_loss = float("inf")
         history = {"train_loss": [], "val_loss": []}
+        val_losses = []  # For predicted final loss
 
         pbar = tqdm(range(epochs), desc="Training DFM")
+        val_num_beta = len(self.fixed_val_betas)
 
         for epoch in pbar:
             self.current_epoch = epoch
 
             # Training
             train_stats = self.train_epoch(energy_fn)
-            history["train_loss"].append(train_stats["train_loss"])
+            train_loss = train_stats["train_loss"]
+            history["train_loss"].append(train_loss)
 
             # Validation
             val_stats = self.val_epoch(energy_fn)
-            history["val_loss"].append(val_stats["val_loss"])
+            val_loss = val_stats["val_loss"]
+            history["val_loss"].append(val_loss)
+            val_losses.append(val_loss)
 
             # Update scheduler (non-OneCycleLR)
             if self.scheduler is not None and not isinstance(
@@ -437,37 +448,121 @@ class FlowMatchingTrainer:
             ):
                 self.scheduler.step()
 
-            # Get current learning rate
-            current_lr = self.optimizer.param_groups[0]["lr"]
+            # Get curriculum info
+            curr_beta_min, curr_beta_max = self.get_curriculum_beta_range()
+            if self.curriculum_enabled:
+                if epoch < self.phase1_epochs:
+                    curr_phase = 1
+                else:
+                    curr_phase = 2
+            else:
+                curr_phase = 0
 
-            # Logging
-            if epoch % log_every == 0:
-                log_dict = {
-                    "epoch": epoch,
-                    "learning_rate": current_lr,
-                    **train_stats,
-                    **val_stats,
-                }
+            # ========== Organized wandb logging by section ==========
+            log_dict = {}
 
-                # Add curriculum info
-                if self.curriculum_enabled:
-                    beta_min, beta_max = self.get_curriculum_beta_range()
-                    log_dict["curriculum_beta_max"] = beta_max
+            # --- train/ section ---
+            log_dict["train/loss"] = train_loss
+            log_dict["train/loss_signlog"] = sign_log_transform(train_loss)
+            if "log_prob_mean" in train_stats:
+                log_dict["train/log_prob_mean"] = train_stats["log_prob_mean"]
+            if "energy_mean" in train_stats:
+                log_dict["train/energy_mean"] = train_stats["energy_mean"]
+            if "reinforce_loss" in train_stats:
+                log_dict["train/reinforce_loss"] = train_stats["reinforce_loss"]
+            if "free_energy_mean" in train_stats:
+                log_dict["train/free_energy_mean"] = train_stats["free_energy_mean"]
+            if "advantage_std" in train_stats:
+                log_dict["train/advantage_std"] = train_stats["advantage_std"]
+            # Energy-guided mode metrics
+            if "denoise_loss" in train_stats:
+                log_dict["train/denoise_loss"] = train_stats["denoise_loss"]
+            if "velocity_loss" in train_stats:
+                log_dict["train/velocity_loss"] = train_stats["velocity_loss"]
+            if "improved_energy_mean" in train_stats:
+                log_dict["train/improved_energy_mean"] = train_stats["improved_energy_mean"]
+            if "energy_improvement" in train_stats:
+                log_dict["train/energy_improvement"] = train_stats["energy_improvement"]
+            log_dict["train/lr"] = self.optimizer.param_groups[0]["lr"]
 
-                # Log to WandB
-                if wandb_log and wandb.run is not None:
-                    wandb.log(log_dict)
+            # --- val/ section ---
+            log_dict["val/loss"] = val_loss
+            log_dict["val/loss_signlog"] = sign_log_transform(val_loss)
+            for i in range(val_num_beta):
+                if f"val_loss_beta_{i}" in val_stats:
+                    log_dict[f"val/loss_beta_{i}"] = val_stats[f"val_loss_beta_{i}"]
+                    log_dict[f"val/loss_beta_{i}_signlog"] = sign_log_transform(
+                        val_stats[f"val_loss_beta_{i}"]
+                    )
+                    log_dict[f"val/beta_{i}"] = self.fixed_val_betas[i].item()
 
-                # Update progress bar
-                pbar.set_postfix({
-                    "loss": f"{train_stats['train_loss']:.3f}",
-                    "val": f"{val_stats['val_loss']:.3f}",
-                    "lr": f"{current_lr:.2e}",
-                })
+            # --- curriculum/ section ---
+            log_dict["curriculum/phase"] = curr_phase
+            log_dict["curriculum/beta_min"] = curr_beta_min
+            log_dict["curriculum/beta_max"] = curr_beta_max
+            log_dict["curriculum/T_min"] = 1.0 / curr_beta_max
+            log_dict["curriculum/T_max"] = 1.0 / curr_beta_min
+
+            # --- diversity/ section ---
+            if "sample_diversity" in train_stats:
+                log_dict["diversity/sample_diversity"] = train_stats["sample_diversity"]
+            if "magnetization_mean" in train_stats:
+                log_dict["diversity/magnetization_mean"] = train_stats["magnetization_mean"]
+
+            # --- sampling/ section ---
+            if "beta_samples_mean" in train_stats:
+                log_dict["sampling/beta_samples_mean"] = train_stats["beta_samples_mean"]
+                log_dict["sampling/beta_samples_min"] = train_stats["beta_samples_min"]
+                log_dict["sampling/beta_samples_max"] = train_stats["beta_samples_max"]
+
+            # --- exact/ section (errors vs Onsager solution) ---
+            if self.exact_logz_values is not None:
+                for i in range(val_num_beta):
+                    if f"val_error_exact_beta_{i}" in val_stats:
+                        log_dict[f"exact/error_beta_{i}"] = val_stats[f"val_error_exact_beta_{i}"]
+                        log_dict[f"exact/error_beta_{i}_signlog"] = sign_log_transform(
+                            val_stats[f"val_error_exact_beta_{i}"]
+                        )
+
+                if "val_error_mean" in val_stats:
+                    log_dict["exact/error_abs_mean"] = val_stats["val_error_mean"]
+                    log_dict["exact/error_abs_mean_signlog"] = sign_log_transform(
+                        val_stats["val_error_mean"]
+                    )
+
+            # Log sample visualization periodically (every 10 epochs or at start/end)
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                try:
+                    vis_betas = self.fixed_val_betas[::2]  # Every other beta
+                    fig = create_sample_grid(
+                        self.model, vis_betas, n_samples=4, device=self.device
+                    )
+                    log_dict["samples"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    tqdm.write(f"Sample visualization failed: {e}")
+
+            # Log to WandB
+            if wandb_log and wandb.run is not None:
+                wandb.log(log_dict)
+
+            # Console output
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                lr = self.optimizer.param_groups[0]["lr"]
+                tqdm.write(
+                    f"epoch: {epoch}, train_loss: {train_loss:.4e}, val_loss: {val_loss:.4e}, lr: {lr:.4e}"
+                )
+
+            # Update progress bar
+            pbar.set_postfix({
+                "loss": f"{train_loss:.3f}",
+                "val": f"{val_loss:.3f}",
+                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+            })
 
             # Save best model
-            if val_stats["val_loss"] < best_val_loss:
-                best_val_loss = val_stats["val_loss"]
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 if save_path:
                     torch.save({
                         "epoch": epoch,
@@ -478,7 +573,7 @@ class FlowMatchingTrainer:
 
             # Early stopping
             if self.early_stopping is not None:
-                if self.early_stopping(val_stats["val_loss"]):
+                if self.early_stopping(val_loss):
                     tqdm.write(f"Early stopping at epoch {epoch}")
                     break
 
@@ -563,7 +658,9 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 epochs=run_config.epochs,
                 lambda_reinforce=net_config.get("lambda_reinforce", 0.1),
                 accumulation_steps=net_config.get("accumulation_steps", 1),
-                training_mode=net_config.get("training_mode", "hybrid"),
+                training_mode=net_config.get("training_mode", "energy_guided"),
+                energy_weight=net_config.get("energy_weight", 1.0),
+                mh_steps=net_config.get("mh_steps", 10),
             )
 
             # Train and get final val_loss

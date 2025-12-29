@@ -9,8 +9,8 @@
 # DFM features:
 # - Parallel sampling via Euler integration (50 steps)
 # - Dirichlet probability path for noising
-# - Pure REINFORCE training (self-training without external data)
-# - Free energy minimization: F = log q + β·E
+# - Energy-guided training (MH-improved + velocity matching)
+# - Mean-field Boltzmann velocity for energy guidance
 
 project: Ising_DFM_v0.14
 device: cuda:0
@@ -39,9 +39,11 @@ net_config:
   time_dim: 64              # Time embedding dimension
 
   # Training Mode
-  training_mode: reinforce  # "reinforce" (pure REINFORCE for self-training)
-  lambda_reinforce: 0.1     # Weight for REINFORCE term (ignored in reinforce mode)
-  accumulation_steps: 8     # Gradient accumulation steps per epoch
+  training_mode: energy_guided  # "energy_guided" (MH-improved + velocity matching)
+  energy_weight: 1.0            # Weight for velocity matching loss
+  mh_steps: 10                  # Metropolis-Hastings steps for sample improvement
+  lambda_reinforce: 0.1         # (unused in energy_guided mode)
+  accumulation_steps: 8         # Gradient accumulation steps per epoch
 
   # 2-Phase Curriculum Learning
   curriculum_enabled: true

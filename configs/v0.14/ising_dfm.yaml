@@ -4,16 +4,16 @@
 # - Replaced autoregressive PixelCNN with Discrete Flow Matching
 #   * Parallel sampling via Euler integration (50 steps vs 256 sequential)
 #   * Dirichlet probability path for noising
-#   * Pure REINFORCE training (self-training without external data)
+#   * Energy-guided training (MH-improved targets + velocity matching)
 #
 # Advantages:
 # - ~3-5x faster sampling (parallel vs autoregressive)
-# - Thermodynamic integration for partition function
+# - Direct energy guidance ensures samples converge to Boltzmann distribution
 # - More flexible architecture (no masking constraints)
 #
 # Training approach:
-# - Pure REINFORCE with RLOO baseline (no denoising loss for self-training)
-# - Free energy: F = log q + β·E
+# - Energy-guided mode: Denoise toward MH-improved samples + velocity matching
+# - Mean-field Boltzmann velocity guides sampling toward low-energy states
 # - Same curriculum learning as v0.13
 
 project: Ising_DFM_v0.14
@@ -43,9 +43,11 @@ net_config:
   time_dim: 64              # Time embedding dimension
 
   # Training Mode
-  training_mode: reinforce  # "reinforce" (pure REINFORCE for self-training)
-  lambda_reinforce: 0.1     # Weight for REINFORCE term (ignored in reinforce mode)
-  accumulation_steps: 8     # Gradient accumulation steps per epoch
+  training_mode: energy_guided  # "energy_guided" (MH-improved + velocity matching)
+  energy_weight: 1.0            # Weight for velocity matching loss
+  mh_steps: 10                  # Metropolis-Hastings steps for sample improvement
+  lambda_reinforce: 0.1         # (unused in energy_guided mode)
+  accumulation_steps: 8         # Gradient accumulation steps per epoch
 
   # 2-Phase Curriculum Learning (same as v0.13)
   curriculum_enabled: true

@@ -419,6 +419,250 @@ class DiscreteFlowMatcher(nn.Module):
 
         return velocity
 
+    def compute_energy_velocity(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute energy-guided velocity using mean-field Boltzmann approximation.
+
+        For Ising model, the local field at position (i,j) is:
+            h_{i,j} = J * sum of neighbor spins
+
+        The Boltzmann probability for spin +1 given local field h:
+            p(s=+1) = sigmoid(2 * beta * h)
+
+        The energy velocity points from current state toward Boltzmann equilibrium.
+
+        Args:
+            x: Current state on probability simplex (B, 2, H, W)
+               x[:, 0] = p(spin=-1), x[:, 1] = p(spin=+1)
+            T: Temperature values (B,)
+
+        Returns:
+            Energy-guided velocity (B, 2, H, W)
+        """
+        B, _, H, W = x.shape
+        beta = (1.0 / T).view(B, 1, 1, 1)
+
+        # Expected spin from current probabilities: <s> = 2*p(+1) - 1
+        # Range: [-1, +1]
+        expected_spin = 2 * x[:, 1:2] - 1  # (B, 1, H, W)
+
+        # Local field = sum of neighbor expected spins (Ising coupling J=1)
+        # Using convolution with periodic boundary conditions
+        kernel = torch.tensor(
+            [[0, 1, 0],
+             [1, 0, 1],
+             [0, 1, 0]],
+            dtype=x.dtype, device=x.device
+        ).view(1, 1, 3, 3)
+
+        # Circular padding for periodic boundaries
+        padded = F.pad(expected_spin, (1, 1, 1, 1), mode='circular')
+        local_field = F.conv2d(padded, kernel)  # (B, 1, H, W)
+
+        # Boltzmann probability for spin +1: p(+1) = sigmoid(2β * h)
+        # Energy for spin s at field h is E = -s*h
+        # So p(+1) ∝ exp(β*h), p(-1) ∝ exp(-β*h)
+        # p(+1) = exp(βh) / (exp(βh) + exp(-βh)) = sigmoid(2βh)
+        p_boltz_plus = torch.sigmoid(2 * beta * local_field)  # (B, 1, H, W)
+
+        # Target Boltzmann distribution
+        p_boltz = torch.cat([1 - p_boltz_plus, p_boltz_plus], dim=1)  # (B, 2, H, W)
+
+        # Velocity toward Boltzmann equilibrium
+        v_energy = p_boltz - x
+
+        return v_energy
+
+    def velocity_field_with_energy(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        T: torch.Tensor,
+        energy_weight: float = 1.0,
+        time_dependent_weight: bool = True
+    ) -> torch.Tensor:
+        """
+        Combined velocity: learned + energy-guided.
+
+        v_total = v_learned + λ(t) * v_energy
+
+        Where λ(t) increases with time (stronger guidance near the end).
+
+        Args:
+            x: Current state on probability simplex (B, 2, H, W)
+            t: Time values (B,)
+            T: Temperature values (B,)
+            energy_weight: Base weight for energy velocity
+            time_dependent_weight: If True, λ(t) = energy_weight * (t/t_max)
+
+        Returns:
+            Combined velocity (B, 2, H, W)
+        """
+        # Learned velocity component
+        v_learned = self.velocity_field(x, t, T)
+
+        # Energy-guided velocity component
+        v_energy = self.compute_energy_velocity(x, T)
+
+        # Time-dependent weighting (stronger guidance at later times)
+        if time_dependent_weight:
+            # λ(t) starts at 0 and increases to energy_weight
+            lambda_t = energy_weight * (t / self.t_max).view(-1, 1, 1, 1)
+        else:
+            lambda_t = energy_weight
+
+        # Combine velocities
+        v_total = v_learned + lambda_t * v_energy
+
+        return v_total
+
+    def sample_with_energy_guidance(
+        self,
+        batch_size: Optional[int] = None,
+        T: Optional[torch.Tensor] = None,
+        energy_weight: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Generate samples using energy-guided velocity field.
+
+        Algorithm:
+        1. Initialize x_0 ~ Uniform on probability simplex
+        2. For t from t_min to t_max:
+           v = v_learned(x, t, T) + λ(t) * v_energy(x, T)
+           x_{t+dt} = x_t + v * dt
+        3. Convert to discrete: s = argmax(x_{t_max})
+
+        Args:
+            batch_size: Number of samples to generate
+            T: Temperature tensor of shape (B,) or (B, 1)
+            energy_weight: Weight for energy-guided velocity
+
+        Returns:
+            Samples of shape (B, 1, H, W) in {-1, +1}
+        """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        H, W = self.size
+
+        # Handle temperature
+        if T is None:
+            T = torch.ones(batch_size, device=self.device) * self.temp_ref
+        else:
+            T = T.to(self.device)
+            if T.dim() == 2:
+                T = T.squeeze(-1)
+            if T.shape[0] == 1 and batch_size > 1:
+                T = T.expand(batch_size)
+
+        # Initialize uniform on probability simplex
+        x = torch.ones(batch_size, 2, H, W, device=self.device) / 2.0
+
+        # Time grid
+        dt = (self.t_max - self.t_min) / self.num_flow_steps
+
+        # Euler integration with energy guidance
+        for step in range(self.num_flow_steps):
+            t = self.t_min + step * dt
+            t_batch = torch.full((batch_size,), t, device=self.device)
+
+            # Compute combined velocity
+            with torch.no_grad():
+                v = self.velocity_field_with_energy(
+                    x, t_batch, T,
+                    energy_weight=energy_weight,
+                    time_dependent_weight=True
+                )
+
+            # Euler step
+            x = x + v * dt
+
+            # Project back to probability simplex
+            x = F.softmax(torch.log(x.clamp(min=1e-8)), dim=1)
+
+        # Convert to discrete spins
+        samples = (x[:, 1] > 0.5).float()
+        samples = samples.unsqueeze(1)
+
+        # Apply fixed first spin if configured
+        if self.fix_first is not None:
+            samples[:, 0, 0, 0] = float(self.fix_first)
+
+        # Map to {-1, +1}
+        samples = self.mapping(samples)
+
+        return samples
+
+    def improve_samples_with_energy(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor,
+        energy_fn,
+        n_steps: int = 10
+    ) -> torch.Tensor:
+        """
+        Improve samples by Metropolis-Hastings spin flips toward lower energy.
+
+        This creates "better" target samples for denoising training.
+
+        Args:
+            samples: Input samples (B, 1, H, W) in {-1, +1}
+            T: Temperature values (B,)
+            energy_fn: Energy function
+            n_steps: Number of MH steps
+
+        Returns:
+            Improved samples (B, 1, H, W) in {-1, +1}
+        """
+        B, C, H, W = samples.shape
+        improved = samples.clone()
+        beta = 1.0 / T  # (B,)
+
+        for _ in range(n_steps):
+            # Random position to potentially flip
+            i = torch.randint(0, H, (B,), device=samples.device)
+            j = torch.randint(0, W, (B,), device=samples.device)
+
+            # Skip if it's the fixed first position
+            if self.fix_first is not None:
+                mask_fixed = (i == 0) & (j == 0)
+
+            # Get current spin at selected position
+            batch_idx = torch.arange(B, device=samples.device)
+            current_spin = improved[batch_idx, 0, i, j]  # (B,)
+
+            # Compute local field (sum of neighbors with periodic BC)
+            neighbors = (
+                improved[batch_idx, 0, (i - 1) % H, j] +
+                improved[batch_idx, 0, (i + 1) % H, j] +
+                improved[batch_idx, 0, i, (j - 1) % W] +
+                improved[batch_idx, 0, i, (j + 1) % W]
+            )  # (B,)
+
+            # Energy change if we flip: ΔE = 2 * s * h
+            delta_E = 2 * current_spin * neighbors  # (B,)
+
+            # Metropolis acceptance probability
+            # Accept if ΔE < 0, otherwise accept with prob exp(-β * ΔE)
+            accept_prob = torch.where(
+                delta_E < 0,
+                torch.ones_like(delta_E),
+                torch.exp(-beta * delta_E)
+            )
+            accept = torch.rand(B, device=samples.device) < accept_prob
+
+            # Don't flip fixed position
+            if self.fix_first is not None:
+                accept = accept & ~mask_fixed
+
+            # Apply accepted flips
+            new_spin = torch.where(accept, -current_spin, current_spin)
+            improved[batch_idx, 0, i, j] = new_spin
+
+        return improved
+
     def denoise(
         self,
         x_noisy: torch.Tensor,
@@ -598,25 +842,30 @@ class DiscreteFlowMatcher(nn.Module):
         T: torch.Tensor,
         energy_fn=None,
         lambda_reinforce: float = 1.0,
-        training_mode: str = "reinforce"
+        training_mode: str = "energy_guided",
+        energy_weight: float = 1.0,
+        mh_steps: int = 10
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute training loss for self-training (no external data).
 
-        For self-training, we use pure REINFORCE since denoising loss causes
-        the model to overfit to its own samples (circular dependency).
-
         Training modes:
-        - "reinforce": Pure REINFORCE with RLOO baseline (recommended for self-training)
+        - "energy_guided": Energy-guided denoising + velocity matching (RECOMMENDED)
+          * Improves samples with Metropolis-Hastings
+          * Trains denoising to predict low-energy configurations
+          * Additionally matches velocity to energy-guided velocity
+        - "reinforce": Pure REINFORCE with RLOO baseline
         - "hybrid": Denoising + REINFORCE (requires external target data)
         - "denoise_only": Only denoising loss (requires external target data)
 
         Args:
             samples: Clean samples (B, 1, H, W) in {-1, +1}
             T: Temperature values (B,)
-            energy_fn: Energy function for REINFORCE
-            lambda_reinforce: Weight for REINFORCE loss (ignored in reinforce mode)
-            training_mode: "reinforce", "hybrid", or "denoise_only"
+            energy_fn: Energy function
+            lambda_reinforce: Weight for REINFORCE loss (ignored in some modes)
+            training_mode: "energy_guided", "reinforce", "hybrid", or "denoise_only"
+            energy_weight: Weight for energy-guided velocity matching
+            mh_steps: Number of Metropolis-Hastings steps for sample improvement
 
         Returns:
             Tuple of (loss, metrics_dict)
@@ -624,7 +873,7 @@ class DiscreteFlowMatcher(nn.Module):
         B, C, H, W = samples.shape
         metrics = {}
 
-        # Compute energy (always needed for REINFORCE modes)
+        # Compute energy (always needed)
         if energy_fn is not None:
             energy = energy_fn(samples)  # (B, 1)
             metrics["energy_mean"] = energy.mean().item()
@@ -632,19 +881,74 @@ class DiscreteFlowMatcher(nn.Module):
             energy = torch.zeros(B, 1, device=self.device)
 
         # ================================================================
+        # ENERGY-GUIDED mode (recommended for self-training)
+        # ================================================================
+        if training_mode == "energy_guided":
+            # 1. Improve samples with Metropolis-Hastings toward lower energy
+            with torch.no_grad():
+                improved_samples = self.improve_samples_with_energy(
+                    samples, T, energy_fn, n_steps=mh_steps
+                )
+                improved_energy = energy_fn(improved_samples)
+
+            metrics["improved_energy_mean"] = improved_energy.mean().item()
+            metrics["energy_improvement"] = (energy.mean() - improved_energy.mean()).item()
+
+            # 2. Denoising loss toward improved (lower-energy) samples
+            t = torch.rand(B, device=self.device) * (self.t_max - self.t_min) + self.t_min
+            x_noisy = self.apply_dirichlet_noise(improved_samples, t)
+            logits = self.denoise(x_noisy, t, T)
+            target = self.reverse_mapping(improved_samples).squeeze(1).long()
+
+            if self.fix_first is not None:
+                mask = torch.ones(B, H, W, device=self.device)
+                mask[:, 0, 0] = 0
+                ce_loss = F.cross_entropy(logits, target, reduction='none')
+                denoise_loss = (ce_loss * mask).sum() / mask.sum()
+            else:
+                denoise_loss = F.cross_entropy(logits, target)
+
+            metrics["denoise_loss"] = denoise_loss.item()
+
+            # 3. Velocity matching loss: learned velocity should match energy-guided velocity
+            # This directly trains the velocity field to point toward low-energy states
+            v_learned = self.velocity_field(x_noisy, t, T)  # (B, 2, H, W)
+            v_energy = self.compute_energy_velocity(x_noisy, T)  # (B, 2, H, W)
+
+            # Target: velocity should incorporate energy guidance
+            # v_target = v_toward_clean + λ * v_energy
+            # where v_toward_clean = one_hot(improved_sample) - x_noisy
+            improved_onehot = F.one_hot(
+                self.reverse_mapping(improved_samples).squeeze(1).long(), 2
+            ).permute(0, 3, 1, 2).float()  # (B, 2, H, W)
+            v_toward_clean = improved_onehot - x_noisy
+
+            # Combine: target velocity is toward clean with energy correction
+            lambda_t = (t / self.t_max).view(B, 1, 1, 1)  # Time-dependent weight
+            v_target = v_toward_clean + lambda_t * energy_weight * v_energy
+
+            # MSE loss on velocity
+            velocity_loss = ((v_learned - v_target.detach()) ** 2).mean()
+            metrics["velocity_loss"] = velocity_loss.item()
+
+            # Total loss: denoising + velocity matching
+            total_loss = denoise_loss + energy_weight * velocity_loss
+            metrics["total_loss"] = total_loss.item()
+
+            return total_loss, metrics
+
+        # ================================================================
         # REINFORCE mode (for self-training without external data)
         # ================================================================
         if training_mode == "reinforce":
             # Compute log probability via velocity field integral
-            # Using a more stable log_prob computation
             log_q = self._compute_log_prob_reinforce(samples, T)  # (B, 1)
 
             # Free energy: F = log q + β·E
             beta = 1.0 / T.unsqueeze(-1)  # (B, 1)
             free_energy = log_q + beta * energy  # (B, 1)
 
-            # RLOO (Leave-One-Out) baseline for variance reduction
-            # baseline_i = (sum of F_j for j != i) / (B - 1)
+            # RLOO baseline for variance reduction
             F_sum = free_energy.sum()
             baseline = (F_sum - free_energy) / (B - 1)  # (B, 1)
 
