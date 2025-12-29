@@ -771,11 +771,6 @@ class DiscreteFlowMatcher(nn.Module):
         # Network forward
         logits = self.net(x_input, t_emb).squeeze(2)  # (B, 2, H, W)
 
-        # Apply temperature scaling if enabled (consistent with velocity_field)
-        if self.logit_temp_scale:
-            temp_scale = self._compute_temp_scale(T)
-            logits = logits * temp_scale.squeeze(-1)  # Adjust shape
-
         return logits
 
     def sample(
@@ -838,9 +833,8 @@ class DiscreteFlowMatcher(nn.Module):
             x = x + v * dt
             x = F.softmax(torch.log(x.clamp(min=1e-8)), dim=1)
 
-        # Convert to discrete spins by SAMPLING from predicted distribution
-        # This preserves stochasticity at High T (where probabilities are ~0.5)
-        samples = (torch.rand_like(x[:, 1]) < x[:, 1]).float()
+        # Convert to discrete spins
+        samples = (x[:, 1] > 0.5).float()
         samples = samples.unsqueeze(1)
 
         if self.fix_first is not None:
@@ -970,9 +964,20 @@ class DiscreteFlowMatcher(nn.Module):
             # 1. Generate improved samples via MH
             with torch.no_grad():
                 # Determine initialization: Random or Model samples
-                # using model samples helps equilibration at low temp (bootstrapping)
-                # using random samples ensures diversity and prevents mode collapse
-                use_model_init = torch.rand(B, device=self.device) < self.mh_model_init_prob
+                # Dynamic strategy:
+                # - High T (> 2.5): Always use Random Init (Prob=0) to ensure diversity
+                # - Low T (<= 2.5): Use Model Init (Prob=0.9) to help equilibration (Bootstrapping)
+                
+                # Create probability mask based on Temperature
+                # shape of T is (B,) or (B, 1)
+                T_val = T.view(B)
+                init_probs = torch.where(
+                    T_val > 2.5,
+                    torch.zeros_like(T_val),
+                    torch.full_like(T_val, self.mh_model_init_prob)
+                )
+                
+                use_model_init = torch.rand(B, device=self.device) < init_probs
                 use_model_init = use_model_init.view(B, 1, 1, 1).float()
 
                 # Random samples (hot start)
