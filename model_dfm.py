@@ -833,8 +833,9 @@ class DiscreteFlowMatcher(nn.Module):
             x = x + v * dt
             x = F.softmax(torch.log(x.clamp(min=1e-8)), dim=1)
 
-        # Convert to discrete spins
-        samples = (x[:, 1] > 0.5).float()
+        # Convert to discrete spins by SAMPLING from predicted distribution
+        # This preserves stochasticity at High T (where probabilities are ~0.5)
+        samples = (torch.rand_like(x[:, 1]) < x[:, 1]).float()
         samples = samples.unsqueeze(1)
 
         if self.fix_first is not None:
