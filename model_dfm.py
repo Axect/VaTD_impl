@@ -884,21 +884,32 @@ class DiscreteFlowMatcher(nn.Module):
         # ENERGY-GUIDED mode (recommended for self-training)
         # ================================================================
         if training_mode == "energy_guided":
-            # 1. Improve samples with Metropolis-Hastings toward lower energy
+            # 1. Generate FRESH random samples via MH from random initialization
+            #    (Not from model samples, to avoid bias collapse)
             with torch.no_grad():
-                improved_samples = self.improve_samples_with_energy(
-                    samples, T, energy_fn, n_steps=mh_steps
+                # Start from random spins (not model samples)
+                random_samples = torch.randint(
+                    0, 2, (B, 1, H, W), device=self.device
+                ).float() * 2 - 1  # {-1, +1}
+
+                # Apply fixed first spin
+                if self.fix_first is not None:
+                    random_samples[:, 0, 0, 0] = float(self.fix_first)
+
+                # Run longer MH to equilibrate
+                mh_samples = self.improve_samples_with_energy(
+                    random_samples, T, energy_fn, n_steps=mh_steps * H * W // 4
                 )
-                improved_energy = energy_fn(improved_samples)
+                mh_energy = energy_fn(mh_samples)
 
-            metrics["improved_energy_mean"] = improved_energy.mean().item()
-            metrics["energy_improvement"] = (energy.mean() - improved_energy.mean()).item()
+            metrics["mh_energy_mean"] = mh_energy.mean().item()
+            metrics["model_energy_mean"] = energy.mean().item()
 
-            # 2. Denoising loss toward improved (lower-energy) samples
+            # 2. Denoising loss: train to denoise toward MH-equilibrated samples
             t = torch.rand(B, device=self.device) * (self.t_max - self.t_min) + self.t_min
-            x_noisy = self.apply_dirichlet_noise(improved_samples, t)
+            x_noisy = self.apply_dirichlet_noise(mh_samples, t)
             logits = self.denoise(x_noisy, t, T)
-            target = self.reverse_mapping(improved_samples).squeeze(1).long()
+            target = self.reverse_mapping(mh_samples).squeeze(1).long()
 
             if self.fix_first is not None:
                 mask = torch.ones(B, H, W, device=self.device)
@@ -910,29 +921,22 @@ class DiscreteFlowMatcher(nn.Module):
 
             metrics["denoise_loss"] = denoise_loss.item()
 
-            # 3. Velocity matching loss: learned velocity should match energy-guided velocity
-            # This directly trains the velocity field to point toward low-energy states
+            # 3. Velocity matching: guide velocity toward MH samples (NOT mean-field!)
+            #    This avoids the positive feedback loop of mean-field
             v_learned = self.velocity_field(x_noisy, t, T)  # (B, 2, H, W)
-            v_energy = self.compute_energy_velocity(x_noisy, T)  # (B, 2, H, W)
 
-            # Target: velocity should incorporate energy guidance
-            # v_target = v_toward_clean + λ * v_energy
-            # where v_toward_clean = one_hot(improved_sample) - x_noisy
-            improved_onehot = F.one_hot(
-                self.reverse_mapping(improved_samples).squeeze(1).long(), 2
+            # Target velocity: simply point toward the MH samples
+            mh_onehot = F.one_hot(
+                self.reverse_mapping(mh_samples).squeeze(1).long(), 2
             ).permute(0, 3, 1, 2).float()  # (B, 2, H, W)
-            v_toward_clean = improved_onehot - x_noisy
+            v_target = mh_onehot - x_noisy
 
-            # Combine: target velocity is toward clean with energy correction
-            lambda_t = (t / self.t_max).view(B, 1, 1, 1)  # Time-dependent weight
-            v_target = v_toward_clean + lambda_t * energy_weight * v_energy
-
-            # MSE loss on velocity
+            # MSE loss on velocity (with reduced weight)
             velocity_loss = ((v_learned - v_target.detach()) ** 2).mean()
             metrics["velocity_loss"] = velocity_loss.item()
 
-            # Total loss: denoising + velocity matching
-            total_loss = denoise_loss + energy_weight * velocity_loss
+            # Total loss: denoising is primary, velocity matching is auxiliary
+            total_loss = denoise_loss + energy_weight * 0.1 * velocity_loss
             metrics["total_loss"] = total_loss.item()
 
             return total_loss, metrics

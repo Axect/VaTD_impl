@@ -317,7 +317,7 @@ class FlowMatchingTrainer:
             # Accumulate stats
             for key in ["denoise_loss", "total_loss", "reinforce_loss", "log_prob_mean",
                         "free_energy_mean", "advantage_std", "velocity_loss",
-                        "improved_energy_mean", "energy_improvement"]:
+                        "mh_energy_mean", "model_energy_mean"]:
                 if key in metrics:
                     epoch_stats[key] = epoch_stats.get(key, 0.0) + metrics[key] / num_steps
             if "energy_mean" in metrics:
@@ -479,10 +479,10 @@ class FlowMatchingTrainer:
                 log_dict["train/denoise_loss"] = train_stats["denoise_loss"]
             if "velocity_loss" in train_stats:
                 log_dict["train/velocity_loss"] = train_stats["velocity_loss"]
-            if "improved_energy_mean" in train_stats:
-                log_dict["train/improved_energy_mean"] = train_stats["improved_energy_mean"]
-            if "energy_improvement" in train_stats:
-                log_dict["train/energy_improvement"] = train_stats["energy_improvement"]
+            if "mh_energy_mean" in train_stats:
+                log_dict["train/mh_energy_mean"] = train_stats["mh_energy_mean"]
+            if "model_energy_mean" in train_stats:
+                log_dict["train/model_energy_mean"] = train_stats["model_energy_mean"]
             log_dict["train/lr"] = self.optimizer.param_groups[0]["lr"]
 
             # --- val/ section ---
