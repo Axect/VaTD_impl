@@ -67,7 +67,7 @@ net_config:
   temp_scale_max: 10.0
 
 optimizer_config:
-  lr: 3.0                   # Slightly lower for larger model
+  lr: 1.e-1                   # Slightly lower for larger model
   eps: 1.e-10
 
 scheduler_config:
