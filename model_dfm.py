@@ -557,8 +557,10 @@ class DiscreteFlowMatcher(nn.Module):
             if T.shape[0] == 1 and batch_size > 1:
                 T = T.expand(batch_size)
 
-        # Initialize uniform on probability simplex
-        x = torch.ones(batch_size, 2, H, W, device=self.device) / 2.0
+        # Initialize with random samples from Dirichlet(1, 1) = Uniform on simplex
+        alpha = torch.ones(batch_size, H, W, 2, device=self.device)
+        x = torch.distributions.Dirichlet(alpha).sample()  # (B, H, W, 2)
+        x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
 
         # Time grid
         dt = (self.t_max - self.t_min) / self.num_flow_steps
@@ -732,8 +734,11 @@ class DiscreteFlowMatcher(nn.Module):
             if T.shape[0] == 1 and batch_size > 1:
                 T = T.expand(batch_size)
 
-        # Initialize uniform on probability simplex
-        x = torch.ones(batch_size, 2, H, W, device=self.device) / 2.0
+        # Initialize with random samples from Dirichlet(1, 1) = Uniform on simplex
+        # This provides stochasticity so different batch elements get different samples
+        alpha = torch.ones(batch_size, H, W, 2, device=self.device)
+        x = torch.distributions.Dirichlet(alpha).sample()  # (B, H, W, 2)
+        x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
 
         # Time grid
         dt = (self.t_max - self.t_min) / self.num_flow_steps
