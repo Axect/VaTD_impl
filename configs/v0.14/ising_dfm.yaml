@@ -4,7 +4,7 @@
 # - Replaced autoregressive PixelCNN with Discrete Flow Matching
 #   * Parallel sampling via Euler integration (50 steps vs 256 sequential)
 #   * Dirichlet probability path for noising
-#   * Cross-entropy denoising loss + REINFORCE
+#   * Pure REINFORCE training (self-training without external data)
 #
 # Advantages:
 # - ~3-5x faster sampling (parallel vs autoregressive)
@@ -12,8 +12,8 @@
 # - More flexible architecture (no masking constraints)
 #
 # Training approach:
-# - Hybrid loss: L_denoise + λ * L_reinforce
-# - ELBO-based log probability estimation
+# - Pure REINFORCE with RLOO baseline (no denoising loss for self-training)
+# - Free energy: F = log q + β·E
 # - Same curriculum learning as v0.13
 
 project: Ising_DFM_v0.14
@@ -43,8 +43,8 @@ net_config:
   time_dim: 64              # Time embedding dimension
 
   # Training Mode
-  training_mode: hybrid     # "hybrid" (denoise + REINFORCE) or "denoise_only"
-  lambda_reinforce: 0.1     # Weight for REINFORCE term
+  training_mode: reinforce  # "reinforce" (pure REINFORCE for self-training)
+  lambda_reinforce: 0.1     # Weight for REINFORCE term (ignored in reinforce mode)
   accumulation_steps: 8     # Gradient accumulation steps per epoch
 
   # 2-Phase Curriculum Learning (same as v0.13)

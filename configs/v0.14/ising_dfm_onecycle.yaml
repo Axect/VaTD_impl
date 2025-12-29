@@ -9,8 +9,8 @@
 # DFM features:
 # - Parallel sampling via Euler integration (50 steps)
 # - Dirichlet probability path for noising
-# - Hybrid loss: L_denoise + λ * L_reinforce
-# - ELBO-based log probability estimation
+# - Pure REINFORCE training (self-training without external data)
+# - Free energy minimization: F = log q + β·E
 
 project: Ising_DFM_v0.14
 device: cuda:0
@@ -39,8 +39,8 @@ net_config:
   time_dim: 64              # Time embedding dimension
 
   # Training Mode
-  training_mode: hybrid     # "hybrid" (denoise + REINFORCE) or "denoise_only"
-  lambda_reinforce: 0.1     # Weight for REINFORCE term
+  training_mode: reinforce  # "reinforce" (pure REINFORCE for self-training)
+  lambda_reinforce: 0.1     # Weight for REINFORCE term (ignored in reinforce mode)
   accumulation_steps: 8     # Gradient accumulation steps per epoch
 
   # 2-Phase Curriculum Learning

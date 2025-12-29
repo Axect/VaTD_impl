@@ -38,8 +38,8 @@ net_config:
   time_dim: 128             # Larger time embedding
 
   # Training Mode
-  training_mode: hybrid
-  lambda_reinforce: 0.1
+  training_mode: reinforce  # Pure REINFORCE for self-training
+  lambda_reinforce: 0.1     # Ignored in reinforce mode
   accumulation_steps: 16    # More gradient accumulation
 
   # 2-Phase Curriculum Learning

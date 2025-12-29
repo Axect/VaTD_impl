@@ -597,73 +597,167 @@ class DiscreteFlowMatcher(nn.Module):
         samples: torch.Tensor,
         T: torch.Tensor,
         energy_fn=None,
-        lambda_reinforce: float = 1.0
+        lambda_reinforce: float = 1.0,
+        training_mode: str = "reinforce"
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Compute training loss combining denoising and REINFORCE objectives.
+        Compute training loss for self-training (no external data).
 
-        Total loss = L_denoise + lambda * L_reinforce
+        For self-training, we use pure REINFORCE since denoising loss causes
+        the model to overfit to its own samples (circular dependency).
+
+        Training modes:
+        - "reinforce": Pure REINFORCE with RLOO baseline (recommended for self-training)
+        - "hybrid": Denoising + REINFORCE (requires external target data)
+        - "denoise_only": Only denoising loss (requires external target data)
 
         Args:
             samples: Clean samples (B, 1, H, W) in {-1, +1}
             T: Temperature values (B,)
-            energy_fn: Energy function for REINFORCE (optional)
-            lambda_reinforce: Weight for REINFORCE loss
+            energy_fn: Energy function for REINFORCE
+            lambda_reinforce: Weight for REINFORCE loss (ignored in reinforce mode)
+            training_mode: "reinforce", "hybrid", or "denoise_only"
 
         Returns:
             Tuple of (loss, metrics_dict)
         """
         B, C, H, W = samples.shape
+        metrics = {}
 
-        # 1. Denoising loss (flow matching objective)
-        # Sample time uniformly
+        # Compute energy (always needed for REINFORCE modes)
+        if energy_fn is not None:
+            energy = energy_fn(samples)  # (B, 1)
+            metrics["energy_mean"] = energy.mean().item()
+        else:
+            energy = torch.zeros(B, 1, device=self.device)
+
+        # ================================================================
+        # REINFORCE mode (for self-training without external data)
+        # ================================================================
+        if training_mode == "reinforce":
+            # Compute log probability via velocity field integral
+            # Using a more stable log_prob computation
+            log_q = self._compute_log_prob_reinforce(samples, T)  # (B, 1)
+
+            # Free energy: F = log q + β·E
+            beta = 1.0 / T.unsqueeze(-1)  # (B, 1)
+            free_energy = log_q + beta * energy  # (B, 1)
+
+            # RLOO (Leave-One-Out) baseline for variance reduction
+            # baseline_i = (sum of F_j for j != i) / (B - 1)
+            F_sum = free_energy.sum()
+            baseline = (F_sum - free_energy) / (B - 1)  # (B, 1)
+
+            # REINFORCE gradient: (F - baseline) * ∇log_q
+            advantage = (free_energy - baseline).detach()  # (B, 1)
+
+            # Loss = E[(F - baseline) * log_q]
+            reinforce_loss = (advantage * log_q).mean()
+
+            metrics["reinforce_loss"] = reinforce_loss.item()
+            metrics["log_prob_mean"] = log_q.mean().item()
+            metrics["free_energy_mean"] = free_energy.mean().item()
+            metrics["advantage_std"] = advantage.std().item()
+            metrics["total_loss"] = reinforce_loss.item()
+
+            return reinforce_loss, metrics
+
+        # ================================================================
+        # Hybrid or Denoise-only modes (require external target data)
+        # ================================================================
+        # Denoising loss
         t = torch.rand(B, device=self.device) * (self.t_max - self.t_min) + self.t_min
-
-        # Apply noising
         x_noisy = self.apply_dirichlet_noise(samples, t)
-
-        # Predict clean state
-        logits = self.denoise(x_noisy, t, T)  # (B, 2, H, W)
-
-        # Cross-entropy loss
-        target = self.reverse_mapping(samples).squeeze(1).long()  # (B, H, W)
+        logits = self.denoise(x_noisy, t, T)
+        target = self.reverse_mapping(samples).squeeze(1).long()
 
         if self.fix_first is not None:
-            # Mask out first position in loss
             mask = torch.ones(B, H, W, device=self.device)
             mask[:, 0, 0] = 0
-            ce_loss = F.cross_entropy(logits, target, reduction='none')  # (B, H, W)
+            ce_loss = F.cross_entropy(logits, target, reduction='none')
             denoise_loss = (ce_loss * mask).sum() / mask.sum()
         else:
             denoise_loss = F.cross_entropy(logits, target)
 
-        metrics = {"denoise_loss": denoise_loss.item()}
+        metrics["denoise_loss"] = denoise_loss.item()
 
-        # 2. REINFORCE loss (optional, for energy guidance)
-        if energy_fn is not None and lambda_reinforce > 0:
-            # Compute log probability (ELBO approximation)
-            log_q = self.log_prob(samples, T)  # (B, 1)
+        if training_mode == "denoise_only":
+            metrics["total_loss"] = denoise_loss.item()
+            return denoise_loss, metrics
 
-            # Compute energy
-            energy = energy_fn(samples)  # (B, 1)
+        # Hybrid mode: add REINFORCE
+        log_q = self.log_prob(samples, T)
+        beta = 1.0 / T.unsqueeze(-1)
+        reinforce_weight = (log_q + beta * energy).detach()
+        reinforce_loss = (reinforce_weight * log_q).mean()
 
-            # REINFORCE weight
-            beta = 1.0 / T.unsqueeze(-1)  # (B, 1)
-            reinforce_weight = (log_q + beta * energy).detach()
-
-            # REINFORCE loss
-            reinforce_loss = (reinforce_weight * log_q).mean()
-
-            metrics["reinforce_loss"] = reinforce_loss.item()
-            metrics["energy_mean"] = energy.mean().item()
-
-            total_loss = denoise_loss + lambda_reinforce * reinforce_loss
-        else:
-            total_loss = denoise_loss
-
+        metrics["reinforce_loss"] = reinforce_loss.item()
+        total_loss = denoise_loss + lambda_reinforce * reinforce_loss
         metrics["total_loss"] = total_loss.item()
 
         return total_loss, metrics
+
+    def _compute_log_prob_reinforce(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute log probability for REINFORCE training.
+
+        Uses multiple time points for more stable gradient estimation.
+        The key is that gradients flow through the velocity field predictions.
+
+        Args:
+            samples: Samples (B, 1, H, W) in {-1, +1}
+            T: Temperature (B,)
+
+        Returns:
+            Log probability estimates (B, 1) with gradients
+        """
+        B, C, H, W = samples.shape
+        num_sites = H * W - (1 if self.fix_first else 0)
+
+        # Use multiple time samples for better gradient estimation
+        num_time_samples = 3
+        t_values = torch.linspace(
+            self.t_min + 0.1 * (self.t_max - self.t_min),
+            self.t_max - 0.1 * (self.t_max - self.t_min),
+            num_time_samples,
+            device=self.device
+        )
+
+        log_prob_sum = torch.zeros(B, device=self.device)
+
+        for t_val in t_values:
+            t = torch.full((B,), t_val.item(), device=self.device)
+
+            # Apply noising (no gradient needed here)
+            with torch.no_grad():
+                x_noisy = self.apply_dirichlet_noise(samples, t)
+
+            # Get denoising prediction (gradients flow here)
+            logits = self.denoise(x_noisy, t, T)  # (B, 2, H, W)
+            log_softmax = F.log_softmax(logits, dim=1)
+
+            # Get target indices
+            target_idx = self.reverse_mapping(samples).long()  # (B, 1, H, W)
+
+            # Gather log probs for actual values
+            log_prob_selected = log_softmax.gather(1, target_idx)  # (B, 1, H, W)
+
+            # Mask fixed position
+            if self.fix_first is not None:
+                mask = torch.ones(1, 1, H, W, device=self.device)
+                mask[:, :, 0, 0] = 0
+                log_prob_selected = log_prob_selected * mask
+
+            log_prob_sum = log_prob_sum + log_prob_selected.sum(dim=[1, 2, 3])
+
+        # Average over time samples
+        log_prob = log_prob_sum / num_time_samples
+
+        return log_prob.unsqueeze(-1)  # (B, 1)
 
 
 if __name__ == "__main__":

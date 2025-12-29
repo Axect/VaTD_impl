@@ -285,12 +285,13 @@ class FlowMatchingTrainer:
             with torch.no_grad():
                 samples = self.model.sample(batch_size=total_size, T=T_expanded)
 
-            # Compute hybrid loss
+            # Compute loss based on training mode
             loss, metrics = self.model.training_loss(
                 samples,
                 T_expanded,
-                energy_fn=energy_fn if self.training_mode == "hybrid" else None,
+                energy_fn=energy_fn,
                 lambda_reinforce=self.lambda_reinforce,
+                training_mode=self.training_mode,
             )
 
             # Backward
