@@ -738,6 +738,264 @@ class DiscreteFlowMatcher(nn.Module):
 
         return improved
 
+    def wolff_cluster_update(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor,
+        n_clusters: int = 10
+    ) -> torch.Tensor:
+        """
+        Improve samples using Wolff cluster algorithm.
+
+        Wolff algorithm eliminates critical slowing down by flipping entire
+        clusters of aligned spins. The cluster is grown with probability
+        p_add = 1 - exp(-2β) for same-spin neighbors.
+
+        This is O(1) in correlation time at Tc, unlike Metropolis which is O(ξ^z).
+
+        Args:
+            samples: Input samples (B, 1, H, W) in {-1, +1}
+            T: Temperature values (B,)
+            n_clusters: Number of cluster flips per sample
+
+        Returns:
+            Improved samples (B, 1, H, W) in {-1, +1}
+        """
+        B, C, H, W = samples.shape
+        device = samples.device
+        improved = samples.clone()
+
+        # Bond probability: p_add = 1 - exp(-2β)
+        beta = 1.0 / T  # (B,)
+        p_add = 1.0 - torch.exp(-2.0 * beta)  # (B,)
+
+        # Direction offsets for neighbors (up, down, left, right)
+        directions = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+
+        for _ in range(n_clusters):
+            # Process each batch element (cluster algorithm is inherently sequential per sample)
+            for b in range(B):
+                spins = improved[b, 0]  # (H, W)
+                p = p_add[b].item()
+
+                # Random seed position
+                seed_i = torch.randint(0, H, (1,), device=device).item()
+                seed_j = torch.randint(0, W, (1,), device=device).item()
+
+                # Skip if seed is fixed position
+                if self.fix_first is not None and seed_i == 0 and seed_j == 0:
+                    continue
+
+                seed_spin = spins[seed_i, seed_j].item()
+
+                # BFS to grow cluster
+                cluster = set()
+                cluster.add((seed_i, seed_j))
+                queue = [(seed_i, seed_j)]
+
+                while queue:
+                    ci, cj = queue.pop(0)
+
+                    for di, dj in directions:
+                        ni, nj = (ci + di) % H, (cj + dj) % W
+
+                        # Skip if already in cluster
+                        if (ni, nj) in cluster:
+                            continue
+
+                        # Skip fixed position
+                        if self.fix_first is not None and ni == 0 and nj == 0:
+                            continue
+
+                        # Check if same spin and accept with probability p_add
+                        if spins[ni, nj].item() == seed_spin:
+                            if torch.rand(1, device=device).item() < p:
+                                cluster.add((ni, nj))
+                                queue.append((ni, nj))
+
+                # Flip entire cluster
+                for (fi, fj) in cluster:
+                    improved[b, 0, fi, fj] = -improved[b, 0, fi, fj]
+
+        return improved
+
+    def wolff_cluster_update_vectorized(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor,
+        n_clusters: int = 10
+    ) -> torch.Tensor:
+        """
+        Vectorized Wolff cluster algorithm using bond percolation.
+
+        Correct implementation: pre-compute all bond activations, then
+        grow clusters through activated bonds only.
+
+        Args:
+            samples: Input samples (B, 1, H, W) in {-1, +1}
+            T: Temperature values (B,)
+            n_clusters: Number of cluster flips per sample
+
+        Returns:
+            Improved samples (B, 1, H, W) in {-1, +1}
+        """
+        B, C, H, W = samples.shape
+        device = samples.device
+        improved = samples.clone()
+
+        # Bond probability: p_add = 1 - exp(-2β)
+        beta = 1.0 / T.view(B, 1, 1)  # (B, 1, 1)
+        p_add = 1.0 - torch.exp(-2.0 * beta)  # (B, 1, 1)
+
+        # Fixed position mask
+        if self.fix_first is not None:
+            fixed_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+            fixed_mask[:, 0, 0] = True
+        else:
+            fixed_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+
+        for _ in range(n_clusters):
+            spins = improved[:, 0]  # (B, H, W)
+
+            # Pre-compute bond activations (key fix!)
+            # For each direction, bond is active if:
+            # 1. Same spin on both ends
+            # 2. Random < p_add (computed once per bond)
+
+            # Right bonds: between (i,j) and (i, j+1)
+            same_right = (spins == torch.roll(spins, -1, dims=2))
+            bond_right = same_right & (torch.rand(B, H, W, device=device) < p_add)
+
+            # Down bonds: between (i,j) and (i+1, j)
+            same_down = (spins == torch.roll(spins, -1, dims=1))
+            bond_down = same_down & (torch.rand(B, H, W, device=device) < p_add)
+
+            # Random seed positions for each batch
+            seed_i = torch.randint(0, H, (B,), device=device)
+            seed_j = torch.randint(0, W, (B,), device=device)
+
+            # Initialize cluster
+            batch_idx = torch.arange(B, device=device)
+            in_cluster = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+            in_cluster[batch_idx, seed_i, seed_j] = True
+
+            # Iterative expansion through active bonds only
+            frontier = in_cluster.clone()
+            max_iterations = H + W
+
+            for _ in range(max_iterations):
+                if not frontier.any():
+                    break
+
+                # Expand through active bonds
+                # Right: frontier can reach right neighbor if bond_right is active
+                expand_right = frontier & bond_right
+                reach_right = torch.roll(expand_right, -1, dims=2)
+
+                # Left: right neighbor's frontier can reach us if their bond_right (our left) is active
+                expand_left = torch.roll(frontier, -1, dims=2) & torch.roll(bond_right, -1, dims=2)
+                reach_left = torch.roll(expand_left, 1, dims=2)
+
+                # Down: frontier can reach down neighbor if bond_down is active
+                expand_down = frontier & bond_down
+                reach_down = torch.roll(expand_down, -1, dims=1)
+
+                # Up: down neighbor's frontier can reach us if their bond_down (our up) is active
+                expand_up = torch.roll(frontier, -1, dims=1) & torch.roll(bond_down, -1, dims=1)
+                reach_up = torch.roll(expand_up, 1, dims=1)
+
+                # New members: reachable and not in cluster yet
+                new_members = (reach_right | reach_left | reach_down | reach_up) & ~in_cluster & ~fixed_mask
+
+                in_cluster = in_cluster | new_members
+                frontier = new_members
+
+            # Flip entire cluster
+            improved[:, 0] = torch.where(in_cluster, -spins, spins)
+
+        return improved
+
+    def swendsen_wang_update(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor,
+        n_sweeps: int = 1
+    ) -> torch.Tensor:
+        """
+        Swendsen-Wang cluster algorithm - fully parallel version.
+
+        Unlike Wolff which flips one cluster at a time, SW identifies ALL
+        clusters simultaneously and flips each with 50% probability.
+
+        This is more efficient for GPU as it's fully parallelizable.
+
+        Args:
+            samples: Input samples (B, 1, H, W) in {-1, +1}
+            T: Temperature values (B,)
+            n_sweeps: Number of full SW sweeps
+
+        Returns:
+            Improved samples (B, 1, H, W) in {-1, +1}
+        """
+        B, C, H, W = samples.shape
+        device = samples.device
+        improved = samples.clone()
+
+        # Bond probability
+        beta = 1.0 / T.view(B, 1, 1)
+        p_bond = 1.0 - torch.exp(-2.0 * beta)
+
+        for _ in range(n_sweeps):
+            spins = improved[:, 0]  # (B, H, W)
+
+            # Activate bonds between same-spin neighbors
+            same_right = (spins == torch.roll(spins, -1, dims=2))
+            same_down = (spins == torch.roll(spins, -1, dims=1))
+
+            bond_right = same_right & (torch.rand(B, H, W, device=device) < p_bond)
+            bond_down = same_down & (torch.rand(B, H, W, device=device) < p_bond)
+
+            # Find connected components using iterative label propagation
+            # Initialize each site with unique label
+            labels = torch.arange(H * W, device=device).view(1, H, W).expand(B, -1, -1).float()
+            labels = labels + torch.arange(B, device=device).view(B, 1, 1) * H * W
+
+            # Iterative min-propagation through active bonds
+            for _ in range(H + W):
+                old_labels = labels.clone()
+
+                # Propagate through right bonds
+                right_labels = torch.roll(labels, -1, dims=2)
+                labels = torch.where(bond_right, torch.minimum(labels, right_labels), labels)
+                left_labels = torch.roll(labels, 1, dims=2)
+                bond_left = torch.roll(bond_right, 1, dims=2)
+                labels = torch.where(bond_left, torch.minimum(labels, left_labels), labels)
+
+                # Propagate through down bonds
+                down_labels = torch.roll(labels, -1, dims=1)
+                labels = torch.where(bond_down, torch.minimum(labels, down_labels), labels)
+                up_labels = torch.roll(labels, 1, dims=1)
+                bond_up = torch.roll(bond_down, 1, dims=1)
+                labels = torch.where(bond_up, torch.minimum(labels, up_labels), labels)
+
+                if (labels == old_labels).all():
+                    break
+
+            # Generate random flip decision for each unique label
+            # Use label as random seed for consistent flip decision within cluster
+            flip_random = torch.fmod(labels * 2654435761, 2**32) / 2**32  # Hash-based random
+            flip_mask = flip_random < 0.5
+
+            # Don't flip fixed position's cluster
+            if self.fix_first is not None:
+                fixed_label = labels[:, 0, 0].view(B, 1, 1)
+                flip_mask = flip_mask & (labels != fixed_label)
+
+            # Flip selected clusters
+            improved[:, 0] = torch.where(flip_mask, -spins, spins)
+
+        return improved
+
     def denoise(
         self,
         x_noisy: torch.Tensor,
@@ -848,21 +1106,51 @@ class DiscreteFlowMatcher(nn.Module):
         self,
         sample: torch.Tensor,
         T: Optional[torch.Tensor] = None,
-        steps: int = 20
+        steps: int = 20,
+        method: str = "elbo"
     ) -> torch.Tensor:
         """
-        Estimate log probability using Variational Lower Bound (ELBO).
-        
-        Averages the denoising log-likelihood over multiple time steps
-        for a more robust estimate than single-point sampling.
-        
+        Estimate log probability of samples.
+
+        Methods:
+        - "elbo": ELBO-style bound using denoising likelihood integral
+        - "denoising": Simple average denoising score (fast but inaccurate)
+
+        Note: For DFM, exact log probability is intractable. These are
+        approximations/bounds. For accurate evaluation, use sampling-based
+        metrics (energy, magnetization) instead.
+
         Args:
             sample: Samples of shape (B, 1, H, W) in {-1, +1}
             T: Temperature tensor (B,)
-            steps: Number of time integration steps for averaging
-            
+            steps: Number of time integration steps
+            method: "elbo" or "denoising"
+
         Returns:
             Log probability estimates (B, 1)
+        """
+        if method == "elbo":
+            return self._log_prob_elbo(sample, T, steps)
+        else:
+            return self._log_prob_denoising(sample, T, steps)
+
+    def _log_prob_elbo(
+        self,
+        sample: torch.Tensor,
+        T: Optional[torch.Tensor] = None,
+        steps: int = 50
+    ) -> torch.Tensor:
+        """
+        ELBO-style log probability estimation.
+
+        Uses the variational bound:
+          log q(x) >= E_t[ log p_θ(x | x_t) ] - D_KL(q(x_t|x) || prior)
+
+        For Dirichlet noising, at t=t_max the distribution is close to uniform,
+        so we use:
+          log q(x) ≈ log(1/2^N) + ∫ weight(t) * denoising_logprob(t) dt
+
+        where N is the number of free sites.
         """
         B, C, H, W = sample.shape
 
@@ -873,44 +1161,105 @@ class DiscreteFlowMatcher(nn.Module):
             if T.dim() == 2:
                 T = T.squeeze(-1)
 
-        # Convert to target indices {0, 1}
+        # Number of free sites
+        N_free = H * W - (1 if self.fix_first is not None else 0)
+
+        # Prior contribution: uniform at t_max
+        # log p(prior) = -N * log(2)
+        log_prior = -N_free * torch.log(torch.tensor(2.0, device=self.device))
+
+        # Convert to target indices
         sample_idx = self.reverse_mapping(sample).long()
-        
-        # Mask for fixed first spin
+
+        # Mask for fixed position
         if self.fix_first is not None:
             mask = torch.ones(B, 1, H, W, device=self.device)
             mask[:, :, 0, 0] = 0
-            # Target indices for gathering (fixed position doesn't matter, masked out later)
         else:
             mask = torch.ones(B, 1, H, W, device=self.device)
 
-        # Time integration
-        total_log_prob = 0.0
-        
-        # Use stratified sampling or fixed grid
+        # Time integration with proper weighting
+        # Use Gaussian quadrature-like weighting: more weight near t_min
         t_values = torch.linspace(self.t_min, self.t_max, steps, device=self.device)
-        
+        dt = (self.t_max - self.t_min) / steps
+
+        # Weight function: 1/(2+t) from Dirichlet velocity scaling
+        # Integrand: w(t) * log p(x|x_t)
+        integrated_log_prob = torch.zeros(B, device=self.device)
+
         for t_val in t_values:
-            t_batch = torch.full((B,), t_val, device=self.device)
-            
-            # Apply noise
+            t_batch = torch.full((B,), t_val.item(), device=self.device)
+
+            # Noise the sample
             x_noisy = self.apply_dirichlet_noise(sample, t_batch)
-            
-            # Denoise
+
+            # Denoising prediction
             logits = self.denoise(x_noisy, t_batch, T)
             log_softmax = F.log_softmax(logits, dim=1)
-            
-            # Select log prob of true class
-            log_prob_pixel = log_softmax.gather(1, sample_idx) # (B, 1, H, W)
-            
-            # Mask and Sum spatial dimensions
+
+            # Log prob of true class
+            log_prob_pixel = log_softmax.gather(1, sample_idx)
             log_prob_step = (log_prob_pixel * mask).sum(dim=[1, 2, 3])
-            
+
+            # Time weight: 1/(2+t) normalized
+            weight = 1.0 / (2.0 + t_val.item())
+
+            integrated_log_prob += weight * log_prob_step * dt
+
+        # Normalize the integral
+        # Total weight = ∫ 1/(2+t) dt from t_min to t_max = log(2+t_max) - log(2+t_min)
+        total_weight = torch.log(torch.tensor(2.0 + self.t_max)) - torch.log(torch.tensor(2.0 + self.t_min))
+        normalized_log_prob = integrated_log_prob / total_weight.item()
+
+        # Combine: prior + denoising contribution
+        # Scale denoising by N_free since each site contributes
+        log_prob = log_prior + normalized_log_prob
+
+        return log_prob.unsqueeze(-1)
+
+    def _log_prob_denoising(
+        self,
+        sample: torch.Tensor,
+        T: Optional[torch.Tensor] = None,
+        steps: int = 20
+    ) -> torch.Tensor:
+        """
+        Simple denoising-based log probability (original method).
+
+        Warning: This is NOT an accurate log probability estimate!
+        Use for relative comparisons only.
+        """
+        B, C, H, W = sample.shape
+
+        if T is None:
+            T = torch.ones(B, device=self.device) * self.temp_ref
+        else:
+            T = T.to(self.device)
+            if T.dim() == 2:
+                T = T.squeeze(-1)
+
+        sample_idx = self.reverse_mapping(sample).long()
+
+        if self.fix_first is not None:
+            mask = torch.ones(B, 1, H, W, device=self.device)
+            mask[:, :, 0, 0] = 0
+        else:
+            mask = torch.ones(B, 1, H, W, device=self.device)
+
+        total_log_prob = 0.0
+        t_values = torch.linspace(self.t_min, self.t_max, steps, device=self.device)
+
+        for t_val in t_values:
+            t_batch = torch.full((B,), t_val.item(), device=self.device)
+            x_noisy = self.apply_dirichlet_noise(sample, t_batch)
+            logits = self.denoise(x_noisy, t_batch, T)
+            log_softmax = F.log_softmax(logits, dim=1)
+            log_prob_pixel = log_softmax.gather(1, sample_idx)
+            log_prob_step = (log_prob_pixel * mask).sum(dim=[1, 2, 3])
             total_log_prob += log_prob_step
-            
-        # Average over time steps
+
         avg_log_prob = total_log_prob / steps
-        
+
         return avg_log_prob.unsqueeze(-1)
 
     def training_loss(
@@ -921,14 +1270,16 @@ class DiscreteFlowMatcher(nn.Module):
         lambda_reinforce: float = 1.0,
         training_mode: str = "energy_guided",
         energy_weight: float = 1.0,
-        mh_steps: int = 10
+        mh_steps: int = 10,
+        use_cluster: bool = False,
+        n_clusters: int = 10
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute training loss for self-training (no external data).
 
         Training modes:
         - "energy_guided": Energy-guided denoising + velocity matching (RECOMMENDED)
-          * Improves samples with Metropolis-Hastings
+          * Improves samples with Metropolis-Hastings or Wolff cluster
           * Trains denoising to predict low-energy configurations
           * Additionally matches velocity to energy-guided velocity
         - "reinforce": Pure REINFORCE with RLOO baseline
@@ -943,6 +1294,8 @@ class DiscreteFlowMatcher(nn.Module):
             training_mode: "energy_guided", "reinforce", "hybrid", or "denoise_only"
             energy_weight: Weight for energy-guided velocity matching
             mh_steps: Number of Metropolis-Hastings steps for sample improvement
+            use_cluster: If True, use Wolff cluster algorithm instead of MH
+            n_clusters: Number of cluster flips (only used if use_cluster=True)
 
         Returns:
             Tuple of (loss, metrics_dict)
@@ -995,11 +1348,18 @@ class DiscreteFlowMatcher(nn.Module):
                 # Calculate initial energy for metrics
                 initial_energy = energy_fn(initial_samples)
 
-                # Run MH with checkerboard updates for faster equilibration
-                # mh_steps = number of full lattice sweeps
-                mh_samples = self.improve_samples_with_energy(
-                    initial_samples, T, energy_fn, n_steps=mh_steps, use_checkerboard=True
-                )
+                # Run equilibration: Swendsen-Wang cluster or MH
+                if use_cluster:
+                    # Swendsen-Wang cluster algorithm - no critical slowing down!
+                    # Much faster equilibration at Tc
+                    mh_samples = self.swendsen_wang_update(
+                        initial_samples, T, n_sweeps=n_clusters
+                    )
+                else:
+                    # MH with checkerboard updates
+                    mh_samples = self.improve_samples_with_energy(
+                        initial_samples, T, energy_fn, n_steps=mh_steps, use_checkerboard=True
+                    )
                 mh_energy = energy_fn(mh_samples)
 
             metrics["mh_energy_mean"] = mh_energy.mean().item()

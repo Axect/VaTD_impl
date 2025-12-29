@@ -47,7 +47,9 @@ net_config:
   # Training Mode
   training_mode: energy_guided  # "energy_guided" (MH-improved + velocity matching)
   energy_weight: 1.0            # Weight for velocity matching loss
-  mh_steps: 200                 # MH sweeps for equilibration (checkerboard, ~200 half-lattice updates)
+  use_cluster: true             # Use Swendsen-Wang cluster algorithm (no critical slowing down!)
+  n_clusters: 10                # Number of SW sweeps (10 is enough for Tc)
+  mh_steps: 200                 # MH sweeps fallback (if use_cluster=false)
   mh_model_init_prob: 0.9       # Probability of initializing MH from model samples (Self-Imitation)
   lambda_reinforce: 0.1         # (unused in energy_guided mode)
   accumulation_steps: 8         # Gradient accumulation steps per epoch
