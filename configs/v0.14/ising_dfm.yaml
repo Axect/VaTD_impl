@@ -52,7 +52,7 @@ net_config:
   accumulation_steps: 8         # Gradient accumulation steps per epoch
 
   # 2-Phase Curriculum Learning (same as v0.13)
-  curriculum_enabled: true
+  curriculum_enabled: false
   phase1_epochs: 75         # High temp learning
   phase1_beta_max: 0.35     # T_min = 2.86 (above Tc)
   phase2_epochs: 100        # Gradual expansion to full range
