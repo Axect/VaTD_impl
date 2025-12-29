@@ -771,6 +771,11 @@ class DiscreteFlowMatcher(nn.Module):
         # Network forward
         logits = self.net(x_input, t_emb).squeeze(2)  # (B, 2, H, W)
 
+        # Apply temperature scaling if enabled (consistent with velocity_field)
+        if self.logit_temp_scale:
+            temp_scale = self._compute_temp_scale(T)
+            logits = logits * temp_scale.squeeze(-1)  # Adjust shape
+
         return logits
 
     def sample(
