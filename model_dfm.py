@@ -378,10 +378,14 @@ class DiscreteFlowMatcher(nn.Module):
         T: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute the probability velocity field.
+        Compute the probability velocity field for Discrete Flow Matching.
 
-        The network predicts logits that define the instantaneous
-        direction of probability mass flow.
+        For Dirichlet probability path p_t(y|x) = Dir(y; 1 + t·e_x),
+        the conditional velocity is:
+            u_t(y|x) = (e_x - y) / (2 + t)
+
+        The network predicts the target distribution, and we compute
+        the properly scaled velocity.
 
         Args:
             x: Current state on probability simplex (B, 2, H, W)
@@ -411,17 +415,21 @@ class DiscreteFlowMatcher(nn.Module):
             temp_scale = self._compute_temp_scale(T)
             logits = logits * temp_scale.squeeze(-1)  # Adjust shape
 
-        # Convert logits to velocity
-        # Velocity should point toward the predicted clean state
-        # v = softmax(logits) - x
+        # Convert logits to velocity with proper time scaling
+        # For Dirichlet path: u_t(y|x) = (e_x - y) / (2 + t)
         target_prob = F.softmax(logits, dim=1)
-        velocity = target_prob - x
+
+        # Time scaling factor: 1 / (2 + t)
+        time_scale = 1.0 / (2.0 + t.view(B, 1, 1, 1))
+
+        velocity = (target_prob - x) * time_scale
 
         return velocity
 
     def compute_energy_velocity(
         self,
         x: torch.Tensor,
+        t: torch.Tensor,
         T: torch.Tensor
     ) -> torch.Tensor:
         """
@@ -433,11 +441,13 @@ class DiscreteFlowMatcher(nn.Module):
         The Boltzmann probability for spin +1 given local field h:
             p(s=+1) = sigmoid(2 * beta * h)
 
-        The energy velocity points from current state toward Boltzmann equilibrium.
+        The energy velocity points from current state toward Boltzmann equilibrium,
+        with proper time scaling for Dirichlet flow matching.
 
         Args:
             x: Current state on probability simplex (B, 2, H, W)
                x[:, 0] = p(spin=-1), x[:, 1] = p(spin=+1)
+            t: Time values (B,) for proper scaling
             T: Temperature values (B,)
 
         Returns:
@@ -472,8 +482,9 @@ class DiscreteFlowMatcher(nn.Module):
         # Target Boltzmann distribution
         p_boltz = torch.cat([1 - p_boltz_plus, p_boltz_plus], dim=1)  # (B, 2, H, W)
 
-        # Velocity toward Boltzmann equilibrium
-        v_energy = p_boltz - x
+        # Velocity toward Boltzmann equilibrium with time scaling
+        time_scale = 1.0 / (2.0 + t.view(B, 1, 1, 1))
+        v_energy = (p_boltz - x) * time_scale
 
         return v_energy
 
@@ -502,11 +513,11 @@ class DiscreteFlowMatcher(nn.Module):
         Returns:
             Combined velocity (B, 2, H, W)
         """
-        # Learned velocity component
+        # Learned velocity component (already includes 1/(2+t) scaling)
         v_learned = self.velocity_field(x, t, T)
 
-        # Energy-guided velocity component
-        v_energy = self.compute_energy_velocity(x, T)
+        # Energy-guided velocity component (also includes 1/(2+t) scaling)
+        v_energy = self.compute_energy_velocity(x, t, T)
 
         # Time-dependent weighting (stronger guidance at later times)
         if time_dependent_weight:
@@ -928,15 +939,19 @@ class DiscreteFlowMatcher(nn.Module):
 
             # 3. Velocity matching: guide velocity toward MH samples (NOT mean-field!)
             #    This avoids the positive feedback loop of mean-field
-            v_learned = self.velocity_field(x_noisy, t, T)  # (B, 2, H, W)
+            #    For Dirichlet path: u_t(y|x) = (e_x - y) / (2 + t)
+            v_learned = self.velocity_field(x_noisy, t, T)  # (B, 2, H, W) - already includes 1/(2+t)
 
-            # Target velocity: simply point toward the MH samples
+            # Target velocity with correct time scaling
             mh_onehot = F.one_hot(
                 self.reverse_mapping(mh_samples).squeeze(1).long(), 2
             ).permute(0, 3, 1, 2).float()  # (B, 2, H, W)
-            v_target = mh_onehot - x_noisy
 
-            # MSE loss on velocity (with reduced weight)
+            # Apply time scaling: 1 / (2 + t)
+            time_scale = 1.0 / (2.0 + t.view(B, 1, 1, 1))
+            v_target = (mh_onehot - x_noisy) * time_scale
+
+            # MSE loss on velocity
             velocity_loss = ((v_learned - v_target.detach()) ** 2).mean()
             metrics["velocity_loss"] = velocity_loss.item()
 

@@ -33,12 +33,14 @@ net_config:
   # Temperature sampling configuration
   batch_size: 64            # Samples per temperature (reduced for GPU memory)
   num_beta: 4               # Number of temperature samples per step
-  beta_min: 0.2             # 1/T_max (T_max = 5)
-  beta_max: 1.0             # 1/T_min (T_min = 1)
+  beta_min: 0.2             # 1/T_max (T_max = 5) - narrower than validation for extrapolation test
+  beta_max: 1.0             # 1/T_min (T_min = 1) - narrower than validation for extrapolation test
 
   # Flow Matching Parameters
-  num_flow_steps: 50        # Euler integration steps for sampling
-  t_max: 5.0                # Maximum integration time
+  # For Dirichlet path, convergence = 1 - 2/(2+t_max)
+  # t_max=50 gives ~96% convergence, t_max=100 gives ~98%
+  num_flow_steps: 100       # Euler integration steps for sampling
+  t_max: 50.0               # Maximum integration time (was 5.0, too small!)
   t_min: 0.01               # Avoid t=0 singularity
   time_dim: 64              # Time embedding dimension
 

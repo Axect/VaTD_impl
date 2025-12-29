@@ -32,8 +32,10 @@ net_config:
   beta_max: 1.0             # 1/T_min (T_min = 1)
 
   # Flow Matching Parameters
-  num_flow_steps: 80        # More steps for better samples
-  t_max: 7.0                # Extended integration time
+  # For Dirichlet path, convergence = 1 - 2/(2+t_max)
+  # t_max=100 gives ~98% convergence
+  num_flow_steps: 150       # More steps for better samples
+  t_max: 100.0              # Extended integration time for better convergence
   t_min: 0.01
   time_dim: 128             # Larger time embedding
 
