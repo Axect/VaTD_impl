@@ -70,7 +70,7 @@ net_config:
   temp_scale_max: 10.0
 
 optimizer_config:
-  lr: 5.0                   # SPlus uses larger LR (scaled internally)
+  lr: 2.e-1
   eps: 1.e-10
 
 scheduler_config:
