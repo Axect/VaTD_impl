@@ -371,8 +371,8 @@ class FlowMatchingTrainer:
             # Sample from model
             samples = self.model.sample(batch_size=total_size, T=T_expanded)
 
-            # Compute log probability (ELBO approximation)
-            log_prob = self.model.log_prob(samples, T=T_expanded)
+            # Compute log probability (denoising method for consistent error comparison)
+            log_prob = self.model.log_prob(samples, T=T_expanded, method="denoising")
 
             # Compute energy
             energy = energy_fn(samples)
