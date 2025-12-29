@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import beaupy
 from rich.console import Console
 from pathlib import Path
+from typing import Union
 
 from util import (
     select_project,
@@ -17,6 +18,50 @@ from main import create_ising_energy_fn
 from vatd_exact_partition import logZ as exact_logZ, CRITICAL_TEMPERATURE
 
 
+def detect_model_type(model) -> str:
+    """
+    Detect whether model is DiscretePixelCNN or DiscreteFlowMatcher.
+
+    Returns:
+        str: "PixelCNN" or "DFM" (Discrete Flow Matching)
+    """
+    class_name = model.__class__.__name__
+    if "FlowMatcher" in class_name or "DFM" in class_name:
+        return "DFM"
+    elif "PixelCNN" in class_name:
+        return "PixelCNN"
+    else:
+        # Fallback: check for DFM-specific attributes
+        if hasattr(model, 'velocity_field') or hasattr(model, 'denoise'):
+            return "DFM"
+        return "PixelCNN"
+
+
+def get_model_info(model) -> dict:
+    """
+    Get model information for display.
+
+    Returns:
+        dict with model type, parameters count, and architecture info
+    """
+    model_type = detect_model_type(model)
+    num_params = sum(p.numel() for p in model.parameters())
+
+    info = {
+        "type": model_type,
+        "num_params": num_params,
+        "size": model.size,
+    }
+
+    if model_type == "DFM":
+        info["num_flow_steps"] = getattr(model, "num_flow_steps", None)
+        info["t_max"] = getattr(model, "t_max", None)
+    elif model_type == "PixelCNN":
+        info["hidden_channels"] = getattr(model, "hidden_channels", None)
+
+    return info
+
+
 def test_model_ising(
     model,
     energy_fn,
@@ -26,12 +71,19 @@ def test_model_ising(
     batch_size=500,
     T_min=None,
     T_max=None,
+    verbose=True,
 ):
     """
     Evaluate trained model at multiple temperatures.
 
+    Works with both DiscretePixelCNN and DiscreteFlowMatcher models.
+
+    Note for DFM models:
+        log_prob computation uses ODE integration which can be slow.
+        Consider using smaller batch_size (e.g., 100) for faster evaluation.
+
     Args:
-        model: Trained DiscretePixelCNN model
+        model: Trained model (DiscretePixelCNN or DiscreteFlowMatcher)
         energy_fn: Ising energy function
         L: Lattice size
         device: Device to run on
@@ -39,6 +91,7 @@ def test_model_ising(
         batch_size: Samples per temperature
         T_min: Minimum temperature (default: 0.7*Tc)
         T_max: Maximum temperature (default: 1.3*Tc)
+        verbose: Print progress for slow operations
 
     Returns:
         pandas.DataFrame with columns:
@@ -53,6 +106,8 @@ def test_model_ising(
             - logz_error: model_logz - exact_logz
             - abs_error: Absolute log Z error
     """
+    model_type = detect_model_type(model)
+
     # Temperature range
     if T_min is None:
         T_min = 0.7 * CRITICAL_TEMPERATURE
@@ -63,12 +118,21 @@ def test_model_ising(
 
     results = []
 
+    # Warn about slow log_prob for DFM
+    if model_type == "DFM" and verbose:
+        print(f"  [DFM] log_prob uses ODE integration - this may take a while...")
+
     model.eval()
     with torch.no_grad():
-        for T in T_values:
-            beta = 1.0 / T
+        iterator = enumerate(T_values)
+        for idx, T in iterator:
+            if verbose and model_type == "DFM" and idx % 5 == 0:
+                print(f"    Processing temperature {idx+1}/{num_temps}...")
+
+            T_val = float(T)  # Ensure T is a float
+            beta = 1.0 / T_val
             # Create temperature tensor with same batch size as samples
-            T_tensor = torch.full((batch_size,), T, device=device)
+            T_tensor = torch.full((batch_size,), T_val, device=device)
 
             # Sample from model
             samples = model.sample(batch_size=batch_size, T=T_tensor)
@@ -93,9 +157,9 @@ def test_model_ising(
 
             results.append(
                 {
-                    "T": T,
+                    "T": T_val,
                     "beta": beta,
-                    "T/Tc": T / CRITICAL_TEMPERATURE,
+                    "T/Tc": T_val / CRITICAL_TEMPERATURE,
                     "model_loss": model_loss,
                     "exact_loss": exact_loss,
                     "loss_error": loss_error,
@@ -118,9 +182,13 @@ def compute_thermodynamic_quantities(
     batch_size=1000,
     T_min=None,
     T_max=None,
+    skip_model_ad=None,
+    verbose=True,
 ):
     """
     Compute thermodynamic quantities using sampling and automatic differentiation.
+
+    Works with both DiscretePixelCNN and DiscreteFlowMatcher models.
 
     Two methods are used:
     1. Sampling (Monte Carlo): Uses samples from the model
@@ -132,9 +200,10 @@ def compute_thermodynamic_quantities(
     2. Automatic Differentiation:
        - From exact log Z: d(log Z)/d(beta) and d^2(log Z)/d(beta)^2
        - From model log_prob: differentiating through log_prob(sample, T) w.r.t. beta
+         NOTE: For DFM models, this is skipped by default as ODE integration is slow
 
     Args:
-        model: Trained DiscretePixelCNN model
+        model: Trained model (DiscretePixelCNN or DiscreteFlowMatcher)
         energy_fn: Ising energy function
         L: Lattice size
         device: Device to run on
@@ -142,14 +211,25 @@ def compute_thermodynamic_quantities(
         batch_size: Samples per temperature (larger for better statistics)
         T_min: Minimum temperature (default: 0.7*Tc)
         T_max: Maximum temperature (default: 1.3*Tc)
+        skip_model_ad: Skip model AD computation (default: True for DFM, False for PixelCNN)
+        verbose: Print progress information
 
     Returns:
         pandas.DataFrame with columns:
             - T, beta, T/Tc: Temperature parameters
             - E_sampling, Cv_sampling, M_sampling, chi_sampling: Sampling-based
             - E_exact_AD, Cv_exact_AD: Exact log Z via AD
-            - E_model_AD, Cv_model_AD: Model log_prob via AD
+            - E_model_AD, Cv_model_AD: Model log_prob via AD (NaN if skipped)
     """
+    model_type = detect_model_type(model)
+
+    # Auto-detect whether to skip model AD
+    if skip_model_ad is None:
+        skip_model_ad = (model_type == "DFM")  # Skip for DFM by default
+
+    if skip_model_ad and verbose:
+        print(f"  [Note] Skipping model AD computation for {model_type} (use skip_model_ad=False to enable)")
+
     # Temperature range
     if T_min is None:
         T_min = 0.7 * CRITICAL_TEMPERATURE
@@ -163,7 +243,10 @@ def compute_thermodynamic_quantities(
 
     model.eval()
 
-    for T in T_values:
+    for idx, T in enumerate(T_values):
+        T = float(T)
+        if verbose and idx % 5 == 0:
+            print(f"    Processing temperature {idx+1}/{num_temps}...")
         beta = 1.0 / T
         T_tensor = torch.full((batch_size,), T, device=device)
 
@@ -213,30 +296,37 @@ def compute_thermodynamic_quantities(
         # Use fixed samples (detached) but differentiate log_prob w.r.t. beta
         # loss(beta) = <log q(x|T) + beta * E(x)> approx -log Z
         # d(loss)/d(beta) includes both explicit beta term and implicit T=1/beta
+        #
+        # NOTE: For DFM models, log_prob uses ODE integration which is slow
+        #       and may have numerical issues with AD. Skipped by default.
 
-        with torch.no_grad():
-            samples_for_ad = model.sample(batch_size=batch_size, T=T_tensor)
-            energies_for_ad = energy_fn(samples_for_ad).squeeze()
+        if skip_model_ad:
+            E_model_AD = float('nan')
+            Cv_model_AD = float('nan')
+        else:
+            with torch.no_grad():
+                samples_for_ad = model.sample(batch_size=batch_size, T=T_tensor)
+                energies_for_ad = energy_fn(samples_for_ad).squeeze()
 
-        # Compute log_prob with gradient tracking on beta
-        beta_model = torch.tensor(
-            beta, dtype=torch.float32, device=device, requires_grad=True
-        )
-        T_model = 1.0 / beta_model
-        T_expanded = T_model.expand(batch_size)
+            # Compute log_prob with gradient tracking on beta
+            beta_model = torch.tensor(
+                beta, dtype=torch.float32, device=device, requires_grad=True
+            )
+            T_model = 1.0 / beta_model
+            T_expanded = T_model.expand(batch_size)
 
-        # samples_for_ad is fixed, but T_expanded carries gradient
-        log_prob_ad = model.log_prob(samples_for_ad, T=T_expanded)
-        loss_model = (log_prob_ad + beta_model * energies_for_ad.unsqueeze(-1)).mean()
+            # samples_for_ad is fixed, but T_expanded carries gradient
+            log_prob_ad = model.log_prob(samples_for_ad, T=T_expanded)
+            loss_model = (log_prob_ad + beta_model * energies_for_ad.unsqueeze(-1)).mean()
 
-        grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
-        E_model_AD = grad_loss.item()
+            grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
+            E_model_AD = grad_loss.item()
 
-        # Second derivative for heat capacity
-        # Note: loss ≈ -log Z, so d²(log Z)/dβ² ≈ -d²(loss)/dβ²
-        # Therefore Cv = β² × d²(log Z)/dβ² = -β² × d²(loss)/dβ²
-        grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
-        Cv_model_AD = -(beta**2) * grad2_loss.item()
+            # Second derivative for heat capacity
+            # Note: loss ≈ -log Z, so d²(log Z)/dβ² ≈ -d²(loss)/dβ²
+            # Therefore Cv = β² × d²(log Z)/dβ² = -β² × d²(loss)/dβ²
+            grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
+            Cv_model_AD = -(beta**2) * grad2_loss.item()
 
         # Collect results
         results.append(
@@ -716,6 +806,17 @@ def main():
     model = model.to(device)
     model.eval()
 
+    # Get model info and display
+    model_info = get_model_info(model)
+    model_type = model_info["type"]
+    console.print(f"[bold cyan]Model type:[/bold cyan] {model_type}")
+    console.print(f"Parameters: {model_info['num_params']:,}")
+
+    if model_type == "DFM":
+        console.print(f"  Flow steps: {model_info.get('num_flow_steps', 'N/A')}")
+        console.print(f"  t_max: {model_info.get('t_max', 'N/A')}")
+        console.print("[yellow]Note: DFM log_prob uses ODE integration (slower than PixelCNN)[/yellow]")
+
     # Get lattice size from model
     L = model.size[0]
     console.print(f"Lattice size: {L}×{L}")
@@ -723,6 +824,16 @@ def main():
     # Create energy function
     energy_fn = create_ising_energy_fn(L=L, d=2, device=device)
     console.print(f"Critical temperature: {CRITICAL_TEMPERATURE:.4f}")
+
+    # Adjust batch sizes based on model type
+    # DFM log_prob is slower, so use smaller batch sizes
+    if model_type == "DFM":
+        test_batch_size = 100  # Smaller for faster log_prob
+        thermo_batch_size = 500
+        console.print(f"[dim]Using reduced batch sizes for DFM (test: {test_batch_size}, thermo: {thermo_batch_size})[/dim]")
+    else:
+        test_batch_size = 500
+        thermo_batch_size = 1000
 
     # Get validation temperature range
     # Validation uses fixed range (0.1-2.0) for extrapolation testing
@@ -753,7 +864,7 @@ def main():
         "\n[bold cyan]Test 1: Critical Temperature Range (0.7*Tc to 1.3*Tc)[/bold cyan]"
     )
     df_critical = test_model_ising(
-        model, energy_fn, L, device=device, num_temps=20, batch_size=500
+        model, energy_fn, L, device=device, num_temps=20, batch_size=test_batch_size
     )
 
     # Display results for critical range
@@ -815,7 +926,7 @@ def main():
         L,
         device=device,
         num_temps=20,
-        batch_size=500,
+        batch_size=test_batch_size,
         T_min=T_val_min,
         T_max=T_val_max,
     )
@@ -962,7 +1073,7 @@ def main():
         L,
         device=device,
         num_temps=20,
-        batch_size=1000,
+        batch_size=thermo_batch_size,
         T_min=0.7 * CRITICAL_TEMPERATURE,
         T_max=1.3 * CRITICAL_TEMPERATURE,
     )
@@ -1040,7 +1151,7 @@ def main():
         L,
         device=device,
         num_temps=30,
-        batch_size=1000,
+        batch_size=thermo_batch_size,
         T_min=T_val_min,
         T_max=T_val_max,
     )
