@@ -264,6 +264,7 @@ class DiscreteFlowMatcher(nn.Module):
         self.num_flow_steps = hparams.get("num_flow_steps", 80)
         self.t_max = hparams.get("t_max", 9.0)  # Maximum integration time
         self.t_min = hparams.get("t_min", 0.01)  # Avoid t=0 singularity
+        self.mh_model_init_prob = hparams.get("mh_model_init_prob", 0.0)
 
         # Curriculum learning (same as PixelCNN)
         self.curriculum_enabled = hparams.get("curriculum_enabled", False)
@@ -1047,26 +1048,38 @@ class DiscreteFlowMatcher(nn.Module):
         # ENERGY-GUIDED mode (recommended for self-training)
         # ================================================================
         if training_mode == "energy_guided":
-            # 1. Generate FRESH random samples via MH from random initialization
-            #    (Not from model samples, to avoid bias collapse)
+            # 1. Generate improved samples via MH
             with torch.no_grad():
-                # Start from random spins (not model samples)
+                # Determine initialization: Random or Model samples
+                # using model samples helps equilibration at low temp (bootstrapping)
+                # using random samples ensures diversity and prevents mode collapse
+                use_model_init = torch.rand(B, device=self.device) < self.mh_model_init_prob
+                use_model_init = use_model_init.view(B, 1, 1, 1).float()
+
+                # Random samples (hot start)
                 random_samples = torch.randint(
                     0, 2, (B, 1, H, W), device=self.device
-                ).float() * 2 - 1  # {-1, +1}
+                ).float() * 2 - 1
 
-                # Apply fixed first spin
+                # Apply fixed first spin to random samples
                 if self.fix_first is not None:
                     random_samples[:, 0, 0, 0] = float(self.fix_first)
+
+                # Mix initialization
+                initial_samples = use_model_init * samples + (1 - use_model_init) * random_samples
+
+                # Calculate initial energy for metrics
+                initial_energy = energy_fn(initial_samples)
 
                 # Run MH with checkerboard updates for faster equilibration
                 # mh_steps = number of full lattice sweeps
                 mh_samples = self.improve_samples_with_energy(
-                    random_samples, T, energy_fn, n_steps=mh_steps, use_checkerboard=True
+                    initial_samples, T, energy_fn, n_steps=mh_steps, use_checkerboard=True
                 )
                 mh_energy = energy_fn(mh_samples)
 
             metrics["mh_energy_mean"] = mh_energy.mean().item()
+            metrics["mh_energy_delta"] = (mh_energy - initial_energy).mean().item()
             metrics["model_energy_mean"] = energy.mean().item()
 
             # 2. Denoising loss: train to denoise toward MH-equilibrated samples
