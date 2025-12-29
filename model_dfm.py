@@ -821,7 +821,7 @@ class DiscreteFlowMatcher(nn.Module):
         steps = torch.linspace(0, 1, self.num_flow_steps + 1, device=self.device)
         # Cosine schedule
         t_schedule = self.t_min + (self.t_max - self.t_min) * (1 - torch.cos(steps * math.pi / 2))
-        t_schedule = t_schedule.flip(0)  # Reverse: from t_max to t_min
+        # t_schedule goes from t_min to t_max (Noise to Data) - Do NOT flip!
 
         # DDPM-style denoising
         with torch.no_grad():

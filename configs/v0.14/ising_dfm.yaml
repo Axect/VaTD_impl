@@ -47,13 +47,13 @@ net_config:
   # Training Mode
   training_mode: energy_guided  # "energy_guided" (MH-improved + velocity matching)
   energy_weight: 1.0            # Weight for velocity matching loss
-  mh_steps: 100                 # MH sweeps for equilibration (checkerboard, ~200 half-lattice updates)
+  mh_steps: 200                 # MH sweeps for equilibration (checkerboard, ~200 half-lattice updates)
   mh_model_init_prob: 0.9       # Probability of initializing MH from model samples (Self-Imitation)
   lambda_reinforce: 0.1         # (unused in energy_guided mode)
   accumulation_steps: 8         # Gradient accumulation steps per epoch
 
   # 2-Phase Curriculum Learning (same as v0.13)
-  curriculum_enabled: false
+  curriculum_enabled: true
   phase1_epochs: 75         # High temp learning
   phase1_beta_max: 0.35     # T_min = 2.86 (above Tc)
   phase2_epochs: 100        # Gradual expansion to full range
