@@ -169,8 +169,10 @@ class FlowMatchingTrainer:
         training_mode="energy_guided",  # "energy_guided", "reinforce", "hybrid", or "denoise_only"
         energy_weight=1.0,  # Weight for energy-guided velocity matching
         mh_steps=10,  # Metropolis-Hastings steps for sample improvement
-        use_cluster=False,  # Use Swendsen-Wang cluster algorithm
-        n_clusters=10,  # Number of cluster sweeps
+        use_cluster=False,  # Use hybrid SW+MH (True) or pure MH (False)
+        n_clusters=10,  # (deprecated) Use n_sw_sweeps instead
+        n_sw_sweeps=5,  # Swendsen-Wang sweeps for decorrelation
+        n_mh_after_sw=20,  # MH steps after SW for energy convergence
     ):
         self.model = model
         self.optimizer = optimizer
@@ -187,6 +189,8 @@ class FlowMatchingTrainer:
         self.mh_steps = mh_steps
         self.use_cluster = use_cluster
         self.n_clusters = n_clusters
+        self.n_sw_sweeps = n_sw_sweeps
+        self.n_mh_after_sw = n_mh_after_sw
 
         # Curriculum learning
         self.curriculum_enabled = getattr(model, "curriculum_enabled", False)
@@ -304,6 +308,8 @@ class FlowMatchingTrainer:
                 mh_steps=self.mh_steps,
                 use_cluster=self.use_cluster,
                 n_clusters=self.n_clusters,
+                n_sw_sweeps=self.n_sw_sweeps,
+                n_mh_after_sw=self.n_mh_after_sw,
             )
 
             # Backward
@@ -669,6 +675,8 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 mh_steps=net_config.get("mh_steps", 10),
                 use_cluster=net_config.get("use_cluster", False),
                 n_clusters=net_config.get("n_clusters", 10),
+                n_sw_sweeps=net_config.get("n_sw_sweeps", 5),
+                n_mh_after_sw=net_config.get("n_mh_after_sw", 20),
             )
 
             # Train and get final val_loss
