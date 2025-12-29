@@ -47,7 +47,7 @@ net_config:
   # Training Mode
   training_mode: energy_guided  # "energy_guided" (MH-improved + velocity matching)
   energy_weight: 1.0            # Weight for velocity matching loss
-  mh_steps: 10                  # Metropolis-Hastings steps for sample improvement
+  mh_steps: 100                 # MH sweeps for equilibration (checkerboard, ~200 half-lattice updates)
   lambda_reinforce: 0.1         # (unused in energy_guided mode)
   accumulation_steps: 8         # Gradient accumulation steps per epoch
 

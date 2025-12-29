@@ -538,19 +538,15 @@ class DiscreteFlowMatcher(nn.Module):
         energy_weight: float = 1.0
     ) -> torch.Tensor:
         """
-        Generate samples using energy-guided velocity field.
+        Generate samples using DDPM-style denoising with energy guidance.
 
-        Algorithm:
-        1. Initialize x_0 ~ Uniform on probability simplex
-        2. For t from t_min to t_max:
-           v = v_learned(x, t, T) + λ(t) * v_energy(x, T)
-           x_{t+dt} = x_t + v * dt
-        3. Convert to discrete: s = argmax(x_{t_max})
+        Combines learned denoising with mean-field Boltzmann guidance
+        for better convergence to the target distribution.
 
         Args:
             batch_size: Number of samples to generate
             T: Temperature tensor of shape (B,) or (B, 1)
-            energy_weight: Weight for energy-guided velocity
+            energy_weight: Weight for energy-guided correction
 
         Returns:
             Samples of shape (B, 1, H, W) in {-1, +1}
@@ -568,42 +564,69 @@ class DiscreteFlowMatcher(nn.Module):
             if T.shape[0] == 1 and batch_size > 1:
                 T = T.expand(batch_size)
 
-        # Initialize with random samples from Dirichlet(1, 1) = Uniform on simplex
-        alpha = torch.ones(batch_size, H, W, 2, device=self.device)
-        x = torch.distributions.Dirichlet(alpha).sample()  # (B, H, W, 2)
+        beta = 1.0 / T  # (B,)
+
+        # Initialize with random Dirichlet samples
+        alpha_init = torch.ones(batch_size, H, W, 2, device=self.device)
+        x = torch.distributions.Dirichlet(alpha_init).sample()
         x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
 
-        # Time grid
-        dt = (self.t_max - self.t_min) / self.num_flow_steps
+        # Time schedule: from t_max down to t_min (cosine)
+        steps = torch.linspace(0, 1, self.num_flow_steps + 1, device=self.device)
+        t_schedule = self.t_min + (self.t_max - self.t_min) * (1 - torch.cos(steps * math.pi / 2))
+        t_schedule = t_schedule.flip(0)
 
-        # Euler integration with energy guidance
-        for step in range(self.num_flow_steps):
-            t = self.t_min + step * dt
-            t_batch = torch.full((batch_size,), t, device=self.device)
+        # Neighbor kernel for local field computation
+        kernel = torch.tensor(
+            [[0, 1, 0], [1, 0, 1], [0, 1, 0]],
+            dtype=x.dtype, device=self.device
+        ).view(1, 1, 3, 3)
 
-            # Compute combined velocity
-            with torch.no_grad():
-                v = self.velocity_field_with_energy(
-                    x, t_batch, T,
-                    energy_weight=energy_weight,
-                    time_dependent_weight=True
-                )
+        # DDPM-style denoising with energy guidance
+        with torch.no_grad():
+            for i in range(self.num_flow_steps):
+                t_current = t_schedule[i]
+                t_next = t_schedule[i + 1]
+                t_batch = torch.full((batch_size,), t_current.item(), device=self.device)
 
-            # Euler step
-            x = x + v * dt
+                # 1. Predict clean state from learned denoiser
+                logits = self.denoise(x, t_batch, T)
+                x_clean_pred = F.softmax(logits, dim=1)
 
-            # Project back to probability simplex
-            x = F.softmax(torch.log(x.clamp(min=1e-8)), dim=1)
+                # 2. Apply energy-based correction (mean-field Boltzmann)
+                # Compute local field from current expected spins
+                expected_spin = 2 * x[:, 1:2] - 1
+                padded = F.pad(expected_spin, (1, 1, 1, 1), mode='circular')
+                local_field = F.conv2d(padded, kernel)
 
-        # Convert to discrete spins
-        samples = (x[:, 1] > 0.5).float()
+                # Boltzmann probability
+                p_boltz_plus = torch.sigmoid(2 * beta.view(-1, 1, 1, 1) * local_field)
+                p_boltz = torch.cat([1 - p_boltz_plus, p_boltz_plus], dim=1)
+
+                # Blend learned prediction with energy guidance
+                # More energy guidance at later steps (lower noise)
+                progress = i / self.num_flow_steps
+                blend_weight = energy_weight * progress
+                x_guided = (1 - blend_weight) * x_clean_pred + blend_weight * p_boltz
+
+                if t_next > self.t_min:
+                    # Re-noise using Dirichlet with soft predictions
+                    t_val = t_next.item()
+                    effective_t = min(t_val, 20.0)
+                    alpha = 1.0 + effective_t * x_guided
+                    alpha = alpha.permute(0, 2, 3, 1)
+                    x = torch.distributions.Dirichlet(alpha).sample()
+                    x = x.permute(0, 3, 1, 2)
+                else:
+                    x = x_guided
+
+        # Convert to discrete spins by SAMPLING from predicted distribution
+        samples = (torch.rand_like(x[:, 1]) < x[:, 1]).float()
         samples = samples.unsqueeze(1)
 
-        # Apply fixed first spin if configured
         if self.fix_first is not None:
             samples[:, 0, 0, 0] = float(self.fix_first)
 
-        # Map to {-1, +1}
         samples = self.mapping(samples)
 
         return samples
@@ -613,66 +636,104 @@ class DiscreteFlowMatcher(nn.Module):
         samples: torch.Tensor,
         T: torch.Tensor,
         energy_fn,
-        n_steps: int = 10
+        n_steps: int = 10,
+        use_checkerboard: bool = True
     ) -> torch.Tensor:
         """
-        Improve samples by Metropolis-Hastings spin flips toward lower energy.
+        Improve samples by Metropolis-Hastings spin flips toward Boltzmann distribution.
 
-        This creates "better" target samples for denoising training.
+        Uses checkerboard updates for faster mixing: update all even/odd sites
+        in parallel since they don't share neighbors.
 
         Args:
             samples: Input samples (B, 1, H, W) in {-1, +1}
             T: Temperature values (B,)
-            energy_fn: Energy function
-            n_steps: Number of MH steps
+            energy_fn: Energy function (unused, we compute locally)
+            n_steps: Number of MH sweeps (each sweep updates all sites)
+            use_checkerboard: If True, use parallel checkerboard updates
 
         Returns:
             Improved samples (B, 1, H, W) in {-1, +1}
         """
         B, C, H, W = samples.shape
         improved = samples.clone()
-        beta = 1.0 / T  # (B,)
+        beta = 1.0 / T.view(B, 1, 1)  # (B, 1, 1)
 
-        for _ in range(n_steps):
-            # Random position to potentially flip
-            i = torch.randint(0, H, (B,), device=samples.device)
-            j = torch.randint(0, W, (B,), device=samples.device)
+        if use_checkerboard:
+            # Create checkerboard masks
+            row_idx = torch.arange(H, device=samples.device).view(1, H, 1)
+            col_idx = torch.arange(W, device=samples.device).view(1, 1, W)
+            even_mask = ((row_idx + col_idx) % 2 == 0).expand(B, H, W)
+            odd_mask = ~even_mask
 
-            # Skip if it's the fixed first position
+            # Fixed first position mask
             if self.fix_first is not None:
-                mask_fixed = (i == 0) & (j == 0)
+                fixed_mask = torch.zeros(B, H, W, dtype=torch.bool, device=samples.device)
+                fixed_mask[:, 0, 0] = True
+            else:
+                fixed_mask = torch.zeros(B, H, W, dtype=torch.bool, device=samples.device)
 
-            # Get current spin at selected position
-            batch_idx = torch.arange(B, device=samples.device)
-            current_spin = improved[batch_idx, 0, i, j]  # (B,)
+            for _ in range(n_steps):
+                for mask in [even_mask, odd_mask]:
+                    # Compute local field for all sites
+                    spins = improved[:, 0]  # (B, H, W)
+                    neighbors = (
+                        torch.roll(spins, 1, dims=1) +
+                        torch.roll(spins, -1, dims=1) +
+                        torch.roll(spins, 1, dims=2) +
+                        torch.roll(spins, -1, dims=2)
+                    )  # (B, H, W)
 
-            # Compute local field (sum of neighbors with periodic BC)
-            neighbors = (
-                improved[batch_idx, 0, (i - 1) % H, j] +
-                improved[batch_idx, 0, (i + 1) % H, j] +
-                improved[batch_idx, 0, i, (j - 1) % W] +
-                improved[batch_idx, 0, i, (j + 1) % W]
-            )  # (B,)
+                    # Energy change if we flip: ΔE = 2 * s * h
+                    delta_E = 2 * spins * neighbors  # (B, H, W)
 
-            # Energy change if we flip: ΔE = 2 * s * h
-            delta_E = 2 * current_spin * neighbors  # (B,)
+                    # Metropolis acceptance probability
+                    accept_prob = torch.where(
+                        delta_E < 0,
+                        torch.ones_like(delta_E),
+                        torch.exp(-beta * delta_E)
+                    )
 
-            # Metropolis acceptance probability
-            # Accept if ΔE < 0, otherwise accept with prob exp(-β * ΔE)
-            accept_prob = torch.where(
-                delta_E < 0,
-                torch.ones_like(delta_E),
-                torch.exp(-beta * delta_E)
-            )
-            accept = torch.rand(B, device=samples.device) < accept_prob
+                    # Random acceptance
+                    accept = torch.rand_like(accept_prob) < accept_prob
 
-            # Don't flip fixed position
-            if self.fix_first is not None:
+                    # Apply mask and fixed position constraint
+                    accept = accept & mask & ~fixed_mask
+
+                    # Flip accepted spins
+                    improved[:, 0] = torch.where(accept, -spins, spins)
+        else:
+            # Original single-site update
+            for _ in range(n_steps * H * W):
+                i = torch.randint(0, H, (B,), device=samples.device)
+                j = torch.randint(0, W, (B,), device=samples.device)
+
+                if self.fix_first is not None:
+                    mask_fixed = (i == 0) & (j == 0)
+                else:
+                    mask_fixed = torch.zeros(B, dtype=torch.bool, device=samples.device)
+
+                batch_idx = torch.arange(B, device=samples.device)
+                current_spin = improved[batch_idx, 0, i, j]
+
+                neighbors = (
+                    improved[batch_idx, 0, (i - 1) % H, j] +
+                    improved[batch_idx, 0, (i + 1) % H, j] +
+                    improved[batch_idx, 0, i, (j - 1) % W] +
+                    improved[batch_idx, 0, i, (j + 1) % W]
+                )
+
+                delta_E = 2 * current_spin * neighbors
+                accept_prob = torch.where(
+                    delta_E < 0,
+                    torch.ones_like(delta_E),
+                    torch.exp(-beta * delta_E)
+                )
+                accept = torch.rand(B, device=samples.device) < accept_prob
                 accept = accept & ~mask_fixed
 
-            # Apply accepted flips
-            new_spin = torch.where(accept, -current_spin, current_spin)
-            improved[batch_idx, 0, i, j] = new_spin
+                new_spin = torch.where(accept, -current_spin, current_spin)
+                improved[batch_idx, 0, i, j] = new_spin
 
         return improved
 
@@ -717,13 +778,108 @@ class DiscreteFlowMatcher(nn.Module):
         T: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Generate samples via Euler integration on the probability simplex.
+        Generate samples via DDPM-style iterative denoising.
+
+        This avoids the diminishing velocity problem of ODE integration
+        by using a discrete-time denoising process:
 
         Algorithm:
-        1. Initialize x_0 ~ Uniform on probability simplex
-        2. For t from t_min to t_max:
-           x_{t+dt} = x_t + velocity(x_t, t, T) * dt
-        3. Convert to discrete: s = argmax(x_{t_max})
+        1. Start at high noise level (t_max)
+        2. For each step, denoise and re-noise at lower level
+        3. Final step: take argmax of predicted clean distribution
+
+        Args:
+            batch_size: Number of samples to generate
+            T: Temperature tensor of shape (B,) or (B, 1)
+
+        Returns:
+            Samples of shape (B, 1, H, W) in {-1, +1}
+        """
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        H, W = self.size
+
+        # Handle temperature
+        if T is None:
+            T = torch.ones(batch_size, device=self.device) * self.temp_ref
+        else:
+            T = T.to(self.device)
+            if T.dim() == 2:
+                T = T.squeeze(-1)
+            if T.shape[0] == 1 and batch_size > 1:
+                T = T.expand(batch_size)
+
+        # Initialize with random Dirichlet samples (high noise level t_max)
+        # At t_max, the Dirichlet concentration is (1 + t_max, 1) or (1, 1 + t_max)
+        # We sample from Dir(1, 1) which is uniform on simplex
+        alpha_init = torch.ones(batch_size, H, W, 2, device=self.device)
+        x = torch.distributions.Dirichlet(alpha_init).sample()  # (B, H, W, 2)
+        x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
+
+        # Time schedule: from t_max down to t_min
+        # Use cosine schedule for smoother denoising
+        steps = torch.linspace(0, 1, self.num_flow_steps + 1, device=self.device)
+        # Cosine schedule
+        t_schedule = self.t_min + (self.t_max - self.t_min) * (1 - torch.cos(steps * math.pi / 2))
+        t_schedule = t_schedule.flip(0)  # Reverse: from t_max to t_min
+
+        # DDPM-style denoising
+        with torch.no_grad():
+            for i in range(self.num_flow_steps):
+                t_current = t_schedule[i]
+                t_next = t_schedule[i + 1]
+
+                t_batch = torch.full((batch_size,), t_current.item(), device=self.device)
+
+                # Predict clean state distribution
+                logits = self.denoise(x, t_batch, T)  # (B, 2, H, W)
+                x_clean_pred = F.softmax(logits, dim=1)
+
+                if t_next > self.t_min:
+                    # Re-noise using Dirichlet distribution for proper stochasticity
+                    # Use SOFT predictions to allow uncertainty to propagate
+                    t_val = t_next.item()
+
+                    # Use soft predictions - uncertain predictions give more uniform Dirichlet
+                    # Normalize to ensure proper Dirichlet parameters
+                    # Scale t to get reasonable concentration (cap at ~20 for numerical stability)
+                    effective_t = min(t_val, 20.0)
+
+                    # alpha = 1 + t * p, where p is the soft probability
+                    alpha = 1.0 + effective_t * x_clean_pred  # (B, 2, H, W)
+                    alpha = alpha.permute(0, 2, 3, 1)  # (B, H, W, 2)
+
+                    # Sample from Dirichlet
+                    x = torch.distributions.Dirichlet(alpha).sample()
+                    x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
+                else:
+                    # Final step: use predicted clean distribution
+                    x = x_clean_pred
+
+        # Convert to discrete spins by SAMPLING from predicted distribution
+        # This preserves stochasticity and respects uncertainty
+        # x[:, 1] is probability of spin +1
+        samples = (torch.rand_like(x[:, 1]) < x[:, 1]).float()
+        samples = samples.unsqueeze(1)
+
+        # Apply fixed first spin if configured
+        if self.fix_first is not None:
+            samples[:, 0, 0, 0] = float(self.fix_first)
+
+        # Map to {-1, +1}
+        samples = self.mapping(samples)
+
+        return samples
+
+    def sample_ode(
+        self,
+        batch_size: Optional[int] = None,
+        T: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Generate samples via Euler ODE integration (original method).
+
+        Note: This method may have convergence issues due to diminishing
+        velocity at large t. Use sample() for better results.
 
         Args:
             batch_size: Number of samples to generate
@@ -746,10 +902,9 @@ class DiscreteFlowMatcher(nn.Module):
                 T = T.expand(batch_size)
 
         # Initialize with random samples from Dirichlet(1, 1) = Uniform on simplex
-        # This provides stochasticity so different batch elements get different samples
         alpha = torch.ones(batch_size, H, W, 2, device=self.device)
-        x = torch.distributions.Dirichlet(alpha).sample()  # (B, H, W, 2)
-        x = x.permute(0, 3, 1, 2)  # (B, 2, H, W)
+        x = torch.distributions.Dirichlet(alpha).sample()
+        x = x.permute(0, 3, 1, 2)
 
         # Time grid
         dt = (self.t_max - self.t_min) / self.num_flow_steps
@@ -759,27 +914,19 @@ class DiscreteFlowMatcher(nn.Module):
             t = self.t_min + step * dt
             t_batch = torch.full((batch_size,), t, device=self.device)
 
-            # Compute velocity
             with torch.no_grad():
                 v = self.velocity_field(x, t_batch, T)
 
-            # Euler step
             x = x + v * dt
-
-            # Project back to probability simplex (softmax projection)
-            # This ensures numerical stability
             x = F.softmax(torch.log(x.clamp(min=1e-8)), dim=1)
 
         # Convert to discrete spins
-        # x[:, 1] is probability of spin +1 (category 1)
-        samples = (x[:, 1] > 0.5).float()  # (B, H, W), values in {0, 1}
-        samples = samples.unsqueeze(1)  # (B, 1, H, W)
+        samples = (x[:, 1] > 0.5).float()
+        samples = samples.unsqueeze(1)
 
-        # Apply fixed first spin if configured
         if self.fix_first is not None:
             samples[:, 0, 0, 0] = float(self.fix_first)
 
-        # Map to {-1, +1}
         samples = self.mapping(samples)
 
         return samples
@@ -912,9 +1059,10 @@ class DiscreteFlowMatcher(nn.Module):
                 if self.fix_first is not None:
                     random_samples[:, 0, 0, 0] = float(self.fix_first)
 
-                # Run longer MH to equilibrate
+                # Run MH with checkerboard updates for faster equilibration
+                # mh_steps = number of full lattice sweeps
                 mh_samples = self.improve_samples_with_energy(
-                    random_samples, T, energy_fn, n_steps=mh_steps * H * W // 4
+                    random_samples, T, energy_fn, n_steps=mh_steps, use_checkerboard=True
                 )
                 mh_energy = energy_fn(mh_samples)
 
