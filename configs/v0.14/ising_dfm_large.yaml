@@ -14,8 +14,8 @@
 project: Ising_DFM_v0.14
 device: cuda:0
 net: model_dfm.DiscreteFlowMatcher
-optimizer: torch.optim.AdamW
-scheduler: torch.optim.lr_scheduler.CosineAnnealingLR
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 500
 batch_size: 512
 seeds: [42]
@@ -65,12 +65,13 @@ net_config:
   temp_scale_max: 10.0
 
 optimizer_config:
-  lr: 5.e-4                 # Lower LR for larger model
-  weight_decay: 1.e-4
+  lr: 3.0                   # Slightly lower for larger model
+  eps: 1.e-10
 
 scheduler_config:
-  T_max: 500
-  eta_min: 1.e-6
+  upper_bound: 550          # Slightly larger than epochs
+  max_iter: 500             # Same as epochs
+  infimum_lr: 1.e-7         # Lower final LR for fine-tuning
 
 early_stopping_config:
   enabled: false
