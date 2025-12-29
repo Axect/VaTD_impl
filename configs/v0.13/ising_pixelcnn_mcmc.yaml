@@ -48,8 +48,14 @@ net_config:
   # MCMC Guided Training (Kalman Filter style)
   mcmc_enabled: true
   mcmc_freq: 5        # Run correction every 5 epochs
-  mcmc_steps: 10      # Number of Swendsen-Wang sweeps
   mcmc_weight: 1.0    # Weight for MLE loss
+
+  # Hybrid SW+MH equilibration (recommended for Tc)
+  # SW eliminates critical slowing down, MH ensures Boltzmann convergence
+  mcmc_use_hybrid: true      # Use hybrid SW+MH (true) or pure SW (false)
+  mcmc_sw_sweeps: 5          # Swendsen-Wang sweeps for decorrelation
+  mcmc_mh_steps: 20          # MH steps for energy-guided refinement
+  mcmc_steps: 10             # (deprecated) Pure SW sweeps if mcmc_use_hybrid=false
 
   # 2-Phase Curriculum Learning
   curriculum_enabled: true

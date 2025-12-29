@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for server
 
 from config import RunConfig
-from ising import swendsen_wang_update  # Import Swendsen-Wang
+from ising import swendsen_wang_update, hybrid_cluster_mh_update  # MCMC methods
 
 import random
 import os
@@ -227,8 +227,12 @@ class Trainer:
         # Checks if model hparams has mcmc_enabled, else defaults to False
         self.mcmc_enabled = getattr(model, "hparams", {}).get("mcmc_enabled", False)
         self.mcmc_freq = getattr(model, "hparams", {}).get("mcmc_freq", 5)
-        self.mcmc_steps = getattr(model, "hparams", {}).get("mcmc_steps", 10)
+        self.mcmc_steps = getattr(model, "hparams", {}).get("mcmc_steps", 10)  # deprecated
         self.mcmc_weight = getattr(model, "hparams", {}).get("mcmc_weight", 1.0)
+        # Hybrid SW+MH parameters (recommended over pure SW)
+        self.mcmc_use_hybrid = getattr(model, "hparams", {}).get("mcmc_use_hybrid", True)
+        self.mcmc_sw_sweeps = getattr(model, "hparams", {}).get("mcmc_sw_sweeps", 5)
+        self.mcmc_mh_steps = getattr(model, "hparams", {}).get("mcmc_mh_steps", 20)
 
         # Curriculum learning settings
         # 2-Phase curriculum: High temp only → Gradual expansion to full range
@@ -660,11 +664,24 @@ class Trainer:
             # Only run periodically
             if self.mcmc_enabled and self.current_epoch % self.mcmc_freq == 0:
                 with torch.no_grad():
-                    # Run Swendsen-Wang to equilibrate samples
-                    # Start from current model samples (warm start)
-                    mcmc_samples = swendsen_wang_update(
-                        samples, T_expanded, n_sweeps=self.mcmc_steps, fix_first=(self.model.fix_first is not None)
-                    )
+                    fix_first_flag = (self.model.fix_first is not None)
+
+                    if self.mcmc_use_hybrid:
+                        # Hybrid SW+MH: SW for decorrelation + MH for energy convergence
+                        # This ensures we get proper Boltzmann samples as targets
+                        mcmc_samples = hybrid_cluster_mh_update(
+                            samples, T_expanded,
+                            n_sw_sweeps=self.mcmc_sw_sweeps,
+                            n_mh_steps=self.mcmc_mh_steps,
+                            fix_first=fix_first_flag
+                        )
+                    else:
+                        # Pure SW (not recommended - doesn't converge to Boltzmann)
+                        mcmc_samples = swendsen_wang_update(
+                            samples, T_expanded,
+                            n_sweeps=self.mcmc_steps,
+                            fix_first=fix_first_flag
+                        )
 
                 # Teacher Forcing: Maximize likelihood of MCMC samples
                 # Treat MCMC samples as "ground truth"

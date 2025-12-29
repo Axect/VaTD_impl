@@ -192,3 +192,115 @@ def wolff_cluster_update(
                 improved[b, 0, fi, fj] = -improved[b, 0, fi, fj]
 
     return improved
+
+
+def metropolis_hastings_update(
+    samples: torch.Tensor,
+    T: torch.Tensor,
+    n_steps: int = 10,
+    fix_first: bool = True
+) -> torch.Tensor:
+    """
+    Metropolis-Hastings update with checkerboard parallelization.
+
+    Unlike cluster algorithms, MH explicitly uses energy changes to accept/reject
+    moves, ensuring convergence to the Boltzmann distribution regardless of
+    the initial distribution.
+
+    Args:
+        samples: Input samples (B, 1, H, W) in {-1, +1}
+        T: Temperature values (B,)
+        n_steps: Number of MH sweeps (each sweep updates all sites)
+        fix_first: Whether to fix the first spin
+
+    Returns:
+        Improved samples (B, 1, H, W) in {-1, +1}
+    """
+    B, C, H, W = samples.shape
+    device = samples.device
+    improved = samples.clone()
+    beta = 1.0 / T.view(B, 1, 1)  # (B, 1, 1)
+
+    # Create checkerboard masks
+    row_idx = torch.arange(H, device=device).view(1, H, 1)
+    col_idx = torch.arange(W, device=device).view(1, 1, W)
+    even_mask = ((row_idx + col_idx) % 2 == 0).expand(B, H, W)
+    odd_mask = ~even_mask
+
+    # Fixed first position mask
+    if fix_first:
+        fixed_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+        fixed_mask[:, 0, 0] = True
+    else:
+        fixed_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+
+    for _ in range(n_steps):
+        for mask in [even_mask, odd_mask]:
+            # Compute local field for all sites
+            spins = improved[:, 0]  # (B, H, W)
+            neighbors = (
+                torch.roll(spins, 1, dims=1) +
+                torch.roll(spins, -1, dims=1) +
+                torch.roll(spins, 1, dims=2) +
+                torch.roll(spins, -1, dims=2)
+            )  # (B, H, W)
+
+            # Energy change if we flip: ΔE = 2 * s * h
+            delta_E = 2 * spins * neighbors  # (B, H, W)
+
+            # Metropolis acceptance probability
+            accept_prob = torch.where(
+                delta_E < 0,
+                torch.ones_like(delta_E),
+                torch.exp(-beta * delta_E)
+            )
+
+            # Random acceptance
+            accept = torch.rand_like(accept_prob) < accept_prob
+
+            # Apply mask and fixed position constraint
+            accept = accept & mask & ~fixed_mask
+
+            # Flip accepted spins
+            improved[:, 0] = torch.where(accept, -spins, spins)
+
+    return improved
+
+
+def hybrid_cluster_mh_update(
+    samples: torch.Tensor,
+    T: torch.Tensor,
+    n_sw_sweeps: int = 5,
+    n_mh_steps: int = 20,
+    fix_first: bool = True
+) -> torch.Tensor:
+    """
+    Hybrid cluster + MH update for optimal equilibration.
+
+    Combines the strengths of both algorithms:
+    1. Swendsen-Wang: Fast decorrelation, eliminates critical slowing down
+    2. Metropolis-Hastings: Energy-guided convergence to Boltzmann distribution
+
+    This is particularly effective at Tc where:
+    - SW moves quickly through phase space (no critical slowing down)
+    - MH then "fine-tunes" toward low-energy configurations
+
+    Args:
+        samples: Input samples (B, 1, H, W) in {-1, +1}
+        T: Temperature values (B,)
+        n_sw_sweeps: Number of Swendsen-Wang sweeps for decorrelation
+        n_mh_steps: Number of MH sweeps for energy-guided refinement
+        fix_first: Whether to fix the first spin
+
+    Returns:
+        Improved samples (B, 1, H, W) in {-1, +1}
+    """
+    # Step 1: Swendsen-Wang for fast decorrelation
+    # This efficiently explores configuration space without critical slowing down
+    decorrelated = swendsen_wang_update(samples, T, n_sweeps=n_sw_sweeps, fix_first=fix_first)
+
+    # Step 2: Metropolis-Hastings for energy-guided convergence
+    # This ensures we actually move toward the Boltzmann distribution
+    improved = metropolis_hastings_update(decorrelated, T, n_steps=n_mh_steps, fix_first=fix_first)
+
+    return improved
