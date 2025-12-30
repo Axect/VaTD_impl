@@ -1,0 +1,70 @@
+# v0.15 Ablation: Dilated Only (No MCMC Guidance)
+#
+# Goal: Measure the performance gain from Dilated Convolutions alone.
+#
+# Key features:
+# - 8-layer Dilated ResNet architecture (Exponential RF)
+# - Sequential training mode (v0.13 style)
+# - NO MCMC Replay Buffer
+# - NO Symmetry Augmentation
+# - NO Teacher Forcing (Pure REINFORCE / Self-Training)
+
+project: Ising_VaTD_v0.15_Ablation
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 256       
+  num_beta: 8           
+  beta_min: 0.2         
+  beta_max: 1.0         
+
+  # Training Mode: Sequential
+  training_mode: sequential
+  accumulation_steps: 64      
+
+  # MCMC Guided Training: DISABLED for ablation
+  mcmc_enabled: false
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 100          
+  phase1_beta_max: 0.35       
+  phase2_epochs: 150          
+
+  # Model architecture (Dilated ResNet - SAME as v0.15 improved)
+  kernel_size: 7              
+  hidden_channels: 96         
+  hidden_conv_layers: 8       
+  hidden_kernel_size: 3       
+  hidden_width: 128           
+  hidden_fc_layers: 2
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_ref: 2.27              
+  temp_scale_power: 1.0       
+  temp_scale_min: 0.1         
+  temp_scale_max: 10.0        
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 1.e-4
+
+scheduler_config:
+  upper_bound: 600
+  max_iter: 500
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false
