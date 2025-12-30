@@ -135,13 +135,17 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def augment_samples(samples):
+def augment_samples(samples, fix_first=None):
     """
     Apply random rotations and flips to samples for symmetry augmentation.
     Ising model on square lattice is invariant under D4 group.
+    
+    If fix_first is provided, we exploit the global Z2 symmetry (s -> -s)
+    to ensure the spin at (0,0) matches fix_first.
 
     Args:
         samples: (B, 1, H, W) tensor
+        fix_first: (float, optional) Value to enforce at (0,0)
     Returns:
         augmented samples
     """
@@ -153,6 +157,22 @@ def augment_samples(samples):
     # Random flip (horizontal)
     if random.random() < 0.5:
         samples = torch.flip(samples, dims=[3])
+        
+    # Enforce fix_first constraint via Z2 symmetry
+    if fix_first is not None:
+        # Check value at (0,0)
+        # samples shape: (B, C, H, W)
+        val_at_zero = samples[:, :, 0, 0]
+        
+        # Identify samples that need flipping (mismatch with fix_first)
+        # We assume values are discrete (close to -1 or 1)
+        mismatch_mask = (val_at_zero != fix_first)
+        
+        # Create flip factor: -1 where mismatch, 1 where match
+        # (B, 1, 1, 1) for broadcasting
+        flip_factor = torch.where(mismatch_mask, -1.0, 1.0).view(-1, 1, 1, 1)
+        
+        samples = samples * flip_factor
 
     return samples
 
@@ -726,7 +746,8 @@ class Trainer:
 
                 # Apply Symmetry Augmentation (Rotation/Flip)
                 # This forces the model to learn isotropic filters despite causal masking
-                mcmc_targets = augment_samples(mcmc_targets)
+                # We pass fix_first to ensure the augmented sample still satisfies the (0,0) constraint
+                mcmc_targets = augment_samples(mcmc_targets, fix_first=self.model.fix_first)
 
                 # Teacher Forcing: Maximize likelihood of MCMC samples
                 log_prob_mcmc = self.model.log_prob(mcmc_targets, T=T_buffer)
