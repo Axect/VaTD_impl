@@ -50,12 +50,11 @@ net_config:
   mcmc_freq: 5        # Run correction every 5 epochs
   mcmc_weight: 1.0    # Weight for MLE loss
 
-  # Hybrid SW+MH equilibration (recommended for Tc)
-  # SW eliminates critical slowing down, MH ensures Boltzmann convergence
-  mcmc_use_hybrid: true      # Use hybrid SW+MH (true) or pure SW (false)
-  mcmc_sw_sweeps: 5          # Swendsen-Wang sweeps for decorrelation
-  mcmc_mh_steps: 20          # MH steps for energy-guided refinement
-  mcmc_steps: 10             # (deprecated) Pure SW sweeps if mcmc_use_hybrid=false
+  # Swendsen-Wang Equilibration (Theoretically Sufficient)
+  # SW eliminates critical slowing down and samples Boltzmann distribution efficiently
+  mcmc_sw_sweeps: 10         # Increased sweeps for full decorrelation (SW only)
+  mcmc_mh_steps: 0           # MH disabled (SW is sufficient)
+  mcmc_steps: 10             # (deprecated)
 
   # 2-Phase Curriculum Learning
   curriculum_enabled: true

@@ -267,40 +267,39 @@ def metropolis_hastings_update(
     return improved
 
 
-def hybrid_cluster_mh_update(
+def mcmc_update(
     samples: torch.Tensor,
     T: torch.Tensor,
     n_sw_sweeps: int = 5,
-    n_mh_steps: int = 20,
+    n_mh_steps: int = 0,
     fix_first: bool = True
 ) -> torch.Tensor:
     """
-    Hybrid cluster + MH update for optimal equilibration.
+    MCMC update for Ising model equilibration.
 
-    Combines the strengths of both algorithms:
-    1. Swendsen-Wang: Fast decorrelation, eliminates critical slowing down
-    2. Metropolis-Hastings: Energy-guided convergence to Boltzmann distribution
+    By default, uses Swendsen-Wang (SW) cluster algorithm which is 
+    theoretically sufficient to reach Boltzmann distribution and 
+    eliminates critical slowing down. 
 
-    This is particularly effective at Tc where:
-    - SW moves quickly through phase space (no critical slowing down)
-    - MH then "fine-tunes" toward low-energy configurations
+    Metropolis-Hastings (MH) is optional and can be used for local 
+    refinement if needed (n_mh_steps > 0).
 
     Args:
         samples: Input samples (B, 1, H, W) in {-1, +1}
         T: Temperature values (B,)
-        n_sw_sweeps: Number of Swendsen-Wang sweeps for decorrelation
-        n_mh_steps: Number of MH sweeps for energy-guided refinement
+        n_sw_sweeps: Number of Swendsen-Wang sweeps (Recommended: 5-10)
+        n_mh_steps: Number of MH sweeps (Optional refinement, 0 to skip)
         fix_first: Whether to fix the first spin
 
     Returns:
-        Improved samples (B, 1, H, W) in {-1, +1}
+        Equilibrated samples (B, 1, H, W) in {-1, +1}
     """
-    # Step 1: Swendsen-Wang for fast decorrelation
-    # This efficiently explores configuration space without critical slowing down
-    decorrelated = swendsen_wang_update(samples, T, n_sweeps=n_sw_sweeps, fix_first=fix_first)
+    # Step 1: Swendsen-Wang for fast global equilibration
+    # This is the primary engine for sampling.
+    improved = swendsen_wang_update(samples, T, n_sweeps=n_sw_sweeps, fix_first=fix_first)
 
-    # Step 2: Metropolis-Hastings for energy-guided convergence
-    # This ensures we actually move toward the Boltzmann distribution
-    improved = metropolis_hastings_update(decorrelated, T, n_steps=n_mh_steps, fix_first=fix_first)
+    # Step 2: Optional Metropolis-Hastings for local refinement
+    if n_mh_steps > 0:
+        improved = metropolis_hastings_update(improved, T, n_steps=n_mh_steps, fix_first=fix_first)
 
     return improved

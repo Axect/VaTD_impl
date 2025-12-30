@@ -996,51 +996,39 @@ class DiscreteFlowMatcher(nn.Module):
 
         return improved
 
-    def hybrid_cluster_mh_update(
+    def mcmc_update(
         self,
         samples: torch.Tensor,
         T: torch.Tensor,
         energy_fn,
-        n_sw_sweeps: int = 5,
-        n_mh_steps: int = 20
+        n_sw_sweeps: int = 10,
+        n_mh_steps: int = 0
     ) -> torch.Tensor:
         """
-        Hybrid cluster + MH update for optimal equilibration.
+        MCMC update for optimal equilibration.
 
-        Combines the strengths of both algorithms:
-        1. Swendsen-Wang: Fast decorrelation, eliminates critical slowing down
-        2. Metropolis-Hastings: Energy-guided convergence to Boltzmann distribution
-
-        The key insight is that SW efficiently explores configuration space
-        (especially at Tc where clusters are large), while MH ensures we
-        converge toward the correct Boltzmann distribution.
-
-        This is particularly effective because:
-        - SW moves quickly through phase space (no critical slowing down)
-        - MH then "fine-tunes" toward low-energy configurations
-        - The combination is faster than either alone
+        Uses Swendsen-Wang (SW) cluster algorithm as the primary engine.
+        SW is theoretically sufficient to reach Boltzmann distribution
+        and eliminates critical slowing down at Tc.
 
         Args:
             samples: Input samples (B, 1, H, W) in {-1, +1}
             T: Temperature values (B,)
-            energy_fn: Energy function for MH acceptance
-            n_sw_sweeps: Number of Swendsen-Wang sweeps for decorrelation
-            n_mh_steps: Number of MH sweeps for energy-guided refinement
+            energy_fn: Energy function for MH acceptance (if used)
+            n_sw_sweeps: Number of Swendsen-Wang sweeps (Recommended: 5-10)
+            n_mh_steps: Number of MH sweeps (Optional refinement, 0 to skip)
 
         Returns:
             Improved samples (B, 1, H, W) in {-1, +1}
         """
-        # Step 1: Swendsen-Wang for fast decorrelation
-        # This efficiently explores configuration space without critical slowing down
-        # SW doesn't use energy_fn - it only satisfies detailed balance for Boltzmann
-        decorrelated = self.swendsen_wang_update(samples, T, n_sweeps=n_sw_sweeps)
+        # Step 1: Swendsen-Wang for fast global equilibration
+        improved = self.swendsen_wang_update(samples, T, n_sweeps=n_sw_sweeps)
 
-        # Step 2: Metropolis-Hastings for energy-guided convergence
-        # This ensures we actually move toward the Boltzmann distribution
-        # MH uses energy_fn to accept/reject based on energy changes
-        improved = self.improve_samples_with_energy(
-            decorrelated, T, energy_fn, n_steps=n_mh_steps, use_checkerboard=True
-        )
+        # Step 2: Optional Metropolis-Hastings for local refinement
+        if n_mh_steps > 0:
+            improved = self.improve_samples_with_energy(
+                improved, T, energy_fn, n_steps=n_mh_steps, use_checkerboard=True
+            )
 
         return improved
 
@@ -1321,15 +1309,15 @@ class DiscreteFlowMatcher(nn.Module):
         mh_steps: int = 10,
         use_cluster: bool = False,
         n_clusters: int = 10,
-        n_sw_sweeps: int = 5,
-        n_mh_after_sw: int = 20
+        n_sw_sweeps: int = 10,
+        n_mh_after_sw: int = 0
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute training loss for self-training (no external data).
 
         Training modes:
         - "energy_guided": Energy-guided denoising + velocity matching (RECOMMENDED)
-          * Improves samples with hybrid SW+MH (if use_cluster=True) or pure MH
+          * Improves samples with Swendsen-Wang (if use_cluster=True) or pure MH
           * Trains denoising to predict low-energy configurations
           * Additionally matches velocity to energy-guided velocity
         - "reinforce": Pure REINFORCE with RLOO baseline
@@ -1343,11 +1331,11 @@ class DiscreteFlowMatcher(nn.Module):
             lambda_reinforce: Weight for REINFORCE loss (ignored in some modes)
             training_mode: "energy_guided", "reinforce", "hybrid", or "denoise_only"
             energy_weight: Weight for energy-guided velocity matching
-            mh_steps: Number of Metropolis-Hastings steps for sample improvement
-            use_cluster: If True, use hybrid SW+MH instead of pure MH
-            n_clusters: (deprecated) Number of SW sweeps, use n_sw_sweeps instead
-            n_sw_sweeps: Number of Swendsen-Wang sweeps for decorrelation
-            n_mh_after_sw: Number of MH steps after SW for energy-guided refinement
+            mh_steps: Number of Metropolis-Hastings steps (used if use_cluster=False)
+            use_cluster: If True, use Swendsen-Wang instead of pure MH
+            n_clusters: (deprecated) Number of SW sweeps
+            n_sw_sweeps: Number of Swendsen-Wang sweeps for equilibration
+            n_mh_after_sw: Number of MH steps after SW (0 to skip, Recommended: 0)
 
         Returns:
             Tuple of (loss, metrics_dict)
@@ -1400,14 +1388,11 @@ class DiscreteFlowMatcher(nn.Module):
                 # Calculate initial energy for metrics
                 initial_energy = energy_fn(initial_samples)
 
-                # Run equilibration: Hybrid SW+MH or pure MH
+                # Run equilibration: SW-only or pure MH
                 if use_cluster:
-                    # Hybrid approach: SW for decorrelation + MH for energy convergence
-                    # SW eliminates critical slowing down at Tc
-                    # MH ensures convergence to Boltzmann distribution
-                    # Use n_sw_sweeps (or fall back to n_clusters for backward compat)
+                    # Swendsen-Wang for fast equilibration
                     sw_sweeps = n_sw_sweeps if n_sw_sweeps > 0 else n_clusters
-                    mh_samples = self.hybrid_cluster_mh_update(
+                    mh_samples = self.mcmc_update(
                         initial_samples, T, energy_fn,
                         n_sw_sweeps=sw_sweeps,
                         n_mh_steps=n_mh_after_sw

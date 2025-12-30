@@ -48,12 +48,12 @@ net_config:
   training_mode: energy_guided  # "energy_guided" (MH-improved + velocity matching)
   energy_weight: 1.0            # Weight for velocity matching loss
 
-  # Hybrid SW+MH equilibration (recommended for Tc)
-  # SW eliminates critical slowing down, MH ensures Boltzmann convergence
-  use_cluster: true             # Use hybrid SW+MH (true) or pure MH (false)
-  n_sw_sweeps: 5                # Swendsen-Wang sweeps for decorrelation
-  n_mh_after_sw: 20             # MH steps after SW for energy-guided refinement
-  n_clusters: 10                # (deprecated) backward compat, use n_sw_sweeps
+  # Swendsen-Wang Equilibration (Theoretically Sufficient)
+  # SW eliminates critical slowing down and samples Boltzmann distribution efficiently
+  use_cluster: true             # Use Swendsen-Wang (true) or pure MH (false)
+  n_sw_sweeps: 10               # Increased sweeps for full decorrelation (SW only)
+  n_mh_after_sw: 0              # MH disabled (SW is sufficient)
+  n_clusters: 10                # (deprecated) backward compat
   mh_steps: 200                 # Pure MH sweeps (if use_cluster=false)
 
   mh_model_init_prob: 0.9       # Probability of initializing MH from model samples (Self-Imitation)

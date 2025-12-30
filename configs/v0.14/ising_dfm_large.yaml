@@ -39,10 +39,11 @@ net_config:
   t_min: 0.01
   time_dim: 128             # Larger time embedding
 
-  # Training Mode
-  training_mode: energy_guided  # Energy-guided (MH-improved + velocity matching)
-  energy_weight: 1.0            # Weight for velocity matching loss
-  mh_steps: 150                 # MH sweeps for equilibration (checkerboard)
+  # Swendsen-Wang Equilibration (Theoretically Sufficient)
+  use_cluster: true             # Use Swendsen-Wang (true) or pure MH (false)
+  n_sw_sweeps: 10               # Increased sweeps for full decorrelation (SW only)
+  n_mh_after_sw: 0              # MH disabled (SW is sufficient)
+  mh_steps: 150                 # Pure MH sweeps (if use_cluster=false)
   lambda_reinforce: 0.1         # (unused in energy_guided mode)
   accumulation_steps: 16        # More gradient accumulation
 
