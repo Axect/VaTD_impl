@@ -9,7 +9,7 @@
 # - NO Symmetry Augmentation
 # - NO Teacher Forcing (Pure REINFORCE / Self-Training)
 
-project: Ising_VaTD_v0.15_Ablation
+project: Ising_VaTD_v0.15
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
