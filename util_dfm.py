@@ -209,15 +209,20 @@ class FlowMatchingTrainer:
                 model.beta_min, model.beta_max, model.num_beta
             ).to(device)
 
-        # Exact partition function for validation
+        # Exact partition function for validation (Ising)
         if energy_fn is not None:
             self.exact_logz_values = getattr(energy_fn, "exact_logz_values", None)
             self.lattice_size = getattr(energy_fn, "lattice_size", None)
             self.critical_temperature = getattr(energy_fn, "critical_temperature", None)
+            # MCMC reference data for XY model validation
+            self.mcmc_reference = getattr(energy_fn, "mcmc_reference", None)
+            self.model_type = getattr(energy_fn, "model_type", "ising")
         else:
             self.exact_logz_values = None
             self.lattice_size = None
             self.critical_temperature = None
+            self.mcmc_reference = None
+            self.model_type = "ising"
 
         # Early stopping
         if early_stopping_config and early_stopping_config.enabled:
@@ -298,19 +303,28 @@ class FlowMatchingTrainer:
                 samples = self.model.sample(batch_size=total_size, T=T_expanded)
 
             # Compute loss based on training mode
-            loss, metrics = self.model.training_loss(
-                samples,
-                T_expanded,
-                energy_fn=energy_fn,
-                lambda_reinforce=self.lambda_reinforce,
-                training_mode=self.training_mode,
-                energy_weight=self.energy_weight,
-                mh_steps=self.mh_steps,
-                use_cluster=self.use_cluster,
-                n_clusters=self.n_clusters,
-                n_sw_sweeps=self.n_sw_sweeps,
-                n_mh_after_sw=self.n_mh_after_sw,
-            )
+            # Use different call signature for XY model (ContinuousFlowMatcher)
+            if self.model_type == "xy":
+                loss, metrics = self.model.training_loss(
+                    samples,
+                    T_expanded,
+                    energy_fn=energy_fn,
+                    mode=self.training_mode,
+                )
+            else:
+                loss, metrics = self.model.training_loss(
+                    samples,
+                    T_expanded,
+                    energy_fn=energy_fn,
+                    lambda_reinforce=self.lambda_reinforce,
+                    training_mode=self.training_mode,
+                    energy_weight=self.energy_weight,
+                    mh_steps=self.mh_steps,
+                    use_cluster=self.use_cluster,
+                    n_clusters=self.n_clusters,
+                    n_sw_sweeps=self.n_sw_sweeps,
+                    n_mh_after_sw=self.n_mh_after_sw,
+                )
 
             # Backward
             self.optimizer.zero_grad()
@@ -419,6 +433,121 @@ class FlowMatchingTrainer:
 
         return val_dict
 
+    def compute_xy_magnetization(self, samples: torch.Tensor) -> torch.Tensor:
+        """
+        Compute XY magnetization for a batch of samples.
+
+        M = (1/N) * |sum_i exp(i*theta_i)|
+          = (1/N) * sqrt((sum cos(theta))^2 + (sum sin(theta))^2)
+
+        Args:
+            samples: Angles of shape (B, 1, H, W) in [-pi, pi]
+
+        Returns:
+            Magnetization of shape (B,) in [0, 1]
+        """
+        cos_sum = torch.cos(samples).sum(dim=[1, 2, 3])  # (B,)
+        sin_sum = torch.sin(samples).sum(dim=[1, 2, 3])  # (B,)
+        N = samples[0].numel()
+        mag = torch.sqrt(cos_sum ** 2 + sin_sum ** 2) / N
+        return mag
+
+    def val_epoch_xy(self, energy_fn):
+        """
+        Validation epoch for XY model.
+
+        Since no exact solution exists for XY model, we compare:
+        1. Model energy vs MCMC reference energy
+        2. Model magnetization vs MCMC reference magnetization
+        3. Variational free energy (for relative comparison)
+
+        Returns:
+            dict: Validation statistics
+        """
+        batch_size = self.model.batch_size
+        num_beta = len(self.fixed_val_betas)
+
+        beta_samples = self.fixed_val_betas
+        T_samples = 1.0 / beta_samples
+        T_expanded = T_samples.repeat_interleave(batch_size)
+        total_size = num_beta * batch_size
+
+        self.model.eval()
+
+        with torch.no_grad():
+            # Sample from model
+            samples = self.model.sample(batch_size=total_size, T=T_expanded)
+
+            # Compute energy
+            energy = energy_fn(samples)
+
+            # Compute magnetization
+            magnetization = self.compute_xy_magnetization(samples)
+
+            # Reshape to (num_beta, batch_size)
+            energy_view = energy.view(num_beta, batch_size)
+            mag_view = magnetization.view(num_beta, batch_size)
+
+            # Mean per temperature
+            energy_per_beta = energy_view.mean(dim=1)
+            mag_per_beta = mag_view.mean(dim=1)
+
+            # Build result dict
+            val_dict = {
+                "val_energy_mean": energy_per_beta.mean().item(),
+                "val_magnetization_mean": mag_per_beta.mean().item(),
+            }
+
+            for i in range(num_beta):
+                T_val = T_samples[i].item()
+                val_dict[f"val_energy_T_{T_val:.2f}"] = energy_per_beta[i].item()
+                val_dict[f"val_mag_T_{T_val:.2f}"] = mag_per_beta[i].item()
+
+            # Compare with MCMC reference if available
+            if self.mcmc_reference is not None:
+                energy_errors = []
+                mag_errors = []
+
+                for i in range(num_beta):
+                    T_val = T_samples[i].item()
+                    # Find closest temperature in reference
+                    ref_temps = list(self.mcmc_reference.keys())
+                    if isinstance(ref_temps[0], str):
+                        ref_temps = [float(t) for t in ref_temps]
+
+                    closest_T = min(ref_temps, key=lambda t: abs(t - T_val))
+                    ref_data = self.mcmc_reference[closest_T]
+
+                    if isinstance(ref_data, dict):
+                        ref_energy = ref_data.get("energy_mean", 0)
+                        ref_mag = ref_data.get("mag_mean", 0)
+                    else:
+                        ref_energy = ref_data
+                        ref_mag = 0
+
+                    e_error = abs(energy_per_beta[i].item() - ref_energy)
+                    m_error = abs(mag_per_beta[i].item() - ref_mag)
+
+                    val_dict[f"val_energy_error_T_{T_val:.2f}"] = e_error
+                    val_dict[f"val_mag_error_T_{T_val:.2f}"] = m_error
+
+                    energy_errors.append(e_error)
+                    mag_errors.append(m_error)
+
+                val_dict["val_energy_error_mean"] = np.mean(energy_errors)
+                val_dict["val_mag_error_mean"] = np.mean(mag_errors)
+
+            # Also compute log probability for monitoring
+            log_prob = self.model.log_prob(samples, T=T_expanded)
+            beta = (1.0 / T_expanded).unsqueeze(-1)
+            loss_raw = log_prob + beta * energy
+
+            loss_view = loss_raw.view(num_beta, batch_size)
+            loss_per_beta = loss_view.mean(dim=1)
+            val_dict["val_loss"] = loss_per_beta.mean().item()
+
+        return val_dict
+
     def train(self, energy_fn, epochs, log_every=1, save_path=None, wandb_log=True):
         """
         Full training loop with organized wandb logging (same structure as util.py).
@@ -448,8 +577,11 @@ class FlowMatchingTrainer:
             train_loss = train_stats["train_loss"]
             history["train_loss"].append(train_loss)
 
-            # Validation
-            val_stats = self.val_epoch(energy_fn)
+            # Validation (use XY-specific validation for XY models)
+            if self.model_type == "xy":
+                val_stats = self.val_epoch_xy(energy_fn)
+            else:
+                val_stats = self.val_epoch(energy_fn)
             val_loss = val_stats["val_loss"]
             history["val_loss"].append(val_loss)
             val_losses.append(val_loss)

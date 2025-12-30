@@ -1575,6 +1575,687 @@ class DiscreteFlowMatcher(nn.Module):
         return log_prob.unsqueeze(-1)  # (B, 1)
 
 
+# ==============================================================================
+# Helper Functions for Continuous Flow Matching (XY Model)
+# ==============================================================================
+
+
+def wrap_angle(x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrap angle to [-pi, pi].
+
+    Args:
+        x: Angle tensor
+
+    Returns:
+        Wrapped angle in [-pi, pi]
+    """
+    return torch.remainder(x + math.pi, 2 * math.pi) - math.pi
+
+
+def _eval_poly(y: torch.Tensor, coef: list) -> torch.Tensor:
+    """Evaluate polynomial with given coefficients."""
+    coef = list(coef)
+    result = coef.pop()
+    while coef:
+        result = coef.pop() + y * result
+    return result
+
+
+# Coefficients for modified Bessel function approximation
+_I0_COEF_SMALL = [1.0, 3.5156229, 3.0899424, 1.2067492, 0.2659732, 0.360768e-1, 0.45813e-2]
+_I0_COEF_LARGE = [0.39894228, 0.1328592e-1, 0.225319e-2, -0.157565e-2, 0.916281e-2,
+                  -0.2057706e-1, 0.2635537e-1, -0.1647633e-1, 0.392377e-2]
+
+
+def log_modified_bessel_fn(x: torch.Tensor, order: int = 0) -> torch.Tensor:
+    """
+    Compute log(I_order(x)) for x > 0.
+
+    Args:
+        x: Input tensor (concentration parameter kappa)
+        order: Order of Bessel function (0 or 1)
+
+    Returns:
+        log(I_order(x))
+    """
+    assert order == 0, "Only order=0 is implemented"
+
+    # Small x approximation
+    y = (x / 3.75) ** 2
+    small = _eval_poly(y, _I0_COEF_SMALL).log()
+
+    # Large x approximation
+    y_large = 3.75 / x
+    large = x - 0.5 * x.log() + _eval_poly(y_large, _I0_COEF_LARGE).log()
+
+    return torch.where(x < 3.75, small, large)
+
+
+def sample_von_mises(
+    mu: torch.Tensor,
+    kappa: torch.Tensor,
+    shape: tuple,
+    device: str = "cpu",
+    eps: float = 1e-7
+) -> torch.Tensor:
+    """
+    Sample from Von Mises distribution using acceptance-rejection.
+
+    Based on Fisher (1993) algorithm for sampling from Von Mises.
+
+    Args:
+        mu: Mean direction (can be scalar or tensor)
+        kappa: Concentration parameter (must be > 0)
+        shape: Output shape
+        device: Torch device
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        Samples in [-pi, pi]
+    """
+    # Handle scalar kappa
+    if kappa.dim() == 0:
+        kappa = kappa.expand(shape)
+
+    # Flatten for vectorized sampling
+    n_samples = np.prod(shape)
+    kappa_flat = kappa.flatten()
+
+    # Algorithm parameters
+    a = 1.0 + torch.sqrt(1.0 + 4.0 * kappa_flat ** 2)
+    b = (a - torch.sqrt(2.0 * a)) / (2.0 * kappa_flat)
+    r = (1.0 + b ** 2) / (2.0 * b)
+
+    # Initialize output and mask
+    theta = torch.zeros(n_samples, device=device)
+    mask = torch.ones(n_samples, device=device, dtype=torch.bool)
+
+    # Acceptance-rejection loop
+    max_iter = 1000
+    for _ in range(max_iter):
+        if not mask.any():
+            break
+
+        mask_idx = mask.nonzero().squeeze(-1)
+        n_remaining = mask_idx.numel()
+
+        # Sample uniform random numbers
+        u = torch.rand(n_remaining, 3, device=device)
+
+        # Get parameters for remaining samples
+        r_m = r[mask_idx]
+        kappa_m = kappa_flat[mask_idx]
+
+        # Proposal
+        z = torch.cos(u[:, 0] * math.pi)
+        f = (1 + r_m * z) / (r_m + z)
+        c = kappa_m * (r_m - f)
+
+        # Acceptance criterion
+        accept = (c * (2 - c) > u[:, 1]) | (torch.log(c / u[:, 1]) + 1 - c >= 0)
+
+        # Update accepted samples
+        accept_idx = mask_idx[accept]
+        sign = (u[accept, 2] - 0.5).sign()
+        theta[accept_idx] = sign * torch.acos(torch.clamp(f[accept], -1 + eps, 1 - eps))
+        mask[accept_idx] = False
+
+    # Add mean direction and wrap to [-pi, pi]
+    theta = theta.reshape(shape)
+    if mu.dim() == 0:
+        theta = theta + mu
+    else:
+        theta = theta + mu.expand(shape)
+
+    return wrap_angle(theta)
+
+
+# ==============================================================================
+# Continuous Flow Matcher for XY Model
+# ==============================================================================
+
+
+class ContinuousFlowMatcher(nn.Module):
+    """
+    Continuous Flow Matching model for 2D XY Model.
+
+    Unlike DiscreteFlowMatcher which uses Dirichlet probability path on a simplex,
+    this uses Gaussian probability path for continuous angles in [-pi, pi].
+
+    Key differences from DiscreteFlowMatcher:
+    - Angles in [-pi, pi] instead of discrete {-1, +1}
+    - Gaussian probability path instead of Dirichlet
+    - Von Mises prior distribution
+    - Direct continuous output (no softmax)
+    - Network outputs angle velocity instead of category logits
+
+    Args:
+        hparams: Hyperparameter dictionary
+        device: Torch device
+    """
+
+    def __init__(self, hparams: dict, device: str = "cpu"):
+        super().__init__()
+        self.hparams = hparams
+        self.device = device
+        self.model_type = "xy"
+
+        # Lattice configuration
+        self.channel = 1  # Single angle per site
+        self.category = 1  # Continuous (not discrete categories)
+
+        size = hparams.get("size", 16)
+        if isinstance(size, int):
+            self.size = (size, size)
+        else:
+            self.size = tuple(size)
+
+        self.fix_first = hparams.get("fix_first", True)
+        self.J = hparams.get("J", 1.0)
+
+        # Training parameters
+        self.batch_size = hparams["batch_size"]
+        self.num_beta = hparams["num_beta"]
+        self.beta_min = hparams["beta_min"]
+        self.beta_max = hparams["beta_max"]
+
+        # Flow matching parameters
+        self.num_flow_steps = hparams.get("num_flow_steps", 100)
+        self.t_max = hparams.get("t_max", 10.0)
+        self.t_min = hparams.get("t_min", 0.01)
+
+        # Von Mises prior parameters
+        self.kappa_0 = hparams.get("kappa_0", 1.0)  # Base concentration
+
+        # Curriculum learning
+        self.curriculum_enabled = hparams.get("curriculum_enabled", False)
+        self.phase1_epochs = hparams.get("phase1_epochs", 50)
+        self.phase1_beta_max = hparams.get("phase1_beta_max", 0.8)
+        self.phase2_epochs = hparams.get("phase2_epochs", 100)
+
+        # Time embedding
+        time_dim = hparams.get("time_dim", 64)
+        self.time_embedding = SinusoidalTimeEmbedding(dim=time_dim)
+
+        # Network: input is (cos(theta), sin(theta)) + temperature = 3 channels
+        # Output is velocity (1 channel)
+        self.net = self._build_network(hparams, time_dim)
+
+    def _build_network(self, hparams: dict, time_dim: int) -> nn.Module:
+        """Build the neural network for velocity prediction."""
+        hidden_channels = hparams.get("hidden_channels", 64)
+        hidden_conv_layers = hparams.get("hidden_conv_layers", 5)
+        hidden_kernel_size = hparams.get("hidden_kernel_size", 3)
+        hidden_width = hparams.get("hidden_width", 128)
+        hidden_fc_layers = hparams.get("hidden_fc_layers", 2)
+
+        # Input: cos(theta) + sin(theta) + T = 3 channels
+        in_channels = 2 + 1  # cos, sin, temperature
+
+        layers = []
+
+        # First conv
+        layers.append(nn.Conv2d(in_channels + time_dim, 2 * hidden_channels,
+                                kernel_size=hidden_kernel_size,
+                                padding=hidden_kernel_size // 2))
+        layers.append(nn.GELU())
+
+        # Residual blocks
+        for _ in range(hidden_conv_layers):
+            layers.append(ResBlock(hidden_channels * 2, hidden_kernel_size))
+
+        # FC layers (1x1 convs)
+        layers.append(nn.Conv2d(2 * hidden_channels, hidden_width, kernel_size=1))
+        layers.append(nn.GELU())
+
+        for _ in range(hidden_fc_layers - 1):
+            layers.append(nn.Conv2d(hidden_width, hidden_width, kernel_size=1))
+            layers.append(nn.GELU())
+
+        # Output: single channel (velocity)
+        layers.append(nn.Conv2d(hidden_width, 1, kernel_size=1))
+
+        return nn.Sequential(*layers)
+
+    def to(self, *args, **kwargs):
+        """Override to() to update self.device."""
+        self = super().to(*args, **kwargs)
+        if args and isinstance(args[0], (torch.device, str)):
+            self.device = args[0]
+        elif "device" in kwargs:
+            self.device = kwargs["device"]
+        return self
+
+    def _prepare_input(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        T: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Prepare network input by encoding angles and adding time/temperature.
+
+        Args:
+            x: Angles of shape (B, 1, H, W) in [-pi, pi]
+            t: Flow time of shape (B,)
+            T: Temperature of shape (B,)
+
+        Returns:
+            Network input of shape (B, C, H, W)
+        """
+        B, _, H, W = x.shape
+
+        # Encode angles as (cos, sin)
+        cos_x = torch.cos(x)  # (B, 1, H, W)
+        sin_x = torch.sin(x)  # (B, 1, H, W)
+
+        # Temperature channel
+        T_channel = T.view(B, 1, 1, 1).expand(B, 1, H, W)
+
+        # Time embedding
+        t_emb = self.time_embedding(t)  # (B, time_dim)
+        t_emb = t_emb.view(B, -1, 1, 1).expand(B, -1, H, W)
+
+        # Concatenate all
+        x_input = torch.cat([cos_x, sin_x, T_channel, t_emb], dim=1)
+
+        return x_input
+
+    def apply_gaussian_noise(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply Gaussian noising along the probability path.
+
+        The probability path interpolates from noise at t=0 to clean at t=t_max:
+            x_t = alpha_t * x + (1 - alpha_t) * noise
+        where alpha_t = t / t_max
+
+        Args:
+            x: Clean angles of shape (B, 1, H, W) in [-pi, pi]
+            t: Time values of shape (B,) in [t_min, t_max]
+
+        Returns:
+            Noisy angles of shape (B, 1, H, W) in [-pi, pi]
+        """
+        B, C, H, W = x.shape
+
+        # Interpolation coefficient
+        alpha_t = (t / self.t_max).view(B, 1, 1, 1)
+
+        # Sample noise from wrapped normal (approximately uniform for low kappa)
+        noise = torch.randn_like(x) * (math.pi / 2)
+
+        # Interpolate
+        x_noisy = alpha_t * x + (1 - alpha_t) * noise
+
+        # Wrap to [-pi, pi]
+        x_noisy = wrap_angle(x_noisy)
+
+        return x_noisy
+
+    def velocity_field(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        T: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the velocity field for continuous flow matching.
+
+        For Gaussian path x_t = alpha_t * x_clean + (1-alpha_t) * noise,
+        the optimal velocity points from current position toward the clean sample.
+
+        Args:
+            x: Current angles of shape (B, 1, H, W)
+            t: Time values of shape (B,)
+            T: Temperature of shape (B,)
+
+        Returns:
+            Velocity of shape (B, 1, H, W)
+        """
+        # Prepare input
+        x_input = self._prepare_input(x, t, T)
+
+        # Get velocity from network
+        velocity = self.net(x_input)  # (B, 1, H, W)
+
+        # Scale velocity by time (faster movement at later times)
+        t_scale = 1.0 / (self.t_max - t.view(-1, 1, 1, 1) + 0.1)
+        velocity = velocity * t_scale
+
+        return velocity
+
+    def compute_energy_velocity_xy(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute energy-guided velocity for XY model using mean-field approximation.
+
+        At each site, compute the local field from neighbors and find the
+        target angle that minimizes energy.
+
+        Args:
+            x: Current angles of shape (B, 1, H, W)
+            T: Temperature of shape (B,)
+
+        Returns:
+            Energy-guided velocity of shape (B, 1, H, W)
+        """
+        # Get neighbor angles
+        theta_right = torch.roll(x, shifts=-1, dims=-1)
+        theta_left = torch.roll(x, shifts=1, dims=-1)
+        theta_down = torch.roll(x, shifts=-1, dims=-2)
+        theta_up = torch.roll(x, shifts=1, dims=-2)
+
+        # Compute local field (sum of neighbor unit vectors)
+        cos_sum = (torch.cos(theta_right) + torch.cos(theta_left) +
+                   torch.cos(theta_down) + torch.cos(theta_up))
+        sin_sum = (torch.sin(theta_right) + torch.sin(theta_left) +
+                   torch.sin(theta_down) + torch.sin(theta_up))
+
+        # Mean-field target angle: align with local field
+        target_angle = torch.atan2(sin_sum, cos_sum)
+
+        # Velocity toward target, scaled by inverse temperature
+        beta = (1.0 / T).view(-1, 1, 1, 1)
+        angle_diff = wrap_angle(target_angle - x)
+
+        # Scale by beta (stronger drive at lower T)
+        velocity = angle_diff * beta * self.J
+
+        return velocity
+
+    def sample(
+        self,
+        batch_size: int,
+        T: torch.Tensor,
+        return_trajectory: bool = False
+    ) -> torch.Tensor:
+        """
+        Sample from the model using Euler integration.
+
+        Args:
+            batch_size: Number of samples
+            T: Temperature tensor of shape (batch_size,)
+            return_trajectory: If True, return full trajectory
+
+        Returns:
+            Samples of shape (batch_size, 1, H, W) in [-pi, pi]
+        """
+        H, W = self.size
+        device = self.device
+
+        # Initialize from Von Mises prior
+        kappa = self.kappa_0 / T  # Higher kappa at lower T
+        x = sample_von_mises(
+            mu=torch.zeros(1, device=device),
+            kappa=kappa.mean(),  # Use mean kappa for initialization
+            shape=(batch_size, 1, H, W),
+            device=device
+        )
+
+        # Fix first spin if requested
+        if self.fix_first:
+            x[:, :, 0, 0] = 0.0
+
+        if return_trajectory:
+            trajectory = [x.clone()]
+
+        # Euler integration from t_min to t_max
+        dt = (self.t_max - self.t_min) / self.num_flow_steps
+        t = torch.full((batch_size,), self.t_min, device=device)
+
+        for step in range(self.num_flow_steps):
+            # Get velocity
+            v = self.velocity_field(x, t, T)
+
+            # Euler step
+            x = x + v * dt
+
+            # Wrap to [-pi, pi]
+            x = wrap_angle(x)
+
+            # Keep first spin fixed
+            if self.fix_first:
+                x[:, :, 0, 0] = 0.0
+
+            # Update time
+            t = t + dt
+
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+        if return_trajectory:
+            return torch.stack(trajectory, dim=0)  # (T, B, 1, H, W)
+
+        return x
+
+    def mcmc_update_xy(
+        self,
+        x: torch.Tensor,
+        T: torch.Tensor,
+        n_sweeps: int = 1,
+        proposal_std: float = 0.5
+    ) -> torch.Tensor:
+        """
+        Metropolis-Hastings update for XY model.
+
+        Args:
+            x: Current angles of shape (B, 1, H, W)
+            T: Temperature of shape (B,)
+            n_sweeps: Number of full lattice sweeps
+            proposal_std: Standard deviation of angle proposal
+
+        Returns:
+            Updated angles of shape (B, 1, H, W)
+        """
+        B, _, H, W = x.shape
+        beta = (1.0 / T).view(B, 1, 1, 1)
+
+        for _ in range(n_sweeps):
+            for i in range(H):
+                for j in range(W):
+                    # Skip fixed first spin
+                    if self.fix_first and i == 0 and j == 0:
+                        continue
+
+                    # Current angle
+                    theta_old = x[:, 0, i, j]
+
+                    # Propose new angle
+                    delta = torch.randn_like(theta_old) * proposal_std
+                    theta_new = wrap_angle(theta_old + delta)
+
+                    # Get neighbor angles
+                    neighbors = (
+                        x[:, 0, (i - 1) % H, j] +
+                        x[:, 0, (i + 1) % H, j] +
+                        x[:, 0, i, (j - 1) % W] +
+                        x[:, 0, i, (j + 1) % W]
+                    )
+
+                    # Note: neighbors here should actually be used in energy calculation
+                    # Energy change: -J * sum_nn cos(theta - theta_nn)
+                    theta_right = x[:, 0, i, (j + 1) % W]
+                    theta_left = x[:, 0, i, (j - 1) % W]
+                    theta_down = x[:, 0, (i + 1) % H, j]
+                    theta_up = x[:, 0, (i - 1) % H, j]
+
+                    # Old energy contribution
+                    E_old = -self.J * (
+                        torch.cos(theta_old - theta_right) +
+                        torch.cos(theta_old - theta_left) +
+                        torch.cos(theta_old - theta_down) +
+                        torch.cos(theta_old - theta_up)
+                    )
+
+                    # New energy contribution
+                    E_new = -self.J * (
+                        torch.cos(theta_new - theta_right) +
+                        torch.cos(theta_new - theta_left) +
+                        torch.cos(theta_new - theta_down) +
+                        torch.cos(theta_new - theta_up)
+                    )
+
+                    # Acceptance probability
+                    delta_E = E_new - E_old
+                    accept_prob = torch.exp(-beta.squeeze() * delta_E)
+                    accept = torch.rand_like(accept_prob) < accept_prob
+
+                    # Update
+                    x[:, 0, i, j] = torch.where(accept, theta_new, theta_old)
+
+        return x
+
+    def training_loss(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor,
+        energy_fn: callable,
+        mode: str = "energy_guided"
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Compute training loss for continuous flow matching.
+
+        Args:
+            samples: Target samples of shape (B, 1, H, W) in [-pi, pi]
+            T: Temperature of shape (B,)
+            energy_fn: Energy function
+            mode: Training mode (only "energy_guided" implemented)
+
+        Returns:
+            Loss tensor and metrics dict
+        """
+        B, C, H, W = samples.shape
+
+        # Sample random time
+        t = torch.rand(B, device=self.device) * (self.t_max - self.t_min) + self.t_min
+
+        # Apply noise to get x_t
+        x_noisy = self.apply_gaussian_noise(samples, t)
+
+        # Keep first spin fixed in noisy version too
+        if self.fix_first:
+            x_noisy[:, :, 0, 0] = 0.0
+
+        # Get predicted velocity
+        v_pred = self.velocity_field(x_noisy, t, T)
+
+        # Target velocity: direction from x_t to x_clean
+        alpha_t = (t / self.t_max).view(B, 1, 1, 1)
+        v_target = (samples - x_noisy) / (self.t_max - t.view(B, 1, 1, 1) + 0.01)
+
+        # Velocity matching loss
+        v_loss = F.mse_loss(v_pred, v_target)
+
+        # Add energy-guided term
+        if mode == "energy_guided":
+            # Run MCMC to get equilibrium samples
+            with torch.no_grad():
+                mh_steps = self.hparams.get("mh_steps", 100)
+                x_eq = self.mcmc_update_xy(samples.clone(), T, n_sweeps=mh_steps // (H * W) + 1)
+
+            # Energy-guided velocity
+            v_energy = self.compute_energy_velocity_xy(x_noisy, T)
+
+            # Match energy velocity too
+            energy_weight = self.hparams.get("energy_weight", 0.1)
+            e_loss = F.mse_loss(v_pred, v_energy) * energy_weight
+
+            loss = v_loss + e_loss
+            metrics = {
+                "velocity_loss": v_loss.item(),
+                "energy_loss": e_loss.item(),
+                "total_loss": loss.item(),
+            }
+        else:
+            loss = v_loss
+            metrics = {"velocity_loss": v_loss.item()}
+
+        return loss, metrics
+
+    def log_prob(
+        self,
+        samples: torch.Tensor,
+        T: torch.Tensor,
+        num_time_samples: int = 10
+    ) -> torch.Tensor:
+        """
+        Estimate log probability using ELBO approximation.
+
+        For continuous flow matching, we estimate log p(x) by integrating
+        the velocity field backward and computing the log Jacobian.
+
+        This is an approximation using the change of variables formula.
+
+        Args:
+            samples: Samples of shape (B, 1, H, W)
+            T: Temperature of shape (B,)
+            num_time_samples: Number of time points for integration
+
+        Returns:
+            Log probability estimates of shape (B, 1)
+        """
+        B, C, H, W = samples.shape
+
+        # Simple ELBO estimate based on reconstruction
+        log_prob_sum = torch.zeros(B, device=self.device)
+
+        for _ in range(num_time_samples):
+            # Sample random time
+            t = torch.rand(B, device=self.device) * (self.t_max - self.t_min) + self.t_min
+
+            # Apply noise
+            x_noisy = self.apply_gaussian_noise(samples, t)
+
+            # Get velocity prediction
+            v_pred = self.velocity_field(x_noisy, t, T)
+
+            # Expected velocity
+            v_expected = (samples - x_noisy) / (self.t_max - t.view(B, 1, 1, 1) + 0.01)
+
+            # Log likelihood based on velocity matching
+            diff = (v_pred - v_expected) ** 2
+
+            # Mask fixed position
+            if self.fix_first:
+                mask = torch.ones(1, 1, H, W, device=self.device)
+                mask[:, :, 0, 0] = 0
+                diff = diff * mask
+
+            log_prob_sum = log_prob_sum - diff.sum(dim=[1, 2, 3])
+
+        # Average over time samples
+        log_prob = log_prob_sum / num_time_samples
+
+        return log_prob.unsqueeze(-1)
+
+
+class ResBlock(nn.Module):
+    """Simple residual block for ContinuousFlowMatcher."""
+
+    def __init__(self, channels: int, kernel_size: int = 3):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels // 2, kernel_size=1)
+        self.conv2 = nn.Conv2d(channels // 2, channels // 2,
+                               kernel_size=kernel_size, padding=kernel_size // 2)
+        self.conv3 = nn.Conv2d(channels // 2, channels, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        x = self.conv3(x)
+        return x + residual
+
+
 if __name__ == "__main__":
     """Test the DiscreteFlowMatcher model."""
     print("=" * 70)

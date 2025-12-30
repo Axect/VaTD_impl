@@ -1,0 +1,89 @@
+# v0.15: Continuous Flow Matching for 2D XY Model
+#
+# Key differences from v0.14 (Ising DFM):
+# - Continuous angles theta in [-pi, pi] instead of discrete spins {-1, +1}
+# - Gaussian probability path instead of Dirichlet
+# - Von Mises prior distribution
+# - Network outputs velocity (1 channel) instead of logits (2 channels)
+# - Metropolis-Hastings MCMC for equilibration (no cluster algorithm for XY)
+#
+# Physics:
+# - XY Model: E = -J * sum_{<ij>} cos(theta_i - theta_j)
+# - BKT transition: T_BKT ~ 0.89 (topological phase transition)
+# - No exact partition function available (use MCMC reference for validation)
+#
+# Training approach:
+# - Energy-guided: Velocity matching toward mean-field + Boltzmann targets
+# - Curriculum learning: Start above BKT, gradually lower temperature
+
+project: XY_CFM_v0.15
+device: cuda:0
+net: model_dfm.ContinuousFlowMatcher
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 256
+seeds: [42]
+
+net_config:
+  # Model type indicator
+  model_type: xy
+
+  # Lattice configuration
+  size: 16
+  fix_first: true        # Fix theta_0 = 0 for symmetry breaking
+  J: 1.0                  # Coupling constant
+
+  # Von Mises prior parameters
+  kappa_0: 1.0            # Base concentration (kappa = kappa_0 / T)
+
+  # Temperature sampling configuration
+  # BKT transition at T ~ 0.89, so we sample around this
+  batch_size: 64          # Samples per temperature
+  num_beta: 4             # Number of temperature samples per step
+  beta_min: 0.5           # 1/T_max (T_max = 2.0) - above BKT
+  beta_max: 2.0           # 1/T_min (T_min = 0.5) - below BKT
+
+  # Flow Matching Parameters
+  num_flow_steps: 100     # Euler integration steps
+  t_max: 10.0             # Maximum integration time
+  t_min: 0.01             # Avoid t=0 singularity
+  time_dim: 64            # Time embedding dimension
+
+  # Training Mode
+  training_mode: energy_guided  # Energy-guided velocity matching
+  energy_weight: 0.1            # Weight for energy-guided velocity loss
+
+  # Metropolis-Hastings Equilibration
+  # No cluster algorithm for XY model, use pure MH
+  use_cluster: false
+  mh_steps: 200           # Metropolis sweeps per equilibration
+
+  accumulation_steps: 8   # Gradient accumulation steps per epoch
+
+  # 2-Phase Curriculum Learning
+  # Phase 1: Stay above BKT transition for easier learning
+  # Phase 2: Gradually extend to lower temperatures
+  curriculum_enabled: true
+  phase1_epochs: 75       # High temp learning
+  phase1_beta_max: 0.8    # T_min = 1.25 (above BKT ~ 0.89)
+  phase2_epochs: 100      # Gradual expansion to full range
+
+  # Model architecture
+  hidden_channels: 64     # ResNet block width
+  hidden_conv_layers: 5   # Number of residual blocks
+  hidden_kernel_size: 3   # Spatial kernel size
+  hidden_width: 128       # FC layer width
+  hidden_fc_layers: 2     # Number of FC layers
+
+optimizer_config:
+  lr: 2.e-1
+  eps: 1.e-10
+
+scheduler_config:
+  upper_bound: 350        # Slightly larger than epochs
+  max_iter: 300           # Same as epochs
+  infimum_lr: 1.e-6       # Final learning rate
+
+early_stopping_config:
+  enabled: false
