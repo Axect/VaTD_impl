@@ -128,6 +128,10 @@ class MaskedResConv2D(nn.Module):
         hidden_convs = []
 
         for i in range(hidden_conv_layers):
+            # Dilation increases exponentially: 1, 2, 4, 8, 16...
+            # Reset if it gets too large (optional, but good for stability)
+            dilation = 2**(i % 4)  # Cycle dilations 1, 2, 4, 8
+            
             hidden_convs.append(
                 nn.Sequential(
                     MaskedConv2D(
@@ -145,7 +149,8 @@ class MaskedResConv2D(nn.Module):
                         in_channels=hidden_channels,
                         out_channels=hidden_channels,
                         kernel_size=hidden_kernel_size,
-                        padding=(hidden_kernel_size - 1) // 2,
+                        padding=(hidden_kernel_size - 1) * dilation // 2, # Adjust padding for dilation
+                        dilation=dilation,
                         mask_type="B",
                         data_channels=channel,
                         augment_channels=augment_channels,

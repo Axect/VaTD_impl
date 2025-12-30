@@ -135,6 +135,28 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+def augment_samples(samples):
+    """
+    Apply random rotations and flips to samples for symmetry augmentation.
+    Ising model on square lattice is invariant under D4 group.
+
+    Args:
+        samples: (B, 1, H, W) tensor
+    Returns:
+        augmented samples
+    """
+    # Random rotation (0, 90, 180, 270 degrees)
+    k = random.randint(0, 3)
+    if k > 0:
+        samples = torch.rot90(samples, k, dims=[2, 3])
+
+    # Random flip (horizontal)
+    if random.random() < 0.5:
+        samples = torch.flip(samples, dims=[3])
+
+    return samples
+
+
 class EarlyStopping:
     def __init__(self, patience=10, mode="min", min_delta=0):
         self.patience = patience
@@ -230,6 +252,10 @@ class Trainer:
         # Swendsen-Wang parameters (Theoretically sufficient)
         self.mcmc_sw_sweeps = getattr(model, "hparams", {}).get("mcmc_sw_sweeps", 10)
         self.mcmc_mh_steps = getattr(model, "hparams", {}).get("mcmc_mh_steps", 0)  # Default to 0 for SW-only
+
+        # MCMC Replay Buffer (Persistent states)
+        self.mcmc_buffer = None
+        self.mcmc_betas = None
 
         # Curriculum learning settings
         # 2-Phase curriculum: High temp only → Gradual expansion to full range
@@ -657,23 +683,53 @@ class Trainer:
                     step_log_prob += log_prob_i.mean().item() / num_beta
                     step_energy += energy_i.mean().item() / num_beta
 
-            # Step 3: MCMC Correction (Kalman Filter Update)
-            # Only run periodically
+            # Step 3: MCMC Correction (Replay Buffer + Symmetry Augmentation)
             if self.mcmc_enabled and self.current_epoch % self.mcmc_freq == 0:
                 with torch.no_grad():
-                    fix_first_flag = (self.model.fix_first is not None)
+                    # Initialize buffer if needed
+                    if self.mcmc_buffer is None:
+                        # Create fixed betas for MCMC buffer covering the full training range
+                        # We use a fixed grid to ensure we guide the model across all temperatures
+                        self.mcmc_betas = generate_fixed_betas(
+                             self.model.beta_min, self.model.beta_max, num_beta
+                        ).to(self.device)
+                        
+                        # Initialize with random samples
+                        # Shape: (num_beta * batch_size, 1, H, W)
+                        total_buffer_size = num_beta * batch_size
+                        H, W = self.model.size
+                        self.mcmc_buffer = torch.randint(
+                            0, 2, (total_buffer_size, 1, H, W), 
+                            device=self.device
+                        ).float() * 2 - 1
+                        
+                        # Fix first spin if needed
+                        if self.model.fix_first is not None:
+                             self.mcmc_buffer[:, 0, 0, 0] = self.model.fix_first
+
+                    # Expand betas for buffer
+                    # mcmc_betas: (num_beta,) -> (num_beta * batch_size,)
+                    T_buffer = (1.0 / self.mcmc_betas).repeat_interleave(batch_size)
                     
-                    # Use Swendsen-Wang (with optional MH if n_mh_steps > 0)
-                    mcmc_samples = mcmc_update(
-                        samples, T_expanded,
+                    # Update buffer with Swendsen-Wang
+                    # We run this on the *persistent* buffer
+                    fix_first_flag = (self.model.fix_first is not None)
+                    self.mcmc_buffer = mcmc_update(
+                        self.mcmc_buffer, T_buffer,
                         n_sw_sweeps=self.mcmc_sw_sweeps,
                         n_mh_steps=self.mcmc_mh_steps,
                         fix_first=fix_first_flag
                     )
+                    
+                    # Get targets from buffer
+                    mcmc_targets = self.mcmc_buffer.clone()
+
+                # Apply Symmetry Augmentation (Rotation/Flip)
+                # This forces the model to learn isotropic filters despite causal masking
+                mcmc_targets = augment_samples(mcmc_targets)
 
                 # Teacher Forcing: Maximize likelihood of MCMC samples
-                # Treat MCMC samples as "ground truth"
-                log_prob_mcmc = self.model.log_prob(mcmc_samples, T=T_expanded)
+                log_prob_mcmc = self.model.log_prob(mcmc_targets, T=T_buffer)
                 loss_mle = -log_prob_mcmc.mean()
 
                 # Backward MLE loss with weight
