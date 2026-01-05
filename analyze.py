@@ -184,6 +184,7 @@ def compute_thermodynamic_quantities(
     T_max=None,
     skip_model_ad=None,
     verbose=True,
+    ad_mini_batch_size=50,
 ):
     """
     Compute thermodynamic quantities using sampling and automatic differentiation.
@@ -213,6 +214,7 @@ def compute_thermodynamic_quantities(
         T_max: Maximum temperature (default: 1.3*Tc)
         skip_model_ad: Skip model AD computation (default: True for DFM, False for PixelCNN)
         verbose: Print progress information
+        ad_mini_batch_size: Mini-batch size for AD computation to avoid OOM (default: 50)
 
     Returns:
         pandas.DataFrame with columns:
@@ -304,29 +306,58 @@ def compute_thermodynamic_quantities(
             E_model_AD = float('nan')
             Cv_model_AD = float('nan')
         else:
+            # Use mini-batching to avoid OOM during AD computation
             with torch.no_grad():
                 samples_for_ad = model.sample(batch_size=batch_size, T=T_tensor)
                 energies_for_ad = energy_fn(samples_for_ad).squeeze()
 
-            # Compute log_prob with gradient tracking on beta
-            beta_model = torch.tensor(
-                beta, dtype=torch.float32, device=device, requires_grad=True
-            )
-            T_model = 1.0 / beta_model
-            T_expanded = T_model.expand(batch_size)
+            # Process in mini-batches to avoid OOM
+            num_mini_batches = (batch_size + ad_mini_batch_size - 1) // ad_mini_batch_size
+            grad_loss_sum = 0.0
+            grad2_loss_sum = 0.0
+            total_samples = 0
 
-            # samples_for_ad is fixed, but T_expanded carries gradient
-            log_prob_ad = model.log_prob(samples_for_ad, T=T_expanded)
-            loss_model = (log_prob_ad + beta_model * energies_for_ad.unsqueeze(-1)).mean()
+            for mb_idx in range(num_mini_batches):
+                start_idx = mb_idx * ad_mini_batch_size
+                end_idx = min((mb_idx + 1) * ad_mini_batch_size, batch_size)
+                mb_size = end_idx - start_idx
 
-            grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
-            E_model_AD = grad_loss.item()
+                # Get mini-batch data
+                mb_samples = samples_for_ad[start_idx:end_idx]
+                mb_energies = energies_for_ad[start_idx:end_idx]
 
-            # Second derivative for heat capacity
-            # Note: loss ≈ -log Z, so d²(log Z)/dβ² ≈ -d²(loss)/dβ²
-            # Therefore Cv = β² × d²(log Z)/dβ² = -β² × d²(loss)/dβ²
-            grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
-            Cv_model_AD = -(beta**2) * grad2_loss.item()
+                # Compute log_prob with gradient tracking on beta
+                beta_model = torch.tensor(
+                    beta, dtype=torch.float32, device=device, requires_grad=True
+                )
+                T_model = 1.0 / beta_model
+                T_expanded = T_model.expand(mb_size)
+
+                # samples are fixed, but T_expanded carries gradient
+                log_prob_ad = model.log_prob(mb_samples, T=T_expanded)
+                loss_model = (log_prob_ad + beta_model * mb_energies.unsqueeze(-1)).mean()
+
+                grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
+                grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
+
+                # Accumulate weighted by mini-batch size
+                grad_loss_sum += grad_loss.item() * mb_size
+                grad2_loss_sum += grad2_loss.item() * mb_size
+                total_samples += mb_size
+
+                # Clear CUDA cache to free memory
+                del log_prob_ad, loss_model, grad_loss, grad2_loss, beta_model
+                if device != "cpu":
+                    torch.cuda.empty_cache()
+
+            # Compute weighted average
+            E_model_AD = grad_loss_sum / total_samples
+            Cv_model_AD = -(beta**2) * (grad2_loss_sum / total_samples)
+
+            # Final cleanup
+            del samples_for_ad, energies_for_ad
+            if device != "cpu":
+                torch.cuda.empty_cache()
 
         # Collect results
         results.append(
@@ -783,6 +814,50 @@ def plot_thermodynamic_errors(
     return output_path
 
 
+def select_tests(console) -> list[str]:
+    """
+    Interactive test selection using beaupy.
+
+    Returns:
+        list of selected test keys
+    """
+    test_options = [
+        ("test1", "Test 1: Critical Temperature Range (log Z comparison)"),
+        ("test2", "Test 2: Validation Range (extrapolation test)"),
+        ("test3", "Test 3: Lattice Visualization (Validation Range)"),
+        ("test4", "Test 4: Lattice Visualization (Critical Range)"),
+        ("test5", "Test 5: Thermodynamic Quantities (Critical Range)"),
+        ("test6", "Test 6: Thermodynamic Quantities (Full Validation Range)"),
+    ]
+
+    console.print("\n[bold cyan]Select tests to run:[/bold cyan]")
+    console.print("[dim](Use Space to select/deselect, Enter to confirm)[/dim]\n")
+
+    # Display options
+    display_options = [opt[1] for opt in test_options]
+
+    # Use beaupy for multi-select (all selected by default)
+    selected_indices = beaupy.select_multiple(
+        display_options,
+        tick_character="✓",
+        ticked_indices=list(range(len(display_options))),  # All selected by default
+        minimal_count=1,
+        return_indices=True,
+    )
+
+    if selected_indices is None:
+        console.print("[yellow]No tests selected. Exiting.[/yellow]")
+        return []
+
+    selected_keys = [test_options[i][0] for i in selected_indices]
+
+    console.print("\n[bold]Selected tests:[/bold]")
+    for i in selected_indices:
+        console.print(f"  [green]✓[/green] {test_options[i][1]}")
+
+    return selected_keys
+
+
 def main():
     console = Console()
     console.print("[bold green]Testing Trained Model on Ising System[/bold green]")
@@ -799,6 +874,11 @@ def main():
 
     console.print("Select a device:")
     device = select_device()
+
+    # Interactive test selection
+    selected_tests = select_tests(console)
+    if not selected_tests:
+        return
 
     # Load model
     console.print(f"\n[bold]Loading model:[/bold] {project}/{group_name}/{seed}")
@@ -857,366 +937,374 @@ def main():
         f"Training range: T = [{T_train_min:.4f}, {T_train_max:.4f}] (β = [{train_beta_min:.4f}, {train_beta_max:.4f}])"
     )
 
+    # Output directory for results
+    output_dir = f"runs/{project}/{group_name}"
+
     # ========================================
     # Test 1: Critical Temperature Range
     # ========================================
-    console.print(
-        "\n[bold cyan]Test 1: Critical Temperature Range (0.7*Tc to 1.3*Tc)[/bold cyan]"
-    )
-    df_critical = test_model_ising(
-        model, energy_fn, L, device=device, num_temps=20, batch_size=test_batch_size
-    )
+    if "test1" in selected_tests:
+        console.print(
+            "\n[bold cyan]Test 1: Critical Temperature Range (0.7*Tc to 1.3*Tc)[/bold cyan]"
+        )
+        df_critical = test_model_ising(
+            model, energy_fn, L, device=device, num_temps=20, batch_size=test_batch_size
+        )
 
-    # Display results for critical range
-    console.print("\n" + "=" * 70)
-    console.print("CRITICAL RANGE RESULTS")
-    console.print("=" * 70)
-    console.print(df_critical.to_string(index=False))
-    console.print("=" * 70)
+        # Display results for critical range
+        console.print("\n" + "=" * 70)
+        console.print("CRITICAL RANGE RESULTS")
+        console.print("=" * 70)
+        console.print(df_critical.to_string(index=False))
+        console.print("=" * 70)
 
-    # Summary statistics for critical range
-    idx_min_error = df_critical["abs_error"].idxmin()
-    idx_max_error = df_critical["abs_error"].idxmax()
+        # Summary statistics for critical range
+        idx_min_error = df_critical["abs_error"].idxmin()
+        idx_max_error = df_critical["abs_error"].idxmax()
 
-    console.print(f"\n[bold green]Best accuracy:[/bold green]")
-    console.print(
-        f"  T = {df_critical.loc[idx_min_error, 'T']:.4f} (T/Tc = {df_critical.loc[idx_min_error, 'T/Tc']:.3f})"
-    )
-    console.print(f"  |Error| = {df_critical.loc[idx_min_error, 'abs_error']:.6f}")
+        console.print(f"\n[bold green]Best accuracy:[/bold green]")
+        console.print(
+            f"  T = {df_critical.loc[idx_min_error, 'T']:.4f} (T/Tc = {df_critical.loc[idx_min_error, 'T/Tc']:.3f})"
+        )
+        console.print(f"  |Error| = {df_critical.loc[idx_min_error, 'abs_error']:.6f}")
 
-    console.print(f"\n[bold red]Worst accuracy:[/bold red]")
-    console.print(
-        f"  T = {df_critical.loc[idx_max_error, 'T']:.4f} (T/Tc = {df_critical.loc[idx_max_error, 'T/Tc']:.3f})"
-    )
-    console.print(f"  |Error| = {df_critical.loc[idx_max_error, 'abs_error']:.6f}")
+        console.print(f"\n[bold red]Worst accuracy:[/bold red]")
+        console.print(
+            f"  T = {df_critical.loc[idx_max_error, 'T']:.4f} (T/Tc = {df_critical.loc[idx_max_error, 'T/Tc']:.3f})"
+        )
+        console.print(f"  |Error| = {df_critical.loc[idx_max_error, 'abs_error']:.6f}")
 
-    # Error at critical temperature
-    idx_critical_temp = (df_critical["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
-    console.print(
-        f"\n[bold yellow]At critical temperature Tc = {CRITICAL_TEMPERATURE:.4f}:[/bold yellow]"
-    )
-    console.print(f"  T = {df_critical.loc[idx_critical_temp, 'T']:.4f}")
-    console.print(
-        f"  Log Z Error = {df_critical.loc[idx_critical_temp, 'logz_error']:.6f}"
-    )
-    console.print(f"  |Error| = {df_critical.loc[idx_critical_temp, 'abs_error']:.6f}")
+        # Error at critical temperature
+        idx_critical_temp = (df_critical["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
+        console.print(
+            f"\n[bold yellow]At critical temperature Tc = {CRITICAL_TEMPERATURE:.4f}:[/bold yellow]"
+        )
+        console.print(f"  T = {df_critical.loc[idx_critical_temp, 'T']:.4f}")
+        console.print(
+            f"  Log Z Error = {df_critical.loc[idx_critical_temp, 'logz_error']:.6f}"
+        )
+        console.print(f"  |Error| = {df_critical.loc[idx_critical_temp, 'abs_error']:.6f}")
 
-    # Generate plots for critical range
-    console.print("\n[bold]Generating plots for critical range...[/bold]")
-    plot_path_critical = plot_model_vs_exact(
-        df_critical,
-        title_suffix=" (Critical Range)",
-        filename="model_test_critical.png",
-    )
-    console.print(f"[green]✓[/green] Saved plot to {plot_path_critical}")
+        # Generate plots for critical range
+        console.print("\n[bold]Generating plots for critical range...[/bold]")
+        plot_path_critical = plot_model_vs_exact(
+            df_critical,
+            title_suffix=" (Critical Range)",
+            filename="model_test_critical.png",
+        )
+        console.print(f"[green]✓[/green] Saved plot to {plot_path_critical}")
 
-    # Save results for critical range
-    output_dir = f"runs/{project}/{group_name}"
-    output_file_critical = f"{output_dir}/test_results_critical_{seed}.csv"
-    df_critical.to_csv(output_file_critical, index=False)
-    console.print(f"[green]✓[/green] Saved results to {output_file_critical}")
+        # Save results for critical range
+        output_file_critical = f"{output_dir}/test_results_critical_{seed}.csv"
+        df_critical.to_csv(output_file_critical, index=False)
+        console.print(f"[green]✓[/green] Saved results to {output_file_critical}")
 
     # ========================================
     # Test 2: Validation Range
     # ========================================
-    console.print("\n[bold cyan]Test 2: Validation Range[/bold cyan]")
-    df_validation = test_model_ising(
-        model,
-        energy_fn,
-        L,
-        device=device,
-        num_temps=20,
-        batch_size=test_batch_size,
-        T_min=T_val_min,
-        T_max=T_val_max,
-    )
+    if "test2" in selected_tests:
+        console.print("\n[bold cyan]Test 2: Validation Range[/bold cyan]")
+        df_validation = test_model_ising(
+            model,
+            energy_fn,
+            L,
+            device=device,
+            num_temps=20,
+            batch_size=test_batch_size,
+            T_min=T_val_min,
+            T_max=T_val_max,
+        )
 
-    # Display results for validation range
-    console.print("\n" + "=" * 70)
-    console.print("VALIDATION RANGE RESULTS")
-    console.print("=" * 70)
-    console.print(df_validation.to_string(index=False))
-    console.print("=" * 70)
+        # Display results for validation range
+        console.print("\n" + "=" * 70)
+        console.print("VALIDATION RANGE RESULTS")
+        console.print("=" * 70)
+        console.print(df_validation.to_string(index=False))
+        console.print("=" * 70)
 
-    # Summary statistics for validation range
-    idx_min_error_val = df_validation["abs_error"].idxmin()
-    idx_max_error_val = df_validation["abs_error"].idxmax()
+        # Summary statistics for validation range
+        idx_min_error_val = df_validation["abs_error"].idxmin()
+        idx_max_error_val = df_validation["abs_error"].idxmax()
 
-    console.print(f"\n[bold green]Best accuracy:[/bold green]")
-    console.print(
-        f"  T = {df_validation.loc[idx_min_error_val, 'T']:.4f} (T/Tc = {df_validation.loc[idx_min_error_val, 'T/Tc']:.3f})"
-    )
-    console.print(
-        f"  |Error| = {df_validation.loc[idx_min_error_val, 'abs_error']:.6f}"
-    )
-
-    console.print(f"\n[bold red]Worst accuracy:[/bold red]")
-    console.print(
-        f"  T = {df_validation.loc[idx_max_error_val, 'T']:.4f} (T/Tc = {df_validation.loc[idx_max_error_val, 'T/Tc']:.3f})"
-    )
-    console.print(
-        f"  |Error| = {df_validation.loc[idx_max_error_val, 'abs_error']:.6f}"
-    )
-
-    # Error at critical temperature (if in range)
-    if T_val_min <= CRITICAL_TEMPERATURE <= T_val_max:
-        idx_critical_temp_val = (
-            (df_validation["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
+        console.print(f"\n[bold green]Best accuracy:[/bold green]")
+        console.print(
+            f"  T = {df_validation.loc[idx_min_error_val, 'T']:.4f} (T/Tc = {df_validation.loc[idx_min_error_val, 'T/Tc']:.3f})"
         )
         console.print(
-            f"\n[bold yellow]At critical temperature Tc = {CRITICAL_TEMPERATURE:.4f}:[/bold yellow]"
-        )
-        console.print(f"  T = {df_validation.loc[idx_critical_temp_val, 'T']:.4f}")
-        console.print(
-            f"  Log Z Error = {df_validation.loc[idx_critical_temp_val, 'logz_error']:.6f}"
-        )
-        console.print(
-            f"  |Error| = {df_validation.loc[idx_critical_temp_val, 'abs_error']:.6f}"
+            f"  |Error| = {df_validation.loc[idx_min_error_val, 'abs_error']:.6f}"
         )
 
-    # Generate plots for validation range
-    console.print("\n[bold]Generating plots for validation range...[/bold]")
-    plot_path_validation = plot_model_vs_exact(
-        df_validation,
-        title_suffix=" (Validation Range)",
-        filename="model_test_validation.png",
-    )
-    console.print(f"[green]✓[/green] Saved plot to {plot_path_validation}")
+        console.print(f"\n[bold red]Worst accuracy:[/bold red]")
+        console.print(
+            f"  T = {df_validation.loc[idx_max_error_val, 'T']:.4f} (T/Tc = {df_validation.loc[idx_max_error_val, 'T/Tc']:.3f})"
+        )
+        console.print(
+            f"  |Error| = {df_validation.loc[idx_max_error_val, 'abs_error']:.6f}"
+        )
 
-    # Save results for validation range
-    output_file_validation = f"{output_dir}/test_results_validation_{seed}.csv"
-    df_validation.to_csv(output_file_validation, index=False)
-    console.print(f"[green]✓[/green] Saved results to {output_file_validation}")
+        # Error at critical temperature (if in range)
+        if T_val_min <= CRITICAL_TEMPERATURE <= T_val_max:
+            idx_critical_temp_val = (
+                (df_validation["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
+            )
+            console.print(
+                f"\n[bold yellow]At critical temperature Tc = {CRITICAL_TEMPERATURE:.4f}:[/bold yellow]"
+            )
+            console.print(f"  T = {df_validation.loc[idx_critical_temp_val, 'T']:.4f}")
+            console.print(
+                f"  Log Z Error = {df_validation.loc[idx_critical_temp_val, 'logz_error']:.6f}"
+            )
+            console.print(
+                f"  |Error| = {df_validation.loc[idx_critical_temp_val, 'abs_error']:.6f}"
+            )
+
+        # Generate plots for validation range
+        console.print("\n[bold]Generating plots for validation range...[/bold]")
+        plot_path_validation = plot_model_vs_exact(
+            df_validation,
+            title_suffix=" (Validation Range)",
+            filename="model_test_validation.png",
+        )
+        console.print(f"[green]✓[/green] Saved plot to {plot_path_validation}")
+
+        # Save results for validation range
+        output_file_validation = f"{output_dir}/test_results_validation_{seed}.csv"
+        df_validation.to_csv(output_file_validation, index=False)
+        console.print(f"[green]✓[/green] Saved results to {output_file_validation}")
 
     # ========================================
     # Test 3: Visualize Sample Lattices (Validation Range)
     # ========================================
-    console.print(
-        "\n[bold cyan]Test 3: Visualizing Sample Lattices (Validation Range)[/bold cyan]"
-    )
+    if "test3" in selected_tests:
+        console.print(
+            "\n[bold cyan]Test 3: Visualizing Sample Lattices (Validation Range)[/bold cyan]"
+        )
 
-    # Select temperatures across validation range
-    num_temp_samples = 6
-    temperatures_val = np.linspace(T_val_min, T_val_max, num_temp_samples)
+        # Select temperatures across validation range
+        num_temp_samples = 6
+        temperatures_val = np.linspace(T_val_min, T_val_max, num_temp_samples)
 
-    console.print(
-        f"Generating lattice samples at {num_temp_samples} temperatures across validation range:"
-    )
-    for T in temperatures_val:
-        console.print(f"  T = {T:.4f} (T/Tc = {T/CRITICAL_TEMPERATURE:.2f})")
+        console.print(
+            f"Generating lattice samples at {num_temp_samples} temperatures across validation range:"
+        )
+        for T in temperatures_val:
+            console.print(f"  T = {T:.4f} (T/Tc = {T/CRITICAL_TEMPERATURE:.2f})")
 
-    console.print("\n[bold]Generating lattice visualizations...[/bold]")
-    lattice_plot_path_val = visualize_lattice_samples(
-        model,
-        L,
-        temperatures_val,
-        device=device,
-        num_samples=4,
-        output_dir="figs",
-        filename=f"lattice_samples_validation_{seed}.png",
-    )
-    console.print(
-        f"[green]✓[/green] Saved validation range lattice samples to {lattice_plot_path_val}"
-    )
+        console.print("\n[bold]Generating lattice visualizations...[/bold]")
+        lattice_plot_path_val = visualize_lattice_samples(
+            model,
+            L,
+            temperatures_val,
+            device=device,
+            num_samples=4,
+            output_dir="figs",
+            filename=f"lattice_samples_validation_{seed}.png",
+        )
+        console.print(
+            f"[green]✓[/green] Saved validation range lattice samples to {lattice_plot_path_val}"
+        )
 
     # ========================================
     # Test 4: Visualize Sample Lattices (Critical Range)
     # ========================================
-    console.print(
-        "\n[bold cyan]Test 4: Visualizing Sample Lattices (Critical Range)[/bold cyan]"
-    )
+    if "test4" in selected_tests:
+        console.print(
+            "\n[bold cyan]Test 4: Visualizing Sample Lattices (Critical Range)[/bold cyan]"
+        )
 
-    # Select temperatures near critical temperature
-    T_low = 0.8 * CRITICAL_TEMPERATURE
-    T_critical = CRITICAL_TEMPERATURE
-    T_high = 1.2 * CRITICAL_TEMPERATURE
-    temperatures_critical = [T_low, T_critical, T_high]
+        # Select temperatures near critical temperature
+        T_low = 0.8 * CRITICAL_TEMPERATURE
+        T_critical = CRITICAL_TEMPERATURE
+        T_high = 1.2 * CRITICAL_TEMPERATURE
+        temperatures_critical = [T_low, T_critical, T_high]
 
-    console.print(f"Generating lattice samples at temperatures near Tc:")
-    console.print(
-        f"  Low:      T = {T_low:.4f} (T/Tc = {T_low/CRITICAL_TEMPERATURE:.2f})"
-    )
-    console.print(
-        f"  Critical: T = {T_critical:.4f} (T/Tc = {T_critical/CRITICAL_TEMPERATURE:.2f})"
-    )
-    console.print(
-        f"  High:     T = {T_high:.4f} (T/Tc = {T_high/CRITICAL_TEMPERATURE:.2f})"
-    )
+        console.print(f"Generating lattice samples at temperatures near Tc:")
+        console.print(
+            f"  Low:      T = {T_low:.4f} (T/Tc = {T_low/CRITICAL_TEMPERATURE:.2f})"
+        )
+        console.print(
+            f"  Critical: T = {T_critical:.4f} (T/Tc = {T_critical/CRITICAL_TEMPERATURE:.2f})"
+        )
+        console.print(
+            f"  High:     T = {T_high:.4f} (T/Tc = {T_high/CRITICAL_TEMPERATURE:.2f})"
+        )
 
-    console.print("\n[bold]Generating lattice visualizations...[/bold]")
-    lattice_plot_path_critical = visualize_lattice_samples(
-        model,
-        L,
-        temperatures_critical,
-        device=device,
-        num_samples=4,
-        output_dir="figs",
-        filename=f"lattice_samples_critical_{seed}.png",
-    )
-    console.print(
-        f"[green]✓[/green] Saved critical range lattice samples to {lattice_plot_path_critical}"
-    )
+        console.print("\n[bold]Generating lattice visualizations...[/bold]")
+        lattice_plot_path_critical = visualize_lattice_samples(
+            model,
+            L,
+            temperatures_critical,
+            device=device,
+            num_samples=4,
+            output_dir="figs",
+            filename=f"lattice_samples_critical_{seed}.png",
+        )
+        console.print(
+            f"[green]✓[/green] Saved critical range lattice samples to {lattice_plot_path_critical}"
+        )
 
     # ========================================
     # Test 5: Thermodynamic Quantities Analysis
     # ========================================
-    console.print(
-        "\n[bold cyan]Test 5: Thermodynamic Quantities Analysis[/bold cyan]"
-    )
-    console.print(
-        "Computing thermodynamic quantities (sampling + automatic differentiation)..."
-    )
+    if "test5" in selected_tests:
+        console.print(
+            "\n[bold cyan]Test 5: Thermodynamic Quantities Analysis[/bold cyan]"
+        )
+        console.print(
+            "Computing thermodynamic quantities (sampling + automatic differentiation)..."
+        )
 
-    df_thermo = compute_thermodynamic_quantities(
-        model,
-        energy_fn,
-        L,
-        device=device,
-        num_temps=20,
-        batch_size=thermo_batch_size,
-        T_min=0.7 * CRITICAL_TEMPERATURE,
-        T_max=1.3 * CRITICAL_TEMPERATURE,
-    )
+        df_thermo = compute_thermodynamic_quantities(
+            model,
+            energy_fn,
+            L,
+            device=device,
+            num_temps=20,
+            batch_size=thermo_batch_size,
+            T_min=0.7 * CRITICAL_TEMPERATURE,
+            T_max=1.3 * CRITICAL_TEMPERATURE,
+        )
 
-    # Display results
-    console.print("\n" + "=" * 80)
-    console.print("THERMODYNAMIC QUANTITIES")
-    console.print("=" * 80)
-    # Show selected columns for readability
-    display_cols = [
-        "T",
-        "T/Tc",
-        "E_sampling",
-        "E_exact_AD",
-        "Cv_sampling",
-        "Cv_exact_AD",
-        "M_sampling",
-        "chi_sampling",
-    ]
-    console.print(df_thermo[display_cols].to_string(index=False))
-    console.print("=" * 80)
+        # Display results
+        console.print("\n" + "=" * 80)
+        console.print("THERMODYNAMIC QUANTITIES")
+        console.print("=" * 80)
+        # Show selected columns for readability
+        display_cols = [
+            "T",
+            "T/Tc",
+            "E_sampling",
+            "E_exact_AD",
+            "Cv_sampling",
+            "Cv_exact_AD",
+            "M_sampling",
+            "chi_sampling",
+        ]
+        console.print(df_thermo[display_cols].to_string(index=False))
+        console.print("=" * 80)
 
-    # Generate plots
-    console.print("\n[bold]Generating thermodynamic quantity plots...[/bold]")
-    thermo_plot_path = plot_thermodynamic_quantities(
-        df_thermo,
-        title_suffix=" (Critical Range)",
-        filename=f"thermodynamic_analysis_{seed}.png",
-    )
-    console.print(f"[green]✓[/green] Saved plot to {thermo_plot_path}")
+        # Generate plots
+        console.print("\n[bold]Generating thermodynamic quantity plots...[/bold]")
+        thermo_plot_path = plot_thermodynamic_quantities(
+            df_thermo,
+            title_suffix=" (Critical Range)",
+            filename=f"thermodynamic_analysis_{seed}.png",
+        )
+        console.print(f"[green]✓[/green] Saved plot to {thermo_plot_path}")
 
-    thermo_error_path = plot_thermodynamic_errors(
-        df_thermo,
-        title_suffix=" (Critical Range)",
-        filename=f"thermodynamic_errors_{seed}.png",
-    )
-    console.print(f"[green]✓[/green] Saved error plot to {thermo_error_path}")
+        thermo_error_path = plot_thermodynamic_errors(
+            df_thermo,
+            title_suffix=" (Critical Range)",
+            filename=f"thermodynamic_errors_{seed}.png",
+        )
+        console.print(f"[green]✓[/green] Saved error plot to {thermo_error_path}")
 
-    # Save results
-    thermo_output_file = f"{output_dir}/thermodynamic_results_{seed}.csv"
-    df_thermo.to_csv(thermo_output_file, index=False)
-    console.print(f"[green]✓[/green] Saved results to {thermo_output_file}")
+        # Save results
+        thermo_output_file = f"{output_dir}/thermodynamic_results_{seed}.csv"
+        df_thermo.to_csv(thermo_output_file, index=False)
+        console.print(f"[green]✓[/green] Saved results to {thermo_output_file}")
 
-    # Summary statistics at critical temperature
-    idx_tc = (df_thermo["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
-    row_tc = df_thermo.loc[idx_tc]
-    console.print(f"\n[bold yellow]Summary at Critical Temperature:[/bold yellow]")
-    console.print(f"  T = {row_tc['T']:.4f} (T/Tc = {row_tc['T/Tc']:.3f})")
-    console.print(
-        f"  Energy: Sampling={row_tc['E_sampling']:.4f}, "
-        f"Exact AD={row_tc['E_exact_AD']:.4f}, "
-        f"Model AD={row_tc['E_model_AD']:.4f}"
-    )
-    console.print(
-        f"  Heat Capacity: Sampling={row_tc['Cv_sampling']:.4f}, "
-        f"Exact AD={row_tc['Cv_exact_AD']:.4f}, "
-        f"Model AD={row_tc['Cv_model_AD']:.4f}"
-    )
-    console.print(f"  Magnetization: {row_tc['M_sampling']:.4f}")
-    console.print(f"  Susceptibility: {row_tc['chi_sampling']:.4f}")
+        # Summary statistics at critical temperature
+        idx_tc = (df_thermo["T"] - CRITICAL_TEMPERATURE).abs().idxmin()
+        row_tc = df_thermo.loc[idx_tc]
+        console.print(f"\n[bold yellow]Summary at Critical Temperature:[/bold yellow]")
+        console.print(f"  T = {row_tc['T']:.4f} (T/Tc = {row_tc['T/Tc']:.3f})")
+        console.print(
+            f"  Energy: Sampling={row_tc['E_sampling']:.4f}, "
+            f"Exact AD={row_tc['E_exact_AD']:.4f}, "
+            f"Model AD={row_tc['E_model_AD']:.4f}"
+        )
+        console.print(
+            f"  Heat Capacity: Sampling={row_tc['Cv_sampling']:.4f}, "
+            f"Exact AD={row_tc['Cv_exact_AD']:.4f}, "
+            f"Model AD={row_tc['Cv_model_AD']:.4f}"
+        )
+        console.print(f"  Magnetization: {row_tc['M_sampling']:.4f}")
+        console.print(f"  Susceptibility: {row_tc['chi_sampling']:.4f}")
 
     # ========================================
     # Test 6: Thermodynamic Quantities (Full Validation Range)
     # ========================================
-    console.print(
-        "\n[bold cyan]Test 6: Thermodynamic Quantities (Full Validation Range)[/bold cyan]"
-    )
-    console.print(
-        f"Computing thermodynamic quantities for T = [{T_val_min:.4f}, {T_val_max:.4f}]..."
-    )
+    if "test6" in selected_tests:
+        console.print(
+            "\n[bold cyan]Test 6: Thermodynamic Quantities (Full Validation Range)[/bold cyan]"
+        )
+        console.print(
+            f"Computing thermodynamic quantities for T = [{T_val_min:.4f}, {T_val_max:.4f}]..."
+        )
 
-    df_thermo_full = compute_thermodynamic_quantities(
-        model,
-        energy_fn,
-        L,
-        device=device,
-        num_temps=30,
-        batch_size=thermo_batch_size,
-        T_min=T_val_min,
-        T_max=T_val_max,
-    )
+        df_thermo_full = compute_thermodynamic_quantities(
+            model,
+            energy_fn,
+            L,
+            device=device,
+            num_temps=30,
+            batch_size=thermo_batch_size,
+            T_min=T_val_min,
+            T_max=T_val_max,
+        )
 
-    # Display results
-    console.print("\n" + "=" * 80)
-    console.print("THERMODYNAMIC QUANTITIES (FULL VALIDATION RANGE)")
-    console.print("=" * 80)
-    display_cols = [
-        "T",
-        "T/Tc",
-        "E_sampling",
-        "E_exact_AD",
-        "Cv_sampling",
-        "Cv_exact_AD",
-        "M_sampling",
-        "chi_sampling",
-    ]
-    console.print(df_thermo_full[display_cols].to_string(index=False))
-    console.print("=" * 80)
+        # Display results
+        console.print("\n" + "=" * 80)
+        console.print("THERMODYNAMIC QUANTITIES (FULL VALIDATION RANGE)")
+        console.print("=" * 80)
+        display_cols = [
+            "T",
+            "T/Tc",
+            "E_sampling",
+            "E_exact_AD",
+            "Cv_sampling",
+            "Cv_exact_AD",
+            "M_sampling",
+            "chi_sampling",
+        ]
+        console.print(df_thermo_full[display_cols].to_string(index=False))
+        console.print("=" * 80)
 
-    # Generate plots for full validation range
-    console.print("\n[bold]Generating thermodynamic quantity plots (full range)...[/bold]")
-    thermo_full_plot_path = plot_thermodynamic_quantities(
-        df_thermo_full,
-        title_suffix=" (Full Validation Range)",
-        filename=f"thermodynamic_analysis_full_{seed}.png",
-    )
-    console.print(f"[green]✓[/green] Saved plot to {thermo_full_plot_path}")
+        # Generate plots for full validation range
+        console.print("\n[bold]Generating thermodynamic quantity plots (full range)...[/bold]")
+        thermo_full_plot_path = plot_thermodynamic_quantities(
+            df_thermo_full,
+            title_suffix=" (Full Validation Range)",
+            filename=f"thermodynamic_analysis_full_{seed}.png",
+        )
+        console.print(f"[green]✓[/green] Saved plot to {thermo_full_plot_path}")
 
-    thermo_full_error_path = plot_thermodynamic_errors(
-        df_thermo_full,
-        title_suffix=" (Full Validation Range)",
-        filename=f"thermodynamic_errors_full_{seed}.png",
-    )
-    console.print(f"[green]✓[/green] Saved error plot to {thermo_full_error_path}")
+        thermo_full_error_path = plot_thermodynamic_errors(
+            df_thermo_full,
+            title_suffix=" (Full Validation Range)",
+            filename=f"thermodynamic_errors_full_{seed}.png",
+        )
+        console.print(f"[green]✓[/green] Saved error plot to {thermo_full_error_path}")
 
-    # Save results
-    thermo_full_output_file = f"{output_dir}/thermodynamic_results_full_{seed}.csv"
-    df_thermo_full.to_csv(thermo_full_output_file, index=False)
-    console.print(f"[green]✓[/green] Saved results to {thermo_full_output_file}")
+        # Save results
+        thermo_full_output_file = f"{output_dir}/thermodynamic_results_full_{seed}.csv"
+        df_thermo_full.to_csv(thermo_full_output_file, index=False)
+        console.print(f"[green]✓[/green] Saved results to {thermo_full_output_file}")
 
-    # Summary: compare accuracy at different temperature regions
-    console.print(f"\n[bold yellow]Summary across temperature regions:[/bold yellow]")
+        # Summary: compare accuracy at different temperature regions
+        console.print(f"\n[bold yellow]Summary across temperature regions:[/bold yellow]")
 
-    # Low temperature region (T < 0.8*Tc)
-    low_T_mask = df_thermo_full["T/Tc"] < 0.8
-    if low_T_mask.any():
-        low_T_data = df_thermo_full[low_T_mask]
-        E_error_low = (low_T_data["E_sampling"] - low_T_data["E_exact_AD"]).abs().mean()
-        console.print(f"  Low T (T/Tc < 0.8): Mean |E error| = {E_error_low:.4f}")
+        # Low temperature region (T < 0.8*Tc)
+        low_T_mask = df_thermo_full["T/Tc"] < 0.8
+        if low_T_mask.any():
+            low_T_data = df_thermo_full[low_T_mask]
+            E_error_low = (low_T_data["E_sampling"] - low_T_data["E_exact_AD"]).abs().mean()
+            console.print(f"  Low T (T/Tc < 0.8): Mean |E error| = {E_error_low:.4f}")
 
-    # Critical region (0.8*Tc < T < 1.2*Tc)
-    crit_mask = (df_thermo_full["T/Tc"] >= 0.8) & (df_thermo_full["T/Tc"] <= 1.2)
-    if crit_mask.any():
-        crit_data = df_thermo_full[crit_mask]
-        E_error_crit = (crit_data["E_sampling"] - crit_data["E_exact_AD"]).abs().mean()
-        console.print(f"  Critical (0.8 ≤ T/Tc ≤ 1.2): Mean |E error| = {E_error_crit:.4f}")
+        # Critical region (0.8*Tc < T < 1.2*Tc)
+        crit_mask = (df_thermo_full["T/Tc"] >= 0.8) & (df_thermo_full["T/Tc"] <= 1.2)
+        if crit_mask.any():
+            crit_data = df_thermo_full[crit_mask]
+            E_error_crit = (crit_data["E_sampling"] - crit_data["E_exact_AD"]).abs().mean()
+            console.print(f"  Critical (0.8 ≤ T/Tc ≤ 1.2): Mean |E error| = {E_error_crit:.4f}")
 
-    # High temperature region (T > 1.2*Tc)
-    high_T_mask = df_thermo_full["T/Tc"] > 1.2
-    if high_T_mask.any():
-        high_T_data = df_thermo_full[high_T_mask]
-        E_error_high = (high_T_data["E_sampling"] - high_T_data["E_exact_AD"]).abs().mean()
-        console.print(f"  High T (T/Tc > 1.2): Mean |E error| = {E_error_high:.4f}")
+        # High temperature region (T > 1.2*Tc)
+        high_T_mask = df_thermo_full["T/Tc"] > 1.2
+        if high_T_mask.any():
+            high_T_data = df_thermo_full[high_T_mask]
+            E_error_high = (high_T_data["E_sampling"] - high_T_data["E_exact_AD"]).abs().mean()
+            console.print(f"  High T (T/Tc > 1.2): Mean |E error| = {E_error_high:.4f}")
 
     console.print(
         "\n[bold green]Analysis complete! All results saved to output directory.[/bold green]"
