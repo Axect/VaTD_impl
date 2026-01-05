@@ -1,0 +1,77 @@
+# v0.16 Compact PixelCNN: Reduced RF + Multi-Scale Skip Connections
+#
+# Goal: Improve efficiency while maintaining critical temperature accuracy.
+#
+# Key features:
+# - 4-layer Dilated ResNet (RF: 37x37, reduced from 61x61)
+# - Multi-scale skip connections from layers 1 and 3
+# - ~46% parameter reduction vs v0.15
+# - Expected ~1.5x speedup in training/sampling
+
+project: Ising_VaTD_v0.16
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 500
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 256
+  num_beta: 8
+  beta_min: 0.2
+  beta_max: 1.0
+
+  # Training Mode: Sequential
+  training_mode: sequential
+  accumulation_steps: 64
+
+  # MCMC Guided Training: DISABLED (pure REINFORCE)
+  mcmc_enabled: false
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 100
+  phase1_beta_max: 0.35
+  phase2_epochs: 150
+
+  # Model architecture (Compact Dilated ResNet)
+  kernel_size: 7
+  hidden_channels: 96
+  hidden_conv_layers: 4       # Reduced from 8
+  hidden_kernel_size: 3
+  hidden_width: 128
+  hidden_fc_layers: 2
+
+  # NEW: Explicit dilation pattern (RF = 7 + 2*(1+2+4+8) = 37)
+  dilation_pattern: [1, 2, 4, 8]
+
+  # NEW: Multi-scale skip connections
+  # Layer 1: after d=1,2 (local features, RF~11)
+  # Layer 3: after d=1,2,4,8 (global features, RF~37)
+  skip_connection_indices: [1, 3]
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_ref: 2.27
+  temp_scale_power: 1.0
+  temp_scale_min: 0.1
+  temp_scale_max: 10.0
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 1.e-4
+
+scheduler_config:
+  upper_bound: 600
+  max_iter: 500
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

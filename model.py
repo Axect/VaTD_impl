@@ -107,12 +107,23 @@ class MaskedResConv2D(nn.Module):
         hidden_fc_layers,
         category,
         augment_channels=0,
+        dilation_pattern=None,
+        skip_connection_indices=None,
     ):
+        """
+        Masked Residual Convolutional Network for autoregressive modeling.
 
+        Args:
+            dilation_pattern: List of dilation values (e.g., [1,2,4,8]).
+                              If None, uses default 2**(i % 4) pattern.
+            skip_connection_indices: List of layer indices to collect skip features from.
+                                     Features are fused and added to final conv output.
+        """
         super().__init__()
 
         self.channel = channel
         self.category = category
+        self.hidden_channels = hidden_channels
 
         self.first_conv = MaskedConv2D(
             in_channels=channel + augment_channels,
@@ -128,9 +139,11 @@ class MaskedResConv2D(nn.Module):
         hidden_convs = []
 
         for i in range(hidden_conv_layers):
-            # Dilation increases exponentially: 1, 2, 4, 8, 16...
-            # Reset if it gets too large (optional, but good for stability)
-            dilation = 2**(i % 4)  # Cycle dilations 1, 2, 4, 8
+            # Dilation: use pattern if provided, else default exponential cycle
+            if dilation_pattern is not None:
+                dilation = dilation_pattern[i % len(dilation_pattern)]
+            else:
+                dilation = 2**(i % 4)  # Cycle dilations 1, 2, 4, 8
             
             hidden_convs.append(
                 nn.Sequential(
@@ -207,6 +220,19 @@ class MaskedResConv2D(nn.Module):
             augment_output=False,
         )
 
+        # Skip connection fusion layer
+        # Collects features from specified intermediate layers and fuses them
+        if skip_connection_indices:
+            self.skip_indices = set(skip_connection_indices)
+            num_skips = len(skip_connection_indices)
+            self.skip_fusion = nn.Sequential(
+                nn.Conv2d(2 * hidden_channels * num_skips, 2 * hidden_channels, 1),
+                nn.GELU(),
+            )
+        else:
+            self.skip_indices = None
+            self.skip_fusion = None
+
         # Initialize ALL biases to 0 for symmetric initialization
         # This ensures initial prediction is p=0.5 (unbiased) and prevents
         # systematic bias accumulation through the network
@@ -223,11 +249,23 @@ class MaskedResConv2D(nn.Module):
         x = self.first_conv(x)
         x = F.gelu(x)
 
-        for layer in self.hidden_convs:
+        # Collect skip features from specified layers for multi-scale fusion
+        skip_features = []
+
+        for idx, layer in enumerate(self.hidden_convs):
             # Conv residual block
             tmp = layer(x)
             tmp = F.gelu(tmp)
             x = x + tmp
+
+            # Collect skip connection if this layer is in skip_indices
+            if self.skip_indices is not None and idx in self.skip_indices:
+                skip_features.append(x)
+
+        # Fuse multi-scale skip features and add to output
+        if skip_features and self.skip_fusion is not None:
+            fused = self.skip_fusion(torch.cat(skip_features, dim=1))
+            x = x + fused
 
         x = self.first_fc(x)
         x = F.gelu(x)
@@ -299,6 +337,8 @@ class DiscretePixelCNN(nn.Module):
             hidden_fc_layers=hparams.get("hidden_fc_layers", 2),
             category=self.category,
             augment_channels=self.augment_channels,
+            dilation_pattern=hparams.get("dilation_pattern", None),
+            skip_connection_indices=hparams.get("skip_connection_indices", None),
         )
 
     def to(self, *args, **kwargs):
