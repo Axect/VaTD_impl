@@ -38,7 +38,8 @@ net_config:
   mcmc_enabled: false
 
   # 2-Phase Curriculum Learning
-  curriculum_enabled: true
+  # NOTE: May not be needed for Checkerboard due to Gibbs-style refinement
+  curriculum_enabled: false
   phase1_epochs: 100
   phase1_beta_max: 0.35
   phase2_epochs: 150
