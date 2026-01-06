@@ -131,12 +131,31 @@ class RunConfig:
         return hash_bytes[:length]
 
     def gen_tags(self):
-        return [
-            self.net.split(".")[-1],
-            *[f"{k[0]}={v}" for k, v in self.net_config.items()],
-            self.optimizer.split(".")[-1],
-            self.scheduler.split(".")[-1],
-        ]
+        """
+        Generate concise tags for wandb.
+
+        Tags must be <= 64 characters each.
+        Format: [ModelName, key_param=value (scalars only), Optimizer, Scheduler, hash]
+        """
+        model_name = self.net.split(".")[-1]
+        optimizer_name = self.optimizer.split(".")[-1]
+        scheduler_name = self.scheduler.split(".")[-1]
+        config_hash = self._compute_config_hash(length=8)
+
+        tags = [model_name]
+
+        # Only include scalar values (skip dicts, lists)
+        for k, v in self.net_config.items():
+            if isinstance(v, (int, float, bool, str)) and not isinstance(v, bool):
+                tag = f"{k[:12]}={v}"  # Truncate key to 12 chars
+                if len(tag) <= 64:
+                    tags.append(tag)
+            elif isinstance(v, bool):
+                if v:  # Only add if True
+                    tags.append(k[:20])
+
+        tags.extend([optimizer_name, scheduler_name, f"cfg:{config_hash}"])
+        return tags
 
     def gen_config(self):
         return asdict(self)
