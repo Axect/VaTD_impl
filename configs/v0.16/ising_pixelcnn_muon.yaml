@@ -1,0 +1,89 @@
+# v0.16 PixelCNN with Muon Optimizer
+#
+# Goal: Test Muon optimizer (Newton-Schulz orthogonalization) for faster convergence.
+#
+# Key features:
+# - 4-layer Dilated ResNet (same architecture as compact config)
+# - Multi-scale skip connections
+# - Muon optimizer for 2D weights, AdamW for biases
+#
+# Muon (MomentUm Orthogonalized by Newton-Schulz):
+# - Designed for hidden layer weight matrices
+# - Uses Newton-Schulz iteration for gradient orthogonalization
+# - Demonstrated ~2x computational efficiency vs AdamW in LLM training
+# - Reference: https://github.com/KellerJordan/Muon
+
+project: Ising_VaTD_v0.16
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: muon.MuonWithAdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 250
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Temperature sampling configuration
+  batch_size: 256
+  num_beta: 8
+  beta_min: 0.2
+  beta_max: 1.0
+
+  # Training Mode: Sequential
+  training_mode: sequential
+  accumulation_steps: 64
+
+  # MCMC Guided Training: DISABLED (pure REINFORCE)
+  mcmc_enabled: false
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 100
+  phase1_beta_max: 0.35
+  phase2_epochs: 150
+
+  # Model architecture (Compact Dilated ResNet)
+  kernel_size: 7
+  hidden_channels: 96
+  hidden_conv_layers: 4
+  hidden_kernel_size: 3
+  hidden_width: 128
+  hidden_fc_layers: 2
+
+  # Dilation pattern for exponential receptive field
+  dilation_pattern: [1, 2, 4, 8]
+
+  # Multi-scale skip connections
+  skip_connection_indices: [1, 3]
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_ref: 2.27
+  temp_scale_power: 1.0
+  temp_scale_min: 0.1
+  temp_scale_max: 10.0
+
+optimizer_config:
+  # Muon parameters (for 2D weights)
+  lr: 0.02                    # Muon typically uses higher LR than AdamW
+  momentum: 0.95              # Momentum coefficient
+  nesterov: true              # Nesterov momentum
+  ns_steps: 5                 # Newton-Schulz iterations
+  weight_decay: 0.01          # Decoupled weight decay
+
+  # AdamW parameters (for 1D params: biases, gains)
+  adam_lr: 2.e-3              # AdamW learning rate (lr/10 is a good default)
+  adam_weight_decay: 1.e-4    # AdamW weight decay
+  adam_betas: [0.9, 0.95]     # AdamW beta coefficients
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 250
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false
