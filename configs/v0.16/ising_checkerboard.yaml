@@ -24,8 +24,8 @@ net_config:
   size: 16
 
   # Temperature sampling configuration
-  batch_size: 256
-  num_beta: 8
+  batch_size: 512
+  num_beta: 16
   beta_min: 0.2
   beta_max: 1.0
 
@@ -49,6 +49,11 @@ net_config:
   hidden_width: 128
   hidden_fc_layers: 2
   dilation_pattern: [1, 2, 4, 8]
+
+  # Iterative refinement (Gibbs-style)
+  # num_iterations=1: original 2-step (fastest, may converge slower)
+  # num_iterations=2-4: better convergence, still much faster than PixelCNN
+  num_iterations: 2
 
 optimizer_config:
   lr: 1.e-3

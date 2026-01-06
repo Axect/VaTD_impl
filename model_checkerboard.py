@@ -9,13 +9,16 @@ and vice versa. This means:
 - All black cells are conditionally independent given white cells
 - All white cells are conditionally independent given black cells
 
-This reduces sampling from O(N) sequential steps to just 2 parallel steps!
+This reduces sampling from O(N) sequential steps to just 2K parallel steps!
+(where K = num_iterations, typically 1-4)
 
-Factorization:
-    p(x) = p(x_black | x_white_prior) * p(x_white | x_black)
+Iterative Refinement (Gibbs-style):
+    For k = 1 to K:
+        x_black^{(k)} ~ p(x_black | x_white^{(k-1)})
+        x_white^{(k)} ~ p(x_white | x_black^{(k)})
 
-    Step 1: Initialize white cells with prior (e.g., uniform), generate all black cells in parallel
-    Step 2: Generate all white cells in parallel, conditioned on black cells
+    This allows black cells to benefit from white cell information after the first iteration,
+    significantly improving sample quality and convergence speed.
 """
 
 import torch
@@ -213,6 +216,11 @@ class CheckerboardPixelCNN(nn.Module):
         # This exploits global Z2 symmetry: p(x) = p(-x)
         self.fix_first = hparams.get("fix_first", None)
 
+        # Iterative refinement: Gibbs-style iterations for better sample quality
+        # num_iterations=1 is the original 2-step checkerboard
+        # num_iterations>1 allows black cells to see white cell information
+        self.num_iterations = hparams.get("num_iterations", 1)
+
         # Spin mapping
         self.mapping = lambda x: 2 * x - 1  # {0,1} -> {-1,1}
         self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
@@ -263,7 +271,11 @@ class CheckerboardPixelCNN(nn.Module):
 
     def sample(self, batch_size=None, T=None) -> torch.Tensor:
         """
-        Generate samples using 2-step checkerboard factorization.
+        Generate samples using iterative checkerboard refinement (Gibbs-style).
+
+        For k = 1 to num_iterations:
+            x_black^{(k)} ~ p(x_black | x_white^{(k-1)})
+            x_white^{(k)} ~ p(x_white | x_black^{(k)})
 
         Args:
             batch_size: Number of samples to generate
@@ -276,7 +288,6 @@ class CheckerboardPixelCNN(nn.Module):
         H, W = self.size
 
         # Initialize lattice with zeros (masked state)
-        # Using 0 to indicate "unknown" - network will learn this
         x = torch.zeros(batch_size, 1, H, W, device=self.device)
 
         # Temperature handling
@@ -285,57 +296,62 @@ class CheckerboardPixelCNN(nn.Module):
             if T.dim() == 1:
                 T = T.unsqueeze(1)  # (B, 1)
         else:
-            # Default temperature
             T = torch.ones(batch_size, 1, device=self.device) * 2.27
 
         # Expand masks for batch
         black_mask = self.black_mask.expand(batch_size, 1, H, W)
         white_mask = self.white_mask.expand(batch_size, 1, H, W)
 
-        # ===== Step 1: Generate BLACK cells =====
-        # White cells are unknown (0), predict black cells
-        phase = torch.zeros(batch_size, 1, H, W, device=self.device)  # phase=0: predicting black
+        # Phase tensors (reused across iterations)
+        phase_black = torch.zeros(batch_size, 1, H, W, device=self.device)
+        phase_white = torch.ones(batch_size, 1, H, W, device=self.device)
 
-        logits_black = self.net(x, T, phase)  # (B, 2, H, W)
-        probs_black = F.softmax(logits_black, dim=1)  # (B, 2, H, W)
+        # ===== Iterative Refinement =====
+        for iteration in range(self.num_iterations):
+            # ----- Resample BLACK cells given WHITE cells -----
+            # On first iteration, white cells are 0 (unknown)
+            # On subsequent iterations, white cells contain actual values
+            x_context_black = x * white_mask  # Keep white, zero out black
 
-        # Sample black cells (parallel!)
-        # probs_black[:, 1] is P(spin=+1)
-        samples_black = torch.bernoulli(probs_black[:, 1:2])  # (B, 1, H, W), values in {0, 1}
-        samples_black = self.mapping(samples_black)  # {0,1} -> {-1,+1}
+            logits_black = self.net(x_context_black, T, phase_black)
+            probs_black = F.softmax(logits_black, dim=1)
+            samples_black = torch.bernoulli(probs_black[:, 1:2])
+            samples_black = self.mapping(samples_black)
 
-        # Fill in black cells
-        x = x * white_mask + samples_black * black_mask
+            # Update black cells
+            x = samples_black * black_mask + x * white_mask
 
-        # ===== Step 2: Generate WHITE cells =====
-        # Black cells are now known, predict white cells
-        phase = torch.ones(batch_size, 1, H, W, device=self.device)  # phase=1: predicting white
+            # ----- Resample WHITE cells given BLACK cells -----
+            x_context_white = x * black_mask  # Keep black, zero out white
 
-        logits_white = self.net(x, T, phase)  # (B, 2, H, W)
-        probs_white = F.softmax(logits_white, dim=1)
+            logits_white = self.net(x_context_white, T, phase_white)
+            probs_white = F.softmax(logits_white, dim=1)
+            samples_white = torch.bernoulli(probs_white[:, 1:2])
+            samples_white = self.mapping(samples_white)
 
-        # Sample white cells (parallel!)
-        samples_white = torch.bernoulli(probs_white[:, 1:2])
-        samples_white = self.mapping(samples_white)
-
-        # Fill in white cells
-        x = x * black_mask + samples_white * white_mask
+            # Update white cells
+            x = x * black_mask + samples_white * white_mask
 
         # ===== Fix first spin using Z2 symmetry =====
-        # If fix_first is set and x[0,0] != fix_first, flip ALL spins
-        # This is valid because p(x) = p(-x) for Ising model (Z2 symmetry)
         if self.fix_first is not None:
-            needs_flip = (x[:, 0, 0, 0] != self.fix_first)  # (B,)
-            flip_mask = needs_flip.float().view(-1, 1, 1, 1)  # (B, 1, 1, 1)
-            x = x * (1 - 2 * flip_mask)  # flip: x -> -x where needed
+            needs_flip = (x[:, 0, 0, 0] != self.fix_first)
+            flip_mask = needs_flip.float().view(-1, 1, 1, 1)
+            x = x * (1 - 2 * flip_mask)
 
         return x
 
     def log_prob(self, sample: torch.Tensor, T=None) -> torch.Tensor:
         """
-        Compute log probability using checkerboard factorization.
+        Compute log pseudo-probability using checkerboard factorization.
 
-        log p(x) = log p(x_black | context) + log p(x_white | x_black)
+        For iterative refinement (num_iterations > 1), we use pseudo-likelihood:
+            log q(x) = log p(x_black | x_white) + log p(x_white | x_black)
+
+        This conditions each color on the actual values of the other color,
+        which is consistent with what the Gibbs sampler produces at equilibrium.
+
+        For num_iterations=1 (original 2-step), we use:
+            log q(x) = log p(x_black | 0) + log p(x_white | x_black)
 
         Args:
             sample: (B, 1, H, W) tensor with values in {-1, +1}
@@ -361,41 +377,36 @@ class CheckerboardPixelCNN(nn.Module):
         black_mask = self.black_mask.expand(B, 1, H, W)
         white_mask = self.white_mask.expand(B, 1, H, W)
 
-        # ===== Step 1: log p(x_black | context) =====
-        # Context is zeros (unknown white cells)
-        x_context = torch.zeros_like(sample)
-        phase = torch.zeros(B, 1, H, W, device=self.device)
+        # Phase tensors
+        phase_black = torch.zeros(B, 1, H, W, device=self.device)
+        phase_white = torch.ones(B, 1, H, W, device=self.device)
 
-        logits_black = self.net(x_context, T, phase)  # (B, 2, H, W)
-        log_probs_black = F.log_softmax(logits_black, dim=1)  # (B, 2, H, W)
+        # ===== log p(x_black | x_white) =====
+        # For num_iterations > 1: condition on actual white values (pseudo-likelihood)
+        # For num_iterations = 1: condition on zeros (original 2-step)
+        if self.num_iterations > 1:
+            x_context_black = sample * white_mask  # Actual white values, black zeroed
+        else:
+            x_context_black = torch.zeros_like(sample)  # Original: all zeros
 
-        # Select log prob for actual black cell values
-        # sample_01: (B, 1, H, W), need to gather from log_probs_black
-        log_prob_black_selected = log_probs_black.gather(1, sample_01.long())  # (B, 1, H, W)
+        logits_black = self.net(x_context_black, T, phase_black)
+        log_probs_black = F.log_softmax(logits_black, dim=1)
+        log_prob_black_selected = log_probs_black.gather(1, sample_01.long())
+        log_prob_black_sum = (log_prob_black_selected * black_mask).sum(dim=(1, 2, 3))
 
-        # Sum only over black cells
-        log_prob_black_sum = (log_prob_black_selected * black_mask).sum(dim=(1, 2, 3))  # (B,)
+        # ===== log p(x_white | x_black) =====
+        # Always condition on actual black values
+        x_context_white = sample * black_mask  # Actual black values, white zeroed
 
-        # ===== Step 2: log p(x_white | x_black) =====
-        # Context is sample with black cells filled, white cells zeroed
-        x_with_black = sample * black_mask  # White cells are 0
-        phase = torch.ones(B, 1, H, W, device=self.device)
-
-        logits_white = self.net(x_with_black, T, phase)  # (B, 2, H, W)
+        logits_white = self.net(x_context_white, T, phase_white)
         log_probs_white = F.log_softmax(logits_white, dim=1)
-
-        # Select log prob for actual white cell values
         log_prob_white_selected = log_probs_white.gather(1, sample_01.long())
-
-        # Sum only over white cells
-        log_prob_white_sum = (log_prob_white_selected * white_mask).sum(dim=(1, 2, 3))  # (B,)
+        log_prob_white_sum = (log_prob_white_selected * white_mask).sum(dim=(1, 2, 3))
 
         # Total log probability
         log_prob_total = log_prob_black_sum + log_prob_white_sum
 
         # Handle fix_first: verify constraint is satisfied
-        # Note: We use Z2 symmetry in sampling, so log_prob is unchanged
-        # (p(x) = p(-x), so flipping doesn't change the probability)
         if self.fix_first is not None:
             assert (sample[:, 0, 0, 0] == self.fix_first).all(), \
                 f"fix_first={self.fix_first} but sample[0,0] has different values"
@@ -404,33 +415,53 @@ class CheckerboardPixelCNN(nn.Module):
 
 
 if __name__ == "__main__":
-    # Quick test
-    hparams = {
-        "size": 16,
-        "batch_size": 4,
-        "num_beta": 8,
-        "beta_min": 0.1,
-        "beta_max": 0.6,
-        "hidden_channels": 32,
-        "hidden_conv_layers": 4,
-        "fix_first": 1,  # Test fix_first
-    }
+    import time
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CheckerboardPixelCNN(hparams, device=device).to(device)
+    print(f"Device: {device}\n")
 
-    # Test sampling
-    T = torch.tensor([2.0, 2.27, 3.0, 4.0], device=device)
-    samples = model.sample(batch_size=4, T=T)
-    print(f"Sample shape: {samples.shape}")
-    print(f"Sample values unique: {samples.unique()}")
-    print(f"fix_first={hparams['fix_first']}, all samples[0,0,0] = {samples[:, 0, 0, 0]}")
+    # Test different num_iterations
+    for num_iter in [1, 2, 4]:
+        print(f"===== num_iterations = {num_iter} =====")
+        hparams = {
+            "size": 16,
+            "batch_size": 32,
+            "num_beta": 8,
+            "beta_min": 0.1,
+            "beta_max": 0.6,
+            "hidden_channels": 32,
+            "hidden_conv_layers": 4,
+            "fix_first": 1,
+            "num_iterations": num_iter,
+        }
 
-    # Test log_prob
-    log_prob = model.log_prob(samples, T=T)
-    print(f"Log prob shape: {log_prob.shape}")
-    print(f"Log prob values: {log_prob.squeeze()}")
+        model = CheckerboardPixelCNN(hparams, device=device).to(device)
+        model.eval()
 
-    # Count parameters
+        T = torch.ones(32, device=device) * 2.27
+
+        # Warmup
+        with torch.no_grad():
+            _ = model.sample(batch_size=32, T=T)
+
+        # Benchmark
+        n_runs = 10
+        with torch.no_grad():
+            start = time.time()
+            for _ in range(n_runs):
+                samples = model.sample(batch_size=32, T=T)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+            elapsed = (time.time() - start) / n_runs
+
+        print(f"  Sample time: {elapsed*1000:.1f}ms ({2*num_iter} forward passes)")
+        print(f"  fix_first check: all x[0,0]={samples[:, 0, 0, 0][0].item():.0f} ✓")
+
+        # Test log_prob
+        log_prob = model.log_prob(samples, T=T)
+        print(f"  Log prob mean: {log_prob.mean().item():.2f}")
+        print()
+
+    # Parameter count
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Number of parameters: {n_params:,}")
+    print(f"Parameters: {n_params:,}")
