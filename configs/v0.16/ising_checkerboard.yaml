@@ -39,10 +39,10 @@ net_config:
 
   # 2-Phase Curriculum Learning
   # NOTE: May not be needed for Checkerboard due to Gibbs-style refinement
-  curriculum_enabled: false
-  phase1_epochs: 100
+  curriculum_enabled: true
+  phase1_epochs: 50
   phase1_beta_max: 0.35
-  phase2_epochs: 150
+  phase2_epochs: 100
 
   # Model architecture (Checkerboard Net)
   hidden_channels: 64
@@ -55,7 +55,7 @@ net_config:
   # Iterative refinement (Gibbs-style)
   # num_iterations=1: original 2-step (fastest, may converge slower)
   # num_iterations=2-4: better convergence, still much faster than PixelCNN
-  num_iterations: 2
+  num_iterations: 4
 
 optimizer_config:
   lr: 1.e-3
