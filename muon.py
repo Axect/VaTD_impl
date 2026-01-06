@@ -241,7 +241,8 @@ class MuonWithAdamW(Optimizer):
         else:
             self.adam = None
 
-        # Initialize base optimizer (required for LR schedulers)
+        # Initialize base optimizer with EMPTY params (required for LR schedulers)
+        # We pass empty list to avoid duplicate parameter registration error
         defaults = dict(
             lr=lr,
             adam_lr=adam_lr,
@@ -253,7 +254,10 @@ class MuonWithAdamW(Optimizer):
             adam_betas=adam_betas,
             adam_eps=adam_eps,
         )
-        super().__init__(params_list, defaults)
+        # Don't call super().__init__ with params - they're already in Muon/AdamW
+        self.defaults = defaults
+        self.state = {}  # Required attribute for Optimizer interface
+        self._param_groups = []  # We manage param_groups via property
 
         # Report parameter distribution
         n_muon = sum(p.numel() for p in muon_params)
