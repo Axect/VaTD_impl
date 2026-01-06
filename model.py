@@ -3,8 +3,98 @@ from torch import nn
 import torch.nn.functional as F
 import einops
 import numpy as np
-from typing import Tuple
+from typing import Tuple, List, Optional
 import math
+
+# Optional MHC import - fallback to standard fusion if not available
+try:
+    from mhc import MHCLayer
+    MHC_AVAILABLE = True
+except ImportError:
+    MHC_AVAILABLE = False
+
+
+class MHCFusion2D(nn.Module):
+    """
+    2D Spatial wrapper for MHCLayer (Manifold-Constrained Hyper-Connections).
+
+    Transforms 2D conv features to work with MHCLayer which expects [B, n, C] input.
+    Each spatial position (h, w) is treated as an independent sequence position.
+
+    Args:
+        hidden_channels: Number of channels in conv features (C in conv = hidden_dim in MHC)
+        num_layers: Number of skip connection layers to fuse (n = expansion_rate in MHC)
+        use_dynamic_h: If True, uses input-dependent H values (more expressive but slower)
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for doubly stochastic constraint
+        aggregation: How to aggregate n outputs - 'sum', 'mean', or 'last'
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        num_layers: int,
+        use_dynamic_h: bool = False,
+        sinkhorn_iters: int = 10,
+        aggregation: str = 'sum',
+    ):
+        super().__init__()
+
+        if not MHC_AVAILABLE:
+            raise ImportError(
+                "MHCLayer not available. Install mHC.cu: pip install -e ./mHC.cu/"
+            )
+
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.aggregation = aggregation
+
+        # MHCLayer expects hidden_dim = C, expansion_rate = n
+        self.mhc = MHCLayer(
+            hidden_dim=hidden_channels,
+            expansion_rate=num_layers,
+            sinkhorn_iters=sinkhorn_iters,
+            use_dynamic_h=use_dynamic_h,
+        )
+
+    def forward(self, skip_features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Fuse multiple skip connection features using MHCLayer.
+
+        Args:
+            skip_features: List of n tensors, each [B, C, H, W]
+
+        Returns:
+            Fused features [B, C, H, W]
+        """
+        assert len(skip_features) == self.num_layers, \
+            f"Expected {self.num_layers} features, got {len(skip_features)}"
+
+        B, C, H, W = skip_features[0].shape
+        device = skip_features[0].device
+
+        # Stack: [B, n, C, H, W]
+        stacked = torch.stack(skip_features, dim=1)
+
+        # Reshape for MHCLayer: [B, n, C, H, W] -> [B*H*W, n, C]
+        x = einops.rearrange(stacked, 'b n c h w -> (b h w) n c')
+
+        # Apply MHCLayer: [B*H*W, n, C] -> [B*H*W, n, C]
+        y = self.mhc(x)
+
+        # Aggregate across n dimension based on strategy
+        if self.aggregation == 'sum':
+            y = y.sum(dim=1)  # [B*H*W, C]
+        elif self.aggregation == 'mean':
+            y = y.mean(dim=1)  # [B*H*W, C]
+        elif self.aggregation == 'last':
+            y = y[:, -1, :]  # [B*H*W, C]
+        else:
+            raise ValueError(f"Unknown aggregation: {self.aggregation}")
+
+        # Reshape back: [B*H*W, C] -> [B, C, H, W]
+        out = einops.rearrange(y, '(b h w) c -> b c h w', b=B, h=H, w=W)
+
+        return out
 
 
 class MaskedConv2D(nn.Conv2d):
@@ -109,6 +199,8 @@ class MaskedResConv2D(nn.Module):
         augment_channels=0,
         dilation_pattern=None,
         skip_connection_indices=None,
+        use_mhc_fusion=False,
+        mhc_config=None,
     ):
         """
         Masked Residual Convolutional Network for autoregressive modeling.
@@ -118,8 +210,16 @@ class MaskedResConv2D(nn.Module):
                               If None, uses default 2**(i % 4) pattern.
             skip_connection_indices: List of layer indices to collect skip features from.
                                      Features are fused and added to final conv output.
+            use_mhc_fusion: If True, use MHCLayer for skip fusion instead of Conv2d.
+                           Requires mHC.cu to be installed.
+            mhc_config: Optional dict with MHC configuration:
+                        - use_dynamic_h: bool (default: False)
+                        - sinkhorn_iters: int (default: 10)
+                        - aggregation: str 'sum'|'mean'|'last' (default: 'sum')
         """
         super().__init__()
+
+        self.use_mhc_fusion = use_mhc_fusion
 
         self.channel = channel
         self.category = category
@@ -225,10 +325,23 @@ class MaskedResConv2D(nn.Module):
         if skip_connection_indices:
             self.skip_indices = set(skip_connection_indices)
             num_skips = len(skip_connection_indices)
-            self.skip_fusion = nn.Sequential(
-                nn.Conv2d(2 * hidden_channels * num_skips, 2 * hidden_channels, 1),
-                nn.GELU(),
-            )
+
+            if use_mhc_fusion:
+                # Use MHCLayer for learned multi-scale fusion
+                mhc_cfg = mhc_config or {}
+                self.skip_fusion = MHCFusion2D(
+                    hidden_channels=2 * hidden_channels,
+                    num_layers=num_skips,
+                    use_dynamic_h=mhc_cfg.get('use_dynamic_h', False),
+                    sinkhorn_iters=mhc_cfg.get('sinkhorn_iters', 10),
+                    aggregation=mhc_cfg.get('aggregation', 'sum'),
+                )
+            else:
+                # Standard Conv2d fusion (concat + 1x1 conv)
+                self.skip_fusion = nn.Sequential(
+                    nn.Conv2d(2 * hidden_channels * num_skips, 2 * hidden_channels, 1),
+                    nn.GELU(),
+                )
         else:
             self.skip_indices = None
             self.skip_fusion = None
@@ -264,7 +377,12 @@ class MaskedResConv2D(nn.Module):
 
         # Fuse multi-scale skip features and add to output
         if skip_features and self.skip_fusion is not None:
-            fused = self.skip_fusion(torch.cat(skip_features, dim=1))
+            if self.use_mhc_fusion:
+                # MHCFusion2D expects list of tensors
+                fused = self.skip_fusion(skip_features)
+            else:
+                # Standard fusion expects concatenated tensor
+                fused = self.skip_fusion(torch.cat(skip_features, dim=1))
             x = x + fused
 
         x = self.first_fc(x)
@@ -339,6 +457,8 @@ class DiscretePixelCNN(nn.Module):
             augment_channels=self.augment_channels,
             dilation_pattern=hparams.get("dilation_pattern", None),
             skip_connection_indices=hparams.get("skip_connection_indices", None),
+            use_mhc_fusion=hparams.get("use_mhc_fusion", False),
+            mhc_config=hparams.get("mhc_config", None),
         )
 
     def to(self, *args, **kwargs):

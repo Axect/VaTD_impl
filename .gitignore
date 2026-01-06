@@ -1,6 +1,7 @@
 /target
 data/*.parquet
 *.db
+mHC.cu/
 
 checkpoints/
 runs/
