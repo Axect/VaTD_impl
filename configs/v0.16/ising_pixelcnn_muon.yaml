@@ -60,12 +60,10 @@ net_config:
   # Multi-scale skip connections
   skip_connection_indices: [1, 3]
 
-  # Temperature-dependent Output Scaling
+  # Temperature-dependent Output Scaling (Parameter-free: β = 1/T)
   logit_temp_scale: true
-  temp_ref: 2.27
-  temp_scale_power: 1.0
   temp_scale_min: 0.1
-  temp_scale_max: 10.0
+  temp_scale_max: 2.0
 
 optimizer_config:
   # Muon parameters (for 2D weights)

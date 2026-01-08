@@ -435,14 +435,12 @@ class DiscretePixelCNN(nn.Module):
         self.phase1_beta_max = hparams.get("phase1_beta_max", 0.35)
         self.phase2_epochs = hparams.get("phase2_epochs", 100)
 
-        # Temperature-dependent Output Scaling
-        # High temp: scale < 1 → logits smaller → softmax closer to 0.5
-        # Low temp: scale > 1 → logits larger → softmax sharper
+        # Temperature-dependent Output Scaling (Parameter-free: uses β = 1/T)
+        # High temp: scale small → logits smaller → softmax closer to 0.5
+        # Low temp: scale large → logits larger → softmax sharper
         self.logit_temp_scale = hparams.get("logit_temp_scale", False)
-        self.temp_ref = hparams.get("temp_ref", 2.27)  # Reference temp (Tc by default)
-        self.temp_scale_power = hparams.get("temp_scale_power", 0.5)  # scale = (T_ref/T)^power
         self.temp_scale_min = hparams.get("temp_scale_min", 0.1)
-        self.temp_scale_max = hparams.get("temp_scale_max", 10.0)
+        self.temp_scale_max = hparams.get("temp_scale_max", 2.0)
 
         # Initialize MaskedResConv2D
         self.masked_conv = MaskedResConv2D(
@@ -475,9 +473,12 @@ class DiscretePixelCNN(nn.Module):
         """
         Compute temperature-dependent scaling factor for logits.
 
-        scale = (T_ref / T)^power
-        - High temp (T > T_ref): scale < 1 → logits smaller → softmax closer to 0.5
-        - Low temp (T < T_ref): scale > 1 → logits larger → softmax sharper
+        Parameter-free scaling using inverse temperature (β = 1/T):
+        - High temp: β small → logits smaller → softmax closer to 0.5 (disorder)
+        - Low temp: β large → logits larger → softmax sharper (order)
+
+        This is physically motivated: Boltzmann distribution P(x) ∝ exp(-βE)
+        naturally uses β = 1/T as the scaling factor.
 
         Args:
             T: Temperature tensor of shape (B,) or (B, 1)
@@ -492,8 +493,8 @@ class DiscretePixelCNN(nn.Module):
         if T.dim() == 1:
             T = T.unsqueeze(1)
 
-        # Compute scale = (T_ref / T)^power
-        scale = (self.temp_ref / T) ** self.temp_scale_power
+        # Parameter-free: use inverse temperature β = 1/T
+        scale = 1.0 / T
 
         # Clamp to prevent extreme values
         scale = scale.clamp(min=self.temp_scale_min, max=self.temp_scale_max)

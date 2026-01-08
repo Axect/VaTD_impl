@@ -57,7 +57,7 @@ net_config:
   dilation_pattern: [1, 2, 4, 8]
 
   # Multi-scale skip connections (4 layers for MHC)
-  skip_connection_indices: [0, 1, 2, 3]
+  skip_connection_indices: [1, 3]
 
   # NEW: MHC Fusion (replaces Conv2d skip fusion)
   use_mhc_fusion: true
@@ -66,12 +66,10 @@ net_config:
     sinkhorn_iters: 10        # Sinkhorn-Knopp iterations
     aggregation: sum          # How to aggregate MHC outputs: sum | mean | last
 
-  # Temperature-dependent Output Scaling
+  # Temperature-dependent Output Scaling (Parameter-free: β = 1/T)
   logit_temp_scale: true
-  temp_ref: 2.27
-  temp_scale_power: 1.0
   temp_scale_min: 0.1
-  temp_scale_max: 10.0
+  temp_scale_max: 2.0
 
 optimizer_config:
   lr: 1.e-3

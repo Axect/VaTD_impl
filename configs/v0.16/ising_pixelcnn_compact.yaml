@@ -23,21 +23,21 @@ net_config:
   fix_first: 1
 
   # Temperature sampling configuration
-  batch_size: 256
+  batch_size: 512
   num_beta: 8
   beta_min: 0.2
   beta_max: 1.0
 
   # Training Mode: Sequential
   training_mode: sequential
-  accumulation_steps: 64
+  accumulation_steps: 16
 
   # MCMC Guided Training: DISABLED (pure REINFORCE)
   mcmc_enabled: false
 
   # 2-Phase Curriculum Learning
   curriculum_enabled: true
-  phase1_epochs: 100
+  phase1_epochs: 50
   phase1_beta_max: 0.35
   phase2_epochs: 150
 
@@ -57,12 +57,10 @@ net_config:
   # Layer 3: after d=1,2,4,8 (global features, RF~37)
   skip_connection_indices: [1, 3]
 
-  # Temperature-dependent Output Scaling
+  # Temperature-dependent Output Scaling (Parameter-free: β = 1/T)
   logit_temp_scale: true
-  temp_ref: 2.27
-  temp_scale_power: 1.0
   temp_scale_min: 0.1
-  temp_scale_max: 10.0
+  temp_scale_max: 2.0
 
 optimizer_config:
   lr: 1.e-3

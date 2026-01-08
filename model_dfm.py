@@ -276,12 +276,10 @@ class DiscreteFlowMatcher(nn.Module):
         self.phase1_beta_max = hparams.get("phase1_beta_max", 0.35)
         self.phase2_epochs = hparams.get("phase2_epochs", 100)
 
-        # Temperature scaling (optional, for compatibility)
+        # Temperature scaling (Parameter-free: uses β = 1/T)
         self.logit_temp_scale = hparams.get("logit_temp_scale", False)
-        self.temp_ref = hparams.get("temp_ref", 2.27)
-        self.temp_scale_power = hparams.get("temp_scale_power", 0.5)
         self.temp_scale_min = hparams.get("temp_scale_min", 0.1)
-        self.temp_scale_max = hparams.get("temp_scale_max", 10.0)
+        self.temp_scale_max = hparams.get("temp_scale_max", 2.0)
 
         # Spin mappings
         self.mapping = lambda x: 2 * x - 1  # {0,1} -> {-1,+1}
@@ -314,14 +312,20 @@ class DiscreteFlowMatcher(nn.Module):
         return self
 
     def _compute_temp_scale(self, T: torch.Tensor) -> torch.Tensor:
-        """Compute temperature-dependent scaling (for compatibility)."""
+        """
+        Compute temperature-dependent scaling using inverse temperature (β = 1/T).
+
+        Parameter-free: no reference temperature needed.
+        Physically motivated by Boltzmann distribution P(x) ∝ exp(-βE).
+        """
         if not self.logit_temp_scale:
             return 1.0
 
         if T.dim() == 1:
             T = T.unsqueeze(1)
 
-        scale = (self.temp_ref / T) ** self.temp_scale_power
+        # Parameter-free: use inverse temperature β = 1/T
+        scale = 1.0 / T
         scale = scale.clamp(min=self.temp_scale_min, max=self.temp_scale_max)
         scale = scale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
