@@ -1,0 +1,85 @@
+# v0.16 Compact PixelCNN with Diagonal Scan Path
+#
+# Goal: 8x faster sampling by using anti-diagonal ordering instead of raster scan.
+#
+# Key features:
+# - Diagonal scan: 31 steps for 16x16 grid (vs 256 for raster)
+# - DiagonalMaskedConv2D: causality based on anti-diagonal index (i+j)
+# - All positions in the same anti-diagonal can be sampled with a single forward pass
+# - 4-layer Compact Dilated ResNet (same as compact config)
+#
+# Path ordering:
+#   Step 0: (0,0)                    - 1 pixel
+#   Step 1: (0,1), (1,0)             - 2 pixels (parallel)
+#   Step 2: (0,2), (1,1), (2,0)      - 3 pixels (parallel)
+#   ...
+#   Step 30: (15,15)                 - 1 pixel
+#
+# Expected: ~8x faster sampling, strict autoregressive validity maintained.
+
+project: Ising_VaTD_v0.16
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 250
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+
+  # Path type: diagonal scan for 8x speedup
+  path_type: diagonal
+
+  # Temperature sampling configuration
+  batch_size: 512
+  num_beta: 8
+  beta_min: 0.2
+  beta_max: 1.0
+
+  # Training Mode: Sequential
+  training_mode: sequential
+  accumulation_steps: 16
+
+  # MCMC Guided Training: DISABLED (pure REINFORCE)
+  mcmc_enabled: false
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 50
+  phase1_beta_max: 0.35
+  phase2_epochs: 150
+
+  # Model architecture (Compact Dilated ResNet)
+  kernel_size: 7
+  hidden_channels: 96
+  hidden_conv_layers: 4
+  hidden_kernel_size: 3
+  hidden_width: 128
+  hidden_fc_layers: 2
+
+  # Dilation pattern (RF = 7 + 2*(1+2+4+8) = 37)
+  dilation_pattern: [1, 2, 4, 8]
+
+  # Multi-scale skip connections
+  skip_connection_indices: [1, 3]
+
+  # Temperature-dependent Output Scaling (Parameter-free: beta = 1/T)
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 1.e-4
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 250
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

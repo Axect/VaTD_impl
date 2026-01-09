@@ -185,6 +185,149 @@ class MaskedConv2D(nn.Conv2d):
         )
 
 
+class DiagonalMaskedConv2D(nn.Conv2d):
+    """
+    Masked convolution for diagonal scan ordering.
+
+    Causality: Position (i, j) can see position (i', j') if:
+      - i' + j' < i + j (strictly previous diagonal), OR
+      - i' + j' == i + j AND mask_type == "B" (same diagonal, Type B only)
+
+    This enables 8x faster sampling (31 steps vs 256) by allowing parallel
+    sampling within each anti-diagonal.
+    """
+
+    def __init__(
+        self,
+        *args,
+        mask_type,
+        data_channels,
+        augment_channels=0,
+        augment_output=True,
+        **kwargs
+    ):
+        super(DiagonalMaskedConv2D, self).__init__(*args, **kwargs)
+        assert mask_type in {"A", "B"}, "mask_type must be either 'A' or 'B'"
+
+        out_channels, in_channels, height, width = self.weight.size()
+        if augment_output:
+            assert (
+                in_channels % (data_channels + augment_channels) == 0
+                and out_channels % (data_channels + augment_channels) == 0
+            ), "When augment_output is True, in_channels and out_channels must be multiples of (data_channels + augment_channels)"
+        else:
+            assert (
+                in_channels % (data_channels + augment_channels) == 0
+                and out_channels % data_channels == 0
+            ), "When augment_output is False, in_channels must be a multiple of (data_channels + augment_channels) and out_channels must be a multiple of data_channels"
+
+        y_center, x_center = height // 2, width // 2
+
+        mask = torch.ones_like(self.weight)
+
+        # Diagonal masking: can see if diag_diff < 0 (or == 0 for Type B)
+        for ky in range(height):
+            for kx in range(width):
+                rel_y = ky - y_center
+                rel_x = kx - x_center
+                diag_diff = rel_y + rel_x
+
+                if diag_diff > 0:
+                    mask[:, :, ky, kx] = 0
+                elif diag_diff == 0 and mask_type == "A":
+                    mask[:, :, ky, kx] = 0
+
+        # Meta mask for channel ordering (same as raster)
+        if mask_type == "A":
+            meta_mask = torch.tril(
+                torch.ones((data_channels, data_channels)), diagonal=-1
+            )
+        else:
+            meta_mask = torch.tril(torch.ones((data_channels, data_channels)))
+
+        # For conditional channels
+        if augment_channels > 0:
+            if augment_output:
+                meta_mask = torch.cat(
+                    [meta_mask, torch.zeros((augment_channels, data_channels))],
+                    dim=0,
+                )
+                meta_mask = torch.cat(
+                    [
+                        meta_mask,
+                        torch.ones(
+                            (augment_channels + data_channels, augment_channels)
+                        ),
+                    ],
+                    dim=1,
+                )
+            else:
+                meta_mask = torch.cat(
+                    [meta_mask, torch.ones((data_channels, augment_channels))],
+                    dim=1,
+                )
+
+        # Tiling meta mask to match real channels
+        in_tiles = in_channels // (data_channels + augment_channels)
+        if augment_output:
+            out_tiles = out_channels // (data_channels + augment_channels)
+        else:
+            out_tiles = out_channels // data_channels
+
+        # Apply meta mask at center position
+        mask[:, :, y_center, x_center] = meta_mask.repeat(out_tiles, in_tiles)
+
+        self.register_buffer("mask", mask)
+
+    def forward(self, x):
+        return F.conv2d(
+            x,
+            self.weight * self.mask,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+
+
+def hilbert_curve_order(n: int) -> List[Tuple[int, int]]:
+    """
+    Generate Hilbert curve indices for n x n grid.
+
+    Args:
+        n: Grid size (must be power of 2)
+
+    Returns:
+        List of (row, col) tuples in Hilbert curve order
+    """
+    assert n > 0 and (n & (n - 1)) == 0, "n must be a power of 2"
+
+    def hilbert_d2xy(n: int, d: int) -> Tuple[int, int]:
+        """Convert Hilbert curve index d to (x, y) coordinates."""
+        x = y = 0
+        s = 1
+        while s < n:
+            rx = 1 & (d // 2)
+            ry = 1 & (d ^ rx)
+            if ry == 0:
+                if rx == 1:
+                    x = s - 1 - x
+                    y = s - 1 - y
+                x, y = y, x
+            x += s * rx
+            y += s * ry
+            d //= 4
+            s *= 2
+        return x, y
+
+    order = []
+    for d in range(n * n):
+        x, y = hilbert_d2xy(n, d)
+        order.append((y, x))  # Return as (row, col)
+    return order
+
+
 class MaskedResConv2D(nn.Module):
     def __init__(
         self,
@@ -201,6 +344,7 @@ class MaskedResConv2D(nn.Module):
         skip_connection_indices=None,
         use_mhc_fusion=False,
         mhc_config=None,
+        conv_class=None,
     ):
         """
         Masked Residual Convolutional Network for autoregressive modeling.
@@ -216,6 +360,8 @@ class MaskedResConv2D(nn.Module):
                         - use_dynamic_h: bool (default: False)
                         - sinkhorn_iters: int (default: 10)
                         - aggregation: str 'sum'|'mean'|'last' (default: 'sum')
+            conv_class: Masked convolution class to use (default: MaskedConv2D).
+                       Can be DiagonalMaskedConv2D for diagonal scan ordering.
         """
         super().__init__()
 
@@ -225,7 +371,10 @@ class MaskedResConv2D(nn.Module):
         self.category = category
         self.hidden_channels = hidden_channels
 
-        self.first_conv = MaskedConv2D(
+        # Select convolution class
+        ConvClass = conv_class if conv_class is not None else MaskedConv2D
+
+        self.first_conv = ConvClass(
             in_channels=channel + augment_channels,
             out_channels=2 * hidden_channels,
             kernel_size=kernel_size,
@@ -244,10 +393,10 @@ class MaskedResConv2D(nn.Module):
                 dilation = dilation_pattern[i % len(dilation_pattern)]
             else:
                 dilation = 2**(i % 4)  # Cycle dilations 1, 2, 4, 8
-            
+
             hidden_convs.append(
                 nn.Sequential(
-                    MaskedConv2D(
+                    ConvClass(
                         in_channels=2 * hidden_channels,
                         out_channels=hidden_channels,
                         kernel_size=1,
@@ -258,7 +407,7 @@ class MaskedResConv2D(nn.Module):
                         augment_output=True,
                     ),
                     nn.GELU(),
-                    MaskedConv2D(
+                    ConvClass(
                         in_channels=hidden_channels,
                         out_channels=hidden_channels,
                         kernel_size=hidden_kernel_size,
@@ -270,7 +419,7 @@ class MaskedResConv2D(nn.Module):
                         augment_output=True,
                     ),
                     nn.GELU(),
-                    MaskedConv2D(
+                    ConvClass(
                         in_channels=hidden_channels,
                         out_channels=2 * hidden_channels,
                         kernel_size=1,
@@ -285,7 +434,7 @@ class MaskedResConv2D(nn.Module):
 
         self.hidden_convs = nn.ModuleList(hidden_convs)
 
-        self.first_fc = MaskedConv2D(
+        self.first_fc = ConvClass(
             in_channels=2 * hidden_channels,
             out_channels=hidden_width,
             kernel_size=1,
@@ -298,7 +447,7 @@ class MaskedResConv2D(nn.Module):
         hidden_fcs = []
         for _ in range(hidden_fc_layers):
             hidden_fcs.append(
-                MaskedConv2D(
+                ConvClass(
                     in_channels=hidden_width,
                     out_channels=hidden_width,
                     kernel_size=1,
@@ -310,7 +459,7 @@ class MaskedResConv2D(nn.Module):
             )
         self.hidden_fcs = nn.ModuleList(hidden_fcs)
 
-        self.final_fc = MaskedConv2D(
+        self.final_fc = ConvClass(
             in_channels=hidden_width,
             out_channels=category * channel,
             kernel_size=1,
@@ -422,6 +571,34 @@ class DiscretePixelCNN(nn.Module):
         self.mapping = lambda x: 2 * x - 1  # Map {0,1} to {-1,1}
         self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
 
+        # Path type: "raster" (default), "diagonal" (8x faster), or "hilbert" (best locality)
+        self.path_type = hparams.get("path_type", "raster")
+        assert self.path_type in {"raster", "diagonal", "hilbert"}, \
+            f"path_type must be 'raster', 'diagonal', or 'hilbert', got {self.path_type}"
+
+        # Precompute path orderings
+        H, W = self.size
+        if self.path_type == "diagonal":
+            # Diagonal groups: list of position lists per anti-diagonal
+            # Total 2*N-1 diagonals for NxN grid
+            self.diagonal_groups = []
+            for d in range(H + W - 1):
+                positions = [(i, d - i) for i in range(max(0, d - W + 1), min(H, d + 1))]
+                self.diagonal_groups.append(positions)
+        elif self.path_type == "hilbert":
+            # Hilbert curve order: list of (row, col) in Hilbert order
+            assert H == W and (H & (H - 1)) == 0, \
+                f"Hilbert curve requires square grid with power-of-2 size, got {self.size}"
+            self.hilbert_order = hilbert_curve_order(H)
+
+        # Select convolution class based on path_type
+        if self.path_type == "diagonal":
+            conv_class = DiagonalMaskedConv2D
+        else:
+            # Raster and Hilbert use standard MaskedConv2D
+            # (Hilbert only changes sampling order, not masking)
+            conv_class = MaskedConv2D
+
         # Curriculum learning settings
         # High temp (low beta) → Low temp (high beta) progression
         self.curriculum_enabled = hparams.get("curriculum_enabled", False)
@@ -442,7 +619,7 @@ class DiscretePixelCNN(nn.Module):
         self.temp_scale_min = hparams.get("temp_scale_min", 0.1)
         self.temp_scale_max = hparams.get("temp_scale_max", 2.0)
 
-        # Initialize MaskedResConv2D
+        # Initialize MaskedResConv2D with selected convolution class
         self.masked_conv = MaskedResConv2D(
             channel=self.channel,
             kernel_size=hparams.get("kernel_size", 7),
@@ -457,6 +634,7 @@ class DiscretePixelCNN(nn.Module):
             skip_connection_indices=hparams.get("skip_connection_indices", None),
             use_mhc_fusion=hparams.get("use_mhc_fusion", False),
             mhc_config=hparams.get("mhc_config", None),
+            conv_class=conv_class,
         )
 
     def to(self, *args, **kwargs):
@@ -525,6 +703,23 @@ class DiscretePixelCNN(nn.Module):
             )
             sample = torch.cat([sample, T_expanded], dim=1)
 
+        # Dispatch to appropriate sampling method based on path_type
+        if self.path_type == "diagonal":
+            sample = self._sample_diagonal(sample, temp_scale, T)
+        elif self.path_type == "hilbert":
+            sample = self._sample_hilbert(sample, temp_scale, T)
+        else:  # raster (default)
+            sample = self._sample_raster(sample, temp_scale, T)
+
+        if T is not None:
+            sample = sample[:, : self.channel, :, :]
+
+        sample = self.mapping(sample)  # Map {0,1} to {-1,1}
+
+        return sample
+
+    def _sample_raster(self, sample, temp_scale, T):
+        """Sample using raster scan (standard left-to-right, top-to-bottom)."""
         for i in range(self.size[0]):
             for j in range(self.size[1]):
                 # Fix the first element of the samples to be a fixed value
@@ -539,27 +734,95 @@ class DiscretePixelCNN(nn.Module):
                 unnormalized = self.masked_conv.forward(sample)
 
                 # Apply temperature-dependent scaling
-                # High temp: scale < 1 → logits smaller → softmax closer to 0.5
                 if self.logit_temp_scale and T is not None:
-                    # temp_scale shape: (B, 1, 1, 1), unnormalized: (B, Cat, C, H, W)
                     unnormalized = unnormalized * temp_scale
 
                 for k in range(self.channel):
-                    # Use multinomial instead of argmax to allow stochastic sampling
                     sample[:, k, i, j] = (
                         torch.multinomial(
                             torch.softmax(unnormalized[:, :, k, i, j], dim=1),
-                            1,  # num_samples=1
+                            1,
                         )
                         .squeeze()
                         .float()
                     )
+        return sample
 
-        if T is not None:
-            sample = sample[:, : self.channel, :, :]
+    def _sample_diagonal(self, sample, temp_scale, T):
+        """
+        Sample using diagonal scan (anti-diagonal ordering).
 
-        sample = self.mapping(sample)  # Map {0,1} to {-1,1}
+        This enables ~8x speedup (31 steps vs 256 for 16x16 grid) by sampling
+        all positions in the same anti-diagonal in parallel within a single forward pass.
+        """
+        for d, positions in enumerate(self.diagonal_groups):
+            # Handle fix_first at (0, 0) which is in diagonal 0
+            if d == 0 and self.fix_first is not None:
+                if T is not None:
+                    sample[:, : self.channel, 0, 0] = self.fix_first
+                else:
+                    sample[:, :, 0, 0] = self.fix_first
+                continue
 
+            # Single forward pass for this diagonal
+            unnormalized = self.masked_conv.forward(sample)
+
+            if self.logit_temp_scale and T is not None:
+                unnormalized = unnormalized * temp_scale
+
+            # Sample all positions in this diagonal (can be parallelized on GPU)
+            for (i, j) in positions:
+                # Skip (0,0) if in later diagonal (shouldn't happen, but safety check)
+                if i == 0 and j == 0 and self.fix_first is not None:
+                    continue
+
+                for k in range(self.channel):
+                    sample[:, k, i, j] = (
+                        torch.multinomial(
+                            torch.softmax(unnormalized[:, :, k, i, j], dim=1),
+                            1,
+                        )
+                        .squeeze()
+                        .float()
+                    )
+        return sample
+
+    def _sample_hilbert(self, sample, temp_scale, T):
+        """
+        Sample using Hilbert curve ordering.
+
+        Preserves 2D locality - adjacent positions in the sequence are neighbors
+        in 2D space. Still 256 steps but may improve learning of local correlations.
+
+        Note: Uses raster masking, so the network has raster-biased receptive field.
+        Only the sampling ORDER follows Hilbert curve.
+        """
+        first_pos = self.hilbert_order[0]
+
+        for idx, (i, j) in enumerate(self.hilbert_order):
+            # Fix the first element (which is hilbert_order[0])
+            if idx == 0 and self.fix_first is not None:
+                if T is not None:
+                    sample[:, : self.channel, i, j] = self.fix_first
+                else:
+                    sample[:, :, i, j] = self.fix_first
+                continue
+
+            # Compute predictions for all channels at once (B, Cat, C, H, W)
+            unnormalized = self.masked_conv.forward(sample)
+
+            if self.logit_temp_scale and T is not None:
+                unnormalized = unnormalized * temp_scale
+
+            for k in range(self.channel):
+                sample[:, k, i, j] = (
+                    torch.multinomial(
+                        torch.softmax(unnormalized[:, :, k, i, j], dim=1),
+                        1,
+                    )
+                    .squeeze()
+                    .float()
+                )
         return sample
 
     def log_prob(self, sample, T=None):
