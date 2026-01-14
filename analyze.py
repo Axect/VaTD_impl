@@ -880,6 +880,11 @@ def main():
     if not selected_tests:
         return
 
+    # Create group-specific figures directory
+    figs_dir = f"figs/{group_name}"
+    Path(figs_dir).mkdir(parents=True, exist_ok=True)
+    console.print(f"[dim]Figures will be saved to: {figs_dir}[/dim]")
+
     # Load model
     console.print(f"\n[bold]Loading model:[/bold] {project}/{group_name}/{seed}")
     model, config = load_model(project, group_name, seed)
@@ -989,6 +994,7 @@ def main():
         console.print("\n[bold]Generating plots for critical range...[/bold]")
         plot_path_critical = plot_model_vs_exact(
             df_critical,
+            output_dir=figs_dir,
             title_suffix=" (Critical Range)",
             filename="model_test_critical.png",
         )
@@ -1062,6 +1068,7 @@ def main():
         console.print("\n[bold]Generating plots for validation range...[/bold]")
         plot_path_validation = plot_model_vs_exact(
             df_validation,
+            output_dir=figs_dir,
             title_suffix=" (Validation Range)",
             filename="model_test_validation.png",
         )
@@ -1097,7 +1104,7 @@ def main():
             temperatures_val,
             device=device,
             num_samples=4,
-            output_dir="figs",
+            output_dir=figs_dir,
             filename=f"lattice_samples_validation_{seed}.png",
         )
         console.print(
@@ -1136,7 +1143,7 @@ def main():
             temperatures_critical,
             device=device,
             num_samples=4,
-            output_dir="figs",
+            output_dir=figs_dir,
             filename=f"lattice_samples_critical_{seed}.png",
         )
         console.print(
@@ -1187,6 +1194,7 @@ def main():
         console.print("\n[bold]Generating thermodynamic quantity plots...[/bold]")
         thermo_plot_path = plot_thermodynamic_quantities(
             df_thermo,
+            output_dir=figs_dir,
             title_suffix=" (Critical Range)",
             filename=f"thermodynamic_analysis_{seed}.png",
         )
@@ -1194,6 +1202,7 @@ def main():
 
         thermo_error_path = plot_thermodynamic_errors(
             df_thermo,
+            output_dir=figs_dir,
             title_suffix=" (Critical Range)",
             filename=f"thermodynamic_errors_{seed}.png",
         )
@@ -1265,6 +1274,7 @@ def main():
         console.print("\n[bold]Generating thermodynamic quantity plots (full range)...[/bold]")
         thermo_full_plot_path = plot_thermodynamic_quantities(
             df_thermo_full,
+            output_dir=figs_dir,
             title_suffix=" (Full Validation Range)",
             filename=f"thermodynamic_analysis_full_{seed}.png",
         )
@@ -1272,6 +1282,7 @@ def main():
 
         thermo_full_error_path = plot_thermodynamic_errors(
             df_thermo_full,
+            output_dir=figs_dir,
             title_suffix=" (Full Validation Range)",
             filename=f"thermodynamic_errors_full_{seed}.png",
         )
