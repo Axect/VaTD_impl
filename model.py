@@ -14,6 +14,172 @@ except ImportError:
     MHC_AVAILABLE = False
 
 
+class HCLayer(nn.Module):
+    """
+    HC (Hyper-Connections) Layer - Unconstrained version.
+
+    Unlike MHCLayer which constrains H_res to be doubly stochastic via Sinkhorn-Knopp,
+    HCLayer uses an unconstrained H_res matrix. This can lead to signal
+    explosion/vanishing in deep networks but provides more expressive power.
+
+    Interface matches MHCLayer for easy swapping.
+
+    Args:
+        hidden_dim: The hidden dimension (C).
+        expansion_rate: The expansion rate (n).
+        alpha_init: Initialization scale for H_res perturbation from identity.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        expansion_rate: int = 4,
+        alpha_init: float = 0.01,
+        **kwargs,  # Accept but ignore MHCLayer-specific args (sinkhorn_iters, use_dynamic_h, etc.)
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.expansion_rate = expansion_rate
+
+        n = expansion_rate
+
+        # RMSNorm weight
+        self.rmsnorm_weight = nn.Parameter(torch.ones(hidden_dim))
+        self.rmsnorm_eps = 1e-5
+
+        # H_res: unconstrained, initialized near identity for stability
+        self.H_res = nn.Parameter(torch.eye(n) + alpha_init * torch.randn(n, n))
+
+        # H_pre and H_post
+        self.H_pre = nn.Parameter(torch.zeros(n))
+        self.H_post = nn.Parameter(torch.zeros(n))
+
+    def _rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
+        """RMSNorm: x / sqrt(mean(x^2) + eps) * weight"""
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
+        return x / rms * self.rmsnorm_weight
+
+    def forward(self, x_expanded: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_expanded: Input tensor of shape [B, n, C]
+
+        Returns:
+            Output tensor of shape [B, n, C]
+        """
+        B, n, C = x_expanded.shape
+        assert n == self.expansion_rate
+        assert C == self.hidden_dim
+
+        # H_pre/H_post activation (matching MHCLayer behavior)
+        H_pre = torch.sigmoid(self.H_pre)  # [n]
+        H_post = 2.0 * torch.sigmoid(self.H_post)  # [n]
+
+        # Aggregate input: x_agg = sum(H_pre[k] * x[:, k, :])
+        x_agg = torch.einsum('k,bkc->bc', H_pre, x_expanded)  # [B, C]
+
+        # Apply RMSNorm
+        y_norm = self._rmsnorm(x_agg)  # [B, C]
+
+        # Mix streams with unconstrained H_res
+        h_mixed = torch.einsum('ij,bjc->bic', self.H_res, x_expanded)  # [B, n, C]
+
+        # Add post-processed output
+        output = h_mixed + torch.einsum('k,bc->bkc', H_post, y_norm)  # [B, n, C]
+
+        return output
+
+
+class HCFusion2D(nn.Module):
+    """
+    2D Spatial wrapper for HC/mHC Layer fusion.
+
+    Supports both MHCLayer (manifold-constrained) and HCLayer (unconstrained)
+    through the manifold_constraint parameter.
+
+    Args:
+        hidden_channels: Number of channels in conv features
+        num_layers: Number of skip connection layers to fuse
+        use_dynamic_h: If True, uses input-dependent H values (MHCLayer only)
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations (MHCLayer only)
+        aggregation: How to aggregate n outputs - 'sum', 'mean', or 'last'
+        manifold_constraint: If True, use MHCLayer (doubly stochastic H_res).
+                            If False, use HCLayer (unconstrained H_res).
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        num_layers: int,
+        use_dynamic_h: bool = False,
+        sinkhorn_iters: int = 10,
+        aggregation: str = 'sum',
+        manifold_constraint: bool = True,
+    ):
+        super().__init__()
+
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.aggregation = aggregation
+        self.manifold_constraint = manifold_constraint
+
+        if manifold_constraint:
+            if not MHC_AVAILABLE:
+                raise ImportError(
+                    "MHCLayer not available. Install mHC.cu: pip install -e ./mHC.cu/"
+                )
+            self.layer = MHCLayer(
+                hidden_dim=hidden_channels,
+                expansion_rate=num_layers,
+                sinkhorn_iters=sinkhorn_iters,
+                use_dynamic_h=use_dynamic_h,
+            )
+        else:
+            self.layer = HCLayer(
+                hidden_dim=hidden_channels,
+                expansion_rate=num_layers,
+            )
+
+    def forward(self, skip_features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Fuse multiple skip connection features using HC/mHC Layer.
+
+        Args:
+            skip_features: List of n tensors, each [B, C, H, W]
+
+        Returns:
+            Fused features [B, C, H, W]
+        """
+        assert len(skip_features) == self.num_layers, \
+            f"Expected {self.num_layers} features, got {len(skip_features)}"
+
+        B, C, H, W = skip_features[0].shape
+
+        # Stack: [B, n, C, H, W]
+        stacked = torch.stack(skip_features, dim=1)
+
+        # Reshape for Layer: [B, n, C, H, W] -> [B*H*W, n, C]
+        x = einops.rearrange(stacked, 'b n c h w -> (b h w) n c')
+
+        # Apply HC/mHC Layer: [B*H*W, n, C] -> [B*H*W, n, C]
+        y = self.layer(x)
+
+        # Aggregate across n dimension based on strategy
+        if self.aggregation == 'sum':
+            y = y.sum(dim=1)  # [B*H*W, C]
+        elif self.aggregation == 'mean':
+            y = y.mean(dim=1)  # [B*H*W, C]
+        elif self.aggregation == 'last':
+            y = y[:, -1, :]  # [B*H*W, C]
+        else:
+            raise ValueError(f"Unknown aggregation: {self.aggregation}")
+
+        # Reshape back: [B*H*W, C] -> [B, C, H, W]
+        out = einops.rearrange(y, '(b h w) c -> b c h w', b=B, h=H, w=W)
+
+        return out
+
+
 class MHCFusion2D(nn.Module):
     """
     2D Spatial wrapper for MHCLayer (Manifold-Constrained Hyper-Connections).
@@ -476,14 +642,15 @@ class MaskedResConv2D(nn.Module):
             num_skips = len(skip_connection_indices)
 
             if use_mhc_fusion:
-                # Use MHCLayer for learned multi-scale fusion
+                # Use HC/mHC Layer for learned multi-scale fusion
                 mhc_cfg = mhc_config or {}
-                self.skip_fusion = MHCFusion2D(
+                self.skip_fusion = HCFusion2D(
                     hidden_channels=2 * hidden_channels,
                     num_layers=num_skips,
                     use_dynamic_h=mhc_cfg.get('use_dynamic_h', False),
                     sinkhorn_iters=mhc_cfg.get('sinkhorn_iters', 10),
                     aggregation=mhc_cfg.get('aggregation', 'sum'),
+                    manifold_constraint=mhc_cfg.get('manifold_constraint', True),
                 )
             else:
                 # Standard Conv2d fusion (concat + 1x1 conv)
@@ -527,7 +694,7 @@ class MaskedResConv2D(nn.Module):
         # Fuse multi-scale skip features and add to output
         if skip_features and self.skip_fusion is not None:
             if self.use_mhc_fusion:
-                # MHCFusion2D expects list of tensors
+                # HCFusion2D expects list of tensors
                 fused = self.skip_fusion(skip_features)
             else:
                 # Standard fusion expects concatenated tensor
