@@ -31,7 +31,11 @@ Usage:
     python analyze_compression.py --replot runs/Ising_VaTD_v0.15/GROUP/compression_42.csv
 """
 
+import os
+os.environ['VATD_NO_MHC'] = '1'  # Prevent mHC.cu CUDA extension from loading
+
 import torch
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -606,42 +610,6 @@ def plot_compression_results(df, L, figs_dir, df_layer=None):
     ax.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
     ax.set_title("Compression Sensitivity vs Specific Heat")
 
-    # Inset: normalized shape comparison near Tc
-    inset = ax.inset_axes([0.42, 0.08, 0.55, 0.42])
-    T_crit_lo, T_crit_hi = 1.5, 4.0
-    crit_mask = (T_arr >= T_crit_lo) & (T_arr <= T_crit_hi)
-
-    if crit_mask.sum() > 3:
-        T_crit = T_arr[crit_mask]
-        deg_crit = deg_arr[crit_mask]
-
-        Cv_crit_mask = (temperatures >= T_crit_lo) & (temperatures <= T_crit_hi)
-        Cv_crit = Cv[Cv_crit_mask]
-
-        # Normalize for shape comparison
-        deg_norm = (deg_crit - deg_crit.min()) / (
-            deg_crit.max() - deg_crit.min() + 1e-10
-        )
-        Cv_norm = (Cv_crit - Cv_crit.min()) / (Cv_crit.max() - Cv_crit.min() + 1e-10)
-
-        inset.plot(
-            T_crit, deg_norm, "b-o", markersize=3, linewidth=1.5, label="Degradation"
-        )
-        inset.plot(
-            temperatures[Cv_crit_mask],
-            Cv_norm,
-            "r-",
-            linewidth=1.5,
-            alpha=0.7,
-            label="$C_v$",
-        )
-        inset.axvline(Tc, color="gray", ls="--", alpha=0.4, lw=0.7)
-        inset.set_xlabel("$T$", fontsize=7)
-        inset.set_ylabel("Normalized", fontsize=7)
-        inset.tick_params(labelsize=6)
-        inset.legend(fontsize=5, loc="upper right")
-        inset.set_title("Critical region", fontsize=7)
-
     # ── [1,1] Relative degradation: D / |log_q_full| ──
     ax = axes[1, 1]
     for ci, rf in enumerate(trunc_fractions):
@@ -837,6 +805,10 @@ def main():
     model, config = load_model(project, group_name, seed)
     model = model.to(device)
     model.eval()
+
+    # Use pure PyTorch for MHC fusion (avoids mHC.cu CUDA kernel issues)
+    if hasattr(model, 'use_pytorch_mhc'):
+        model.use_pytorch_mhc()
 
     L = model.size[0]
     num_layers = len(model.masked_conv.hidden_convs)

@@ -20,7 +20,11 @@ Usage:
         --group DiscretePixelCNN_lr1e-3_e500_f2d43d --seed 42 --quick
 """
 
+import os
+os.environ['VATD_NO_MHC'] = '1'  # Prevent mHC.cu CUDA extension from loading
+
 import torch
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -645,6 +649,10 @@ def main():
     model, config = load_model(project, group_name, seed)
     model = model.to(device)
     model.eval()
+
+    # Use pure PyTorch for MHC fusion (avoids mHC.cu CUDA kernel issues)
+    if hasattr(model, 'use_pytorch_mhc'):
+        model.use_pytorch_mhc()
 
     L = model.size[0]
     num_layers = len(model.masked_conv.hidden_convs)

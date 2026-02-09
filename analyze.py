@@ -1,4 +1,8 @@
+import os
+os.environ['VATD_NO_MHC'] = '1'  # Prevent mHC.cu CUDA extension from loading
+
 import torch
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -890,6 +894,10 @@ def main():
     model, config = load_model(project, group_name, seed)
     model = model.to(device)
     model.eval()
+
+    # Use pure PyTorch for MHC fusion (avoids mHC.cu CUDA kernel issues)
+    if hasattr(model, 'use_pytorch_mhc'):
+        model.use_pytorch_mhc()
 
     # Get model info and display
     model_info = get_model_info(model)
