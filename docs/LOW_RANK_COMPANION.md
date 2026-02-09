@@ -3,8 +3,11 @@
 > **목적**: `LOW_RANK.md` 문서를 읽기 위해 필요한 모든 배경지식을 정리한 해설서.
 >
 > **대상 독자**:
-> - **물리학 박사 (고에너지 물리학 전공)**: QFT, 게이지 이론, 재규격화, 자발적 대칭 깨짐 등에 익숙하지만, 응집물질 물리학 및 통계역학적 상전이 경험이 없음
-> - **머신러닝 전문가**: 딥러닝, 최적화, 생성 모델에 익숙하지만, 물리학적 배경이 제한적임
+> - **현상론 물리학 배경의 ML-oriented 대학원생**: 열역학·통계역학 수준의 물리 배경과 딥러닝 실무 경험을 갖추고 있으며, 물리와 ML의 교차점에 관심이 있는 연구자
+> - **머신러닝 연구자**: 딥러닝, 최적화, 생성 모델에 익숙하지만, 통계물리학적 배경을 보충하고 싶은 독자
+> - **물리학 연구자**: QFT/통계역학에 익숙하지만, 신경망 내부의 물리적 구조에 관심이 있는 독자
+>
+> 각 섹션에는 **물리 → ML 대응**을 명시하여, 물리 개념이 신경망 학습과 어떻게 연결되는지 직관적으로 이해할 수 있도록 구성했습니다.
 
 ---
 
@@ -58,6 +61,20 @@ $$
 
 이 대응은 **Wick 회전** ($t \to -i\tau$)에 의해 성립합니다. HEP에서 민코프스키 시공간의 장론을 유클리드 공간으로 해석적 연속하면, 그 수학적 구조가 통계역학의 분배함수와 정확히 일치합니다.
 
+#### ML 관점에서 본 통계역학
+
+위의 경로적분 대응은 HEP 배경이 있는 독자를 위한 것입니다. ML 배경의 독자를 위해, 통계역학의 핵심 개념을 딥러닝 용어로 재해석합니다:
+
+| 통계역학 | 머신러닝 대응 | 직관 |
+|---|---|---|
+| Boltzmann 분포 $p(\mathbf{x}) = e^{-\beta E(\mathbf{x})}/Z$ | **Softmax with $2^N$ classes** | $N=256$ 스핀의 모든 가능한 배위에 대한 softmax. 각 배위의 "로짓"이 $-\beta E(\mathbf{x})$ |
+| 분배함수 $Z = \sum_{\mathbf{x}} e^{-\beta E(\mathbf{x})}$ | **Softmax의 분모** (정규화 상수) | LogSumExp: $\log Z = \text{LSE}(-\beta E(\mathbf{x}))$. $2^{256}$개 항의 합이므로 직접 계산 불가 |
+| 에너지 함수 $E(\mathbf{x})$ | **Unnormalized negative log-probability** | EBM(에너지 기반 모델)의 에너지와 동일: $E(\mathbf{x}) = -\log \tilde{p}(\mathbf{x})$ |
+| 역온도 $\beta = 1/T$ | **Softmax temperature의 역수** | LLM의 `temperature` 파라미터와 동일한 역할. $\beta \uparrow$ → 분포가 날카로워짐 (greedy), $\beta \downarrow$ → 균일해짐 (random) |
+| 자유에너지 최소화 | **ELBO 최대화** (부호 반전) | $F_q = F_{\text{exact}} + T \cdot D_{\text{KL}}(q \| p)$: VAE의 ELBO와 동일한 구조 |
+
+> **핵심 직관**: Boltzmann 분포는 "에너지가 낮은 상태일수록 높은 확률을 부여하는 softmax"이고, 분배함수 $Z$는 이 softmax의 분모입니다. VaTD 훈련은 이 거대한 softmax를 자기회귀 모델로 근사하는 과정입니다.
+
 ### 1.2 자유에너지와 열역학적 포텐셜
 
 > **ML 전문가를 위한 설명**: 자유에너지는 "에너지 최소화"와 "엔트로피 최대화" 사이의 균형을 정량화하는 손실함수입니다.
@@ -74,6 +91,18 @@ $$
 - **높은 온도** ($T \to \infty$): 엔트로피 $-TS$ 항이 지배 → 시스템은 가능한 한 많은 상태에 퍼짐 → **무질서 상**
 - **임계 온도** ($T = T_c$): 두 힘이 정확히 균형을 이루며, 스케일 불변성이 출현
 
+**VAE의 ELBO와의 대응**: 자유에너지의 변분 원리를 VAE의 ELBO(Evidence Lower Bound)와 나란히 비교하면 구조적 동치성이 명확해집니다:
+
+$$
+\underbrace{-\text{ELBO}}_{\text{VAE 손실}} = \underbrace{\mathbb{E}_{q_\phi}[-\log p(x|z)]}_{\text{재구성 오차}} + \underbrace{D_{\text{KL}}(q_\phi(z|x) \| p(z))}_{\text{사전분포 정칙화}}
+$$
+
+$$
+\underbrace{F_q}_{\text{변분 자유에너지}} = \underbrace{\langle E \rangle_q}_{\text{평균 에너지} \leftrightarrow \text{재구성 오차}} + \underbrace{T \langle \log q \rangle_q}_{\text{음의 엔트로피} \leftrightarrow \text{KL 정칙화}}
+$$
+
+두 경우 모두 (1) 데이터/물리에 맞는 방향과 (2) 분포를 퍼뜨리는 정칙화 사이의 트레이드오프이며, 온도 $T$가 이 균형을 제어합니다. VAE에서 KL 가중치를 조절하는 $\beta$-VAE의 $\beta$는 물리의 역온도 $\beta = 1/T$와 정확히 같은 역할을 합니다.
+
 ### 1.3 Boltzmann 분포
 
 주어진 온도 $T$에서 배위 $\mathbf{x}$가 나타날 확률은:
@@ -83,6 +112,14 @@ p(\mathbf{x} \mid T) = \frac{e^{-\beta H(\mathbf{x})}}{Z(\beta)}, \quad \beta = 
 $$
 
 이것은 기계학습에서 **에너지 기반 모델(EBM)**의 softmax 분포와 동일한 형태입니다. 분모 $Z(\beta)$는 정규화 상수이며, 2D Ising 모델의 경우 $2^N$개의 항을 합산해야 하므로 ($L = 16$이면 $2^{256}$개), 직접 계산은 불가능합니다.
+
+**Softmax temperature와의 관계**: LLM이나 분류 모델에서 사용하는 temperature scaling은 물리학의 온도와 동일한 수학적 구조입니다:
+
+$$
+\text{softmax}_T(z_i) = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}} \quad \longleftrightarrow \quad p(\mathbf{x} | T) = \frac{e^{-E(\mathbf{x}) / T}}{Z(T)}
+$$
+
+로짓 $z_i$가 음의 에너지 $-E(\mathbf{x})$에 대응합니다. 본 프로젝트의 `logit_temp_scale: true` 설정은 PixelCNN의 출력 로짓에 $\text{scale} = 1/T$를 곱하는데, 이것은 정확히 물리적 Boltzmann 분포의 $\beta = 1/T$ 스케일링을 구현한 것입니다. 고온($T \gg 1$)에서 출력이 $P \approx 0.5$에 가까워지고, 저온($T \ll 1$)에서 날카로워지는 것은 softmax temperature와 동일한 행동입니다.
 
 ### 1.4 요동-소산 정리 (Fluctuation-Dissipation Theorem)
 
@@ -134,6 +171,19 @@ $$
 
 **핵심 차이**: Higgs 메커니즘에서는 **국소(local) 게이지 대칭**이 깨지므로 Goldstone 보손이 게이지 보손에 "먹혀서" 질량을 줍니다. 반면 Ising 모델에서는 **전역 이산 대칭**이 깨지므로 연속 대칭의 Goldstone 정리가 적용되지 않고, 금보손(Goldstone boson)이 존재하지 않습니다.
 
+#### ML 관점: 대칭 깨짐과 Mode Collapse
+
+ML에서도 대칭 깨짐은 핵심적인 문제입니다:
+
+| 물리학 개념 | ML 대응 | 본 프로젝트 |
+|---|---|---|
+| $Z_2$ 대칭 ($s_i \to -s_i$) | **출력 분포의 다봉성(multimodality)** | $+M$과 $-M$ 두 상태가 동등 |
+| 자발적 대칭 깨짐 ($T < T_c$) | **Mode collapse** (GAN) / mode dropping | 모델이 한 모드만 학습 |
+| 명시적 대칭 깨짐 (`fix_first: 1`) | **조건화(conditioning)를 통한 모드 선택** | 첫 스핀 $= +1$ 고정 → $+M$ 섹터만 학습 |
+| 뉴런 순열 대칭 | **가중치 대칭** (모든 은닉 뉴런을 치환해도 동일 함수) | 학습 과정에서 자발적으로 깨짐 |
+
+`fix_first: 1`은 물리적으로는 $Z_2$ 대칭을 깨뜨리는 것이고, ML 관점에서는 **mode collapse를 구조적으로 방지하는 전략**입니다. 생성 모델이 $+M$과 $-M$을 동시에 학습하면 모델 용량의 절반이 중복되므로, 한 섹터를 선택함으로써 효율적인 학습이 가능합니다.
+
 **유효 포텐셜 관점**: Landau-Ginzburg 자유에너지 범함수는
 
 $$
@@ -180,6 +230,22 @@ $$
 
 > **ML 전문가를 위한 해석**: $T_c$에서 이미지의 모든 픽셀이 장거리 상관관계를 갖습니다. 이는 작은 커널의 국소적 CNN이 포착하기 가장 어려운 레짐이며, 확장 합성곱(dilated convolution)이 필수적인 이유입니다.
 
+**상관길이와 수용 영역(Receptive Field)의 직접 연결**:
+
+상관함수 $G(r) \sim e^{-r/\xi}$에서 상관길이 $\xi$는 "정보가 유의미하게 전파되는 거리"입니다. 신경망의 수용 영역(RF)은 하나의 출력 뉴런이 참조할 수 있는 입력 범위입니다. 물리적으로, 모델이 올바른 조건부 확률 $q(s_i | s_{<i})$를 학습하려면:
+
+$$
+\text{RF} \geq \xi(T), \quad \text{특히 } T \approx T_c \text{에서 } \xi \sim L \text{이므로 RF} \geq L
+$$
+
+| 온도 영역 | 상관길이 $\xi$ | 필요한 RF | 학습 난이도 |
+|---|---|---|---|
+| 고온 ($T \gg T_c$) | $\xi \ll 1$ (거의 독립) | 작은 RF도 충분 | 쉬움 (독립 Bernoulli에 가까움) |
+| 임계 ($T \approx T_c$) | $\xi \sim L = 16$ | **RF $\geq L$ 필수** | 가장 어려움 (장거리 상관) |
+| 저온 ($T \ll T_c$) | $\xi \ll 1$ (정렬됨) | 국소 도메인 벽만 포착 필요 | 쉬움 (거의 모든 스핀 동일) |
+
+이것이 본 프로젝트에서 확장 패턴 `[1,2,4,8]`로 RF $= 37 \times 37 > 16 \times 16$을 확보하는 물리적 이유입니다.
+
 ---
 
 ## 3. 상전이와 임계현상
@@ -205,6 +271,18 @@ Ising 모델의 상전이는 **2차(연속) 상전이**입니다. 1차 상전이
 | $\nu$ | 상관길이 | $\xi \sim \|t\|^{-\nu}$ | **1** | 1/2 |
 | $\eta$ | 이상차원 | $G(r) \sim r^{-(d-2+\eta)}$ | **1/4** | 0 |
 
+**임계지수가 신경망 학습에 미치는 실질적 영향**:
+
+각 임계지수는 $T_c$ 근방에서 신경망이 직면하는 구체적인 어려움과 직결됩니다:
+
+- **$\nu = 1$ (상관길이 발산)**: $\xi \sim |t|^{-1} \to \infty$이므로, **수용 영역이 격자 전체를 커버해야** 합니다. 국소 커널만으로는 장거리 상관을 포착할 수 없으며, 이것이 확장 합성곱(`dilation_pattern: [1,2,4,8]`)이 필수적인 물리적 근거입니다.
+
+- **$\gamma = 7/4$ (감수율 발산)**: 감수율은 외부 섭동에 대한 시스템의 응답입니다. 이것은 **가중치의 작은 변화(섭동)에 대한 모델 출력의 민감도가 $T_c$에서 발산**한다는 것을 의미합니다. `analyze_compression.py`에서 관측하는 "가중치 압축 시 $T_c$에서 최대 열화"가 정확히 이 현상입니다.
+
+- **$\alpha = 0$ (비열 로그 발산)**: 에너지 요동의 분산이 발산하므로, REINFORCE 기울기의 분산이 $T_c$에서 최대가 됩니다. 이것이 **온도별 RLOO 기준선**이 필요한 물리적 이유입니다.
+
+- **$\beta = 1/8$ (자화 지수)**: 질서변수가 매우 천천히 ($|t|^{1/8}$) 성장하므로, $T_c$ 바로 아래에서 자화 신호가 약하여 모델이 질서/무질서 상을 구분하기 어렵습니다.
+
 ### 3.3 평균장 이론은 왜 실패하는가?
 
 > **HEP 물리학자를 위한 설명**: 이것은 **상위 임계 차원(upper critical dimension)** 아래에서 요동이 지배적이라는 것과 관련됩니다.
@@ -216,6 +294,16 @@ Ising 모델의 상전이는 **2차(연속) 상전이**입니다. 1차 상전이
 - $d = 2$: 평균장이 **극적으로** 실패 ($\beta = 1/8$ vs 평균장 $1/2$)
 
 HEP에서 차원적 정칙화(dimensional regularization)로 $d = 4 - \epsilon$ 전개를 하는 것과 같은 맥락입니다. $\epsilon$이 클수록(낮은 차원일수록) 루프 보정이 중요해집니다.
+
+#### ML 관점: 평균장 ↔ 독립 픽셀 모델
+
+평균장 근사는 ML에서 **각 픽셀이 독립이라고 가정하는 모델**과 정확히 대응합니다:
+
+$$
+\underbrace{p_{\text{MF}}(\mathbf{s}) = \prod_i p(s_i | \langle s \rangle)}_{\text{평균장: 독립 스핀}} \quad \longleftrightarrow \quad \underbrace{q_{\text{indep}}(\mathbf{x}) = \prod_i q(x_i)}_{\text{독립 픽셀 모델}}
+$$
+
+평균장이 실패하는 이유는 **공간적 상관관계를 무시**하기 때문이며, 이는 독립 픽셀 모델이 실제 이미지 분포를 포착하지 못하는 것과 같습니다. 자기회귀 모델(PixelCNN)은 조건부 의존성 $q(x_i | x_{<i})$를 통해 공간 상관관계를 명시적으로 모델링하므로, 평균장을 넘어서는 "요동 보정"을 자연스럽게 포함합니다.
 
 ### 3.4 스케일링 관계 (Scaling Relations)
 
@@ -252,6 +340,21 @@ $$
 
 이들은 모두 2D Ising 보편성류에 속합니다. HEP 언어로: 다른 **UV 완비 이론**(UV completions)이 같은 **IR 고정점**으로 RG 흐름(flow)하는 것입니다. 격자 구조, 결합 상수의 부호, 심지어 물리적 차원(자성 vs 유체)까지 모두 RG 의미에서 **무관한(irrelevant) 연산자**에 해당합니다.
 
+#### ML 관점: 보편성류와 Transfer Learning
+
+보편성류는 ML의 **전이 학습(transfer learning)**과 깊은 구조적 유사성을 가집니다:
+
+- **보편성류**: 미시적 세부사항(격자 구조, 상호작용 형태)이 다르더라도 **임계점의 거시적 행동**은 동일
+- **Transfer learning**: 사전학습 도메인(ImageNet, 텍스트)이 다르더라도 **학습된 특성 표현**은 새로운 태스크에 전이 가능
+
+두 현상 모두 같은 메커니즘으로 설명됩니다: **RG 흐름이 무관한 세부사항을 제거하고 관련 정보만 보존**합니다. 사전학습된 CNN의 초기 층(에지, 텍스처 검출)은 도메인에 무관한(irrelevant) 특성이 이미 제거된 보편적 표현이며, 이것이 다양한 도메인에서 전이가 가능한 이유입니다.
+
+| RG 개념 | Transfer Learning 대응 |
+|---|---|
+| 무관 연산자 (IR에서 소멸) | 도메인 특수적 특성 (전이 시 제거됨) |
+| 관련 연산자 (IR에서 성장) | 보편적 특성 (에지, 텍스처 — 전이됨) |
+| 같은 보편성류 = 같은 임계지수 | 같은 "특성 공간" = 같은 전이 성능 |
+
 ### 3.6 비열의 로그 발산: 왜 특별한가?
 
 2D Ising 모델의 비열은 $\alpha = 0$으로, 거듭제곱 법칙 대신 **로그 발산**을 보입니다:
@@ -285,15 +388,15 @@ Lars Onsager의 1944년 해는 이론물리학에서 가장 중요한 결과 중
 
 ### 4.2 임계온도의 도출: Kramers-Wannier 쌍대성
 
-> **HEP 물리학자를 위한 설명**: 이것은 $\mathcal{N}=4$ SYM의 Montonen-Olive (S-) 쌍대성과 구조적으로 유사합니다.
-
 Kramers와 Wannier(1941)는 Onsager보다 2년 앞서, 분배함수가 고온 전개와 저온 전개 사이의 **쌍대성(duality)**을 만족함을 보였습니다. 고온과 저온이 서로 매핑되며, 상전이가 유일하다면 자기쌍대점(self-dual point)에서 발생해야 합니다:
 
 $$
 \sinh(2J/T_c) = 1 \quad \Longrightarrow \quad T_c = \frac{2J}{\ln(1 + \sqrt{2})} \approx 2.269
 $$
 
-S-쌍대성에서 결합상수가 $g \to 1/g$로 매핑되고 자기쌍대점이 $g = 1$인 것처럼, Kramers-Wannier 쌍대성에서 자기쌍대점이 임계온도를 결정합니다.
+> **물리 배경 참고**: 이 쌍대성은 고온($T \to \infty$)과 저온($T \to 0$)의 분배함수를 서로 교환하는 변환입니다. HEP의 S-쌍대성($g \to 1/g$)과 구조적으로 유사하지만, 여기서 중요한 것은 실용적 결과입니다.
+
+**실용적 의미**: 이 관계로부터 $T_c \approx 2.269$ ($\beta_c \approx 0.441$)가 엄밀하게 결정됩니다. 본 프로젝트의 모든 분석에서 이 값이 기준점으로 사용되며, `analyze_rank.py`와 `analyze_compression.py`에서 eRank 곡선의 극값 위치를 이 정확한 $T_c$와 비교합니다. 유한 크기($L = 16$) 효과로 인한 유사임계온도 이동 $T_c(L) \approx T_c + O(L^{-1})$도 이 엄밀해를 기준으로 정량화됩니다.
 
 ### 4.3 엄밀한 결과들
 
@@ -352,13 +455,72 @@ RG 고정점 근방에서 연산자를 분류합니다:
 | 깊은 층 | 반복된 RG 변환 |
 | 잔차(residual) 연결 | 관련 연산자의 보존 |
 
+**Mehta & Schwab (2014)의 정확한 매핑**: 이 유사성은 단순한 비유가 아닙니다. Mehta와 Schwab은 2D Ising 모델에서 학습된 RBM(Restricted Boltzmann Machine)의 가중치 행렬이 실공간 RG 변환(블록 스핀)과 **정확히 일치**함을 보였습니다:
+
+- RBM의 은닉 뉴런 $h_j$ = 블록 스핀 변수 (조대화된 자유도)
+- RBM의 가중치 행렬 $W_{ij}$ = 다수결(majority rule) 조대화 커널
+- RBM 층의 깊이 = RG 스텝의 횟수
+
+이는 **심층 신경망이 RG를 자연스럽게 수행한다**는 것을 의미합니다: 각 층이 미세 스케일의 자유도를 제거하고 거시적 집단 변수만 보존합니다.
+
+**깊이와 Low-Rank Bias**: Arora et al. (2019)는 깊은 행렬 분해(deep matrix factorization)에서 경사 하강법이 자연스럽게 저랭크 해를 찾는다는 것을 증명했습니다. 이것은 RG 해석과 결합하면 강력한 예측을 제공합니다: **깊은 층을 거칠수록 무관 연산자가 소멸하므로 유효 랭크가 감소**합니다. 이것이 `LOW_RANK.md`에서 관측하는 층별 랭크 구조의 이론적 배경입니다.
+
+**한계점 — CNN ≠ RG**: 이 유사성에는 중요한 차이가 있습니다:
+- RG는 **비가역적**(irreversible) 조대화입니다 — UV 정보가 영구히 손실됩니다
+- CNN은 **정보를 파괴하지 않습니다** — 잔차 연결이나 스킵 연결을 통해 세부 정보가 보존될 수 있습니다
+- RG 흐름은 결합상수 공간에서의 궤적이지만, CNN의 가중치 갱신은 매개변수 공간에서의 최적화입니다
+- 따라서 CNN-RG 유사성은 **정보 흐름의 구조적 유사성**이지, 정확한 수학적 동치는 아닙니다
+
 `LOW_RANK.md`의 결과(Section 5.1)에서 **초기 층(Block 0-1)이 $T_c$에서 가장 깊은 랭크 하락**을 보이는 것은 RG 해석과 일치합니다: 초기 층은 UV(단파장) 자유도를 적분해 내는 조대화를 수행하고, 후기 층은 이미 재규격화된 IR(장파장) 변수를 다룹니다.
+
+### 5.4 딥러닝에서의 상전이 현상
+
+물리학의 상전이 개념은 딥러닝 연구에서도 핵심적인 현상을 설명하는 데 활용되고 있습니다:
+
+#### Grokking과 Effective Rank
+
+**Grokking** (Power et al., 2022)은 신경망이 훈련 데이터를 암기한 후, 추가 훈련을 통해 갑자기 일반화 성능을 획득하는 현상입니다. 이것은 **상전이와 유사한 급격한 전환**입니다:
+
+- 암기 단계: 가중치의 effective rank가 높음 (과적합, 무질서 상과 유사)
+- 일반화 전환: effective rank가 **급격히 하락** → 가중치가 저차원 구조로 수렴
+- 전환점: 손실 곡선에서 급격한 변화 (임계점과 유사)
+
+이것은 본 프로젝트의 관찰과 직접 연결됩니다: $T_c$에서 활성화 랭크가 급락하는 것은, 신경망이 임계점의 저차원 구조를 "발견"하는 일종의 grokking입니다.
+
+#### Neural Collapse
+
+**Neural collapse** (Papyan et al., 2020)은 분류 신경망의 마지막 층에서 클래스 특성이 정규 심플렉스(simplex)로 수렴하는 현상입니다:
+
+- 마지막 층 활성화의 클래스 내 분산 → 0 (rank collapse)
+- 클래스 평균 특성이 **정확히 $K$개의 방향**으로 수렴 ($K$ = 클래스 수)
+- 이것은 물리적으로 **완전한 대칭 깨짐** — 연속적 특성 공간이 이산적 구조로 응축
+
+Neural collapse에서의 랭크 $= K$(클래스 수)는, 2D Ising에서의 eRank $\approx 3$–$5$(관련 연산자 수 + 보정)와 같은 물리적 메커니즘입니다: 두 경우 모두 시스템의 실질적 자유도 수로 차원이 축소됩니다.
+
+#### Edge of Chaos와 보편성류
+
+신경망 초기화에서 **edge of chaos** (Poole et al., 2016)는 신호가 폭발하지도 소멸하지도 않는 임계 초기화 조건입니다. 최근 연구 (Roberts et al., *Phys. Rev. Research*, 2025)는 이 임계점이 물리적 상전이와 **같은 보편성류**에 속할 수 있음을 보여주었습니다:
+
+- 가중치 분산 $\sigma_w^2$가 임계값 아래: 신호 소멸 (질서 상)
+- 가중치 분산 $\sigma_w^2$가 임계값 위: 신호 폭발 (무질서 상/혼돈)
+- 임계점: 정보가 최대한 깊이 전파 = 가장 효과적인 학습
+
+이는 "좋은 초기화"가 물리학적 임계점에 해당한다는 것을 의미하며, 본 프로젝트에서 임계 온도의 학습이 가장 어려운 것과 연결됩니다.
 
 ---
 
 ## 6. 2D Ising CFT: c = 1/2 최소 모델
 
-> **HEP 물리학자를 위한 설명**: 끈이론이나 2D QFT를 아신다면, 이 섹션이 가장 자연스러울 것입니다.
+> **ML 독자를 위한 도입**: 이 섹션은 수학적으로 밀도가 높지만, 핵심 메시지는 간단합니다:
+>
+> **"임계점에서 시스템의 자유도가 몇 개인가?"에 대한 정확한 답을 제공합니다.**
+>
+> CFT(등각장론)는 임계점의 물리를 완전히 분류합니다. 2D Ising의 경우:
+> - **관련 연산자 = 2개** ($\sigma$: 자화, $\epsilon$: 에너지 밀도)
+> - 이것은 네트워크가 $T_c$에서 포착해야 할 **독립적인 물리 모드의 수**입니다
+> - `analyze_rank.py`에서 eRank가 $T_c$ 부근에서 3–5로 떨어지는 것 = **2개 관련 연산자 + 항등원 + 유한 크기 보정**의 물리적 반영
+>
+> 수학적 세부사항을 건너뛰더라도, "관련 연산자 수 → eRank 하한"이라는 핵심 연결만 기억하시면 됩니다.
 
 ### 6.1 임계점에서의 등각 불변성
 
@@ -372,23 +534,34 @@ $$
 c = \frac{1}{2}
 $$
 
-Virasoro 대수:
+**중심 전하의 직관적 의미**: $c$는 시스템의 **유효 자유도 수**를 세는 양입니다.
+- $c = 1/2$: 자유 Majorana 페르미온 **1개** (가장 단순한 비자명 CFT)
+- $c = 1$: 자유 보손 **1개** (또는 Dirac 페르미온 1개)
+- $c = 7/10$: 3-상태 Potts 모델 (더 복잡한 임계점)
 
-$$
-[L_m, L_n] = (m-n)L_{m+n} + \frac{c}{12}m(m^2 - 1)\delta_{m+n,0}
-$$
+$c$가 작을수록 임계점의 물리가 **단순하고 제약적**입니다. $c = 1/2$는 가능한 가장 단순한 임계점으로, 일차 연산자가 겨우 3개뿐입니다. 이것이 2D Ising이 "가장 단순한 상전이 시스템"인 이유입니다.
 
-$c = 1/2$는 **자유 Majorana 페르미온** 하나에 해당합니다. 이 연결은 심오합니다: 2D Ising 임계 모델은 **질량 없는 Majorana 페르미온 장론**과 동치입니다. $T \neq T_c$에서 페르미온은 질량 $m \sim |t|^\nu = |t|$를 획득하며, 이것이 역 상관길이입니다.
+> **수학적 배경** (선택적): 등각 대칭의 생성자는 Virasoro 대수 $[L_m, L_n] = (m-n)L_{m+n} + \frac{c}{12}m(m^2 - 1)\delta_{m+n,0}$를 만족합니다. $c$는 이 대수의 중심 확장(central extension)으로, 양자 이상(quantum anomaly)에서 기원합니다.
+
+물리적으로, $c = 1/2$는 2D Ising 임계 모델이 **질량 없는 Majorana 페르미온 장론**과 동치임을 의미합니다. $T \neq T_c$에서 페르미온은 질량 $m \sim |t|^\nu = |t|$를 획득하며, 이것이 역 상관길이입니다.
 
 ### 6.3 일차 연산자와 Kac 테이블
 
 M(4,3) 최소 모델에는 정확히 **3개의 일차 연산자(primary operator)**가 있습니다:
 
-| 연산자 | 기호 | 등각 무게 $(h, \bar{h})$ | 스케일링 차원 $\Delta = h + \bar{h}$ | 물리적 의미 |
-|--------|------|------------------------|--------------------------------------|------------|
-| 항등원 | $\mathbb{1}$ | $(0, 0)$ | 0 | 진공 |
-| 스핀 | $\sigma$ | $(1/16, 1/16)$ | $1/8$ | 자화 밀도 |
-| 에너지 | $\epsilon$ | $(1/2, 1/2)$ | $1$ | 에너지 밀도 섭동 |
+| 연산자 | 기호 | 스케일링 차원 $\Delta$ | 물리적 의미 | **신경망에서의 의미** |
+|--------|------|----------------------|------------|---------------------|
+| 항등원 | $\mathbb{1}$ | 0 | 진공 (기저 상태) | 평균 배경 (DC 성분) |
+| 스핀 | $\sigma$ | $1/8$ | 자화 밀도 | **전역 자화 모드** — 가장 중요한 특성 |
+| 에너지 | $\epsilon$ | $1$ | 에너지 밀도 섭동 | **국소 에너지 요동 모드** — 두 번째 중요 특성 |
+
+**ML 관점에서의 재해석**: 이 3개의 일차 연산자는 **신경망이 $T_c$에서 학습해야 할 독립 특성**입니다:
+
+- $\mathbb{1}$ (항등원): 평균 배경 — 모든 온도에서 존재하는 기본 모드
+- $\sigma$ (스핀 연산자): 전역 자화 패턴 — 저온에서 질서를 형성하는 모드
+- $\epsilon$ (에너지 연산자): 국소 에너지 요동 — 인접 스핀 간의 정렬/비정렬 패턴
+
+임계점에서 이 **2개의 관련 연산자** ($\sigma$, $\epsilon$)만으로 시스템의 모든 장거리 물리가 결정됩니다. 나머지 무한히 많은 연산자(고차 보정)는 무관 연산자로서 RG 흐름 아래에서 소멸합니다. 이것이 `analyze_rank.py`에서 eRank가 $T_c$에서 3–5로 떨어지는 물리적 기원입니다: **2개 관련 연산자 + 항등원 + 유한 크기 보정**.
 
 스케일링 차원으로부터 임계지수가 직접 결정됩니다:
 
@@ -408,7 +581,9 @@ $$
 \sigma \times \sigma = \mathbb{1} + \epsilon, \quad \sigma \times \epsilon = \sigma, \quad \epsilon \times \epsilon = \mathbb{1}
 $$
 
-이것은 QFT의 **연산자곱 전개(OPE)**와 형식적으로 동일하며, 등각 부트스트랩(conformal bootstrap)을 통해 모든 상관함수를 결정합니다. 현대 등각 부트스트랩 프로그램(Rattazzi-Rychkov-Tonni-Vichi, 2008)은 유니타리성 한계와 교차 대칭을 이용하여 3D Ising 임계지수를 높은 정밀도로 재도출했습니다 — HEP의 S-행렬 부트스트랩과 동일한 기술입니다.
+이것은 QFT의 **연산자곱 전개(OPE)**의 이산 버전입니다. 핵심 메시지는: 3개의 일차 연산자와 이 융합 규칙만으로 **모든 상관함수가 완전히 결정**된다는 것입니다. 이것이 2D Ising이 "정확히 풀 수 있는(exactly solvable)" 이유입니다.
+
+> **등각 부트스트랩** (심화 참고): 현대 등각 부트스트랩 프로그램(El-Showk et al., 2012)은 대칭성 제약조건만으로 3D Ising 임계지수를 높은 정밀도로 결정했습니다. 이것은 ML의 "제약 최적화"와 유사합니다 — 물리적 일관성 조건(유니타리성, 교차 대칭)이 허용 가능한 해를 극도로 제한합니다.
 
 ---
 
@@ -452,9 +627,13 @@ Low-rank hypothesis는 $\sigma_k$가 $k$에 대해 빠르게(종종 지수적으
 
 ### 7.5 본 프로젝트와의 관계
 
-Thibeault 논문은 **네트워크 결합 행렬**의 특이값 스펙트럼을 분석합니다. 본 프로젝트(`LOW_RANK.md`)는 이를 확장하여 **신경망 활성화(activation)**의 유효 랭크를 온도의 함수로 측정합니다. 이는 관련되지만 구별되는 질문입니다: "물리계를 학습하는 신경망이 hypothesis에서 예측하는 low-rank 구조를 내면화하는가?"
+Thibeault 논문은 **네트워크 결합 행렬**의 특이값 스펙트럼을 분석합니다. 본 프로젝트(`LOW_RANK.md`)는 이를 세 가지 방향으로 확장합니다:
 
-> **이것은 독창적인 확장입니다**: Thibeault는 결합 행렬의 정적 속성을 분석하지만, 본 프로젝트는 학습된 표현의 동적(온도 의존적) 랭크 변화를 추적합니다.
+**확장 1: 정적 구조 → 동적 표현**. Thibeault는 결합 행렬 $W$의 정적 특이값 스펙트럼을 분석하지만, 본 프로젝트는 신경망의 **활성화(activation)**가 온도에 따라 어떻게 변하는지를 추적합니다. 같은 가중치를 가진 네트워크가 다른 온도의 입력에 대해 다른 유효 랭크를 보이는 것은, low-rank 구조가 네트워크 구조가 아닌 **입력 데이터의 물리적 특성**에서 기원함을 보여줍니다.
+
+**확장 2: 물리계 → 학습된 표현**. 원래 hypothesis는 "물리 시스템의 결합 행렬이 low-rank"라는 주장입니다. 본 프로젝트는 더 나아가 "물리 시스템을 **학습한 신경망의 내부 표현**이 그 low-rank 구조를 반영한다"는 것을 실험적으로 보여줍니다.
+
+**확장 3: 온도 의존적 랭크 프로파일**. 가장 중요한 새 발견은 eRank의 온도 의존성입니다: 고온에서 높고, $T_c$에서 급락하며, 저온에서 부분 회복합니다. 이 비단조적 프로파일은 Thibeault 논문에서 다루지 않는 것으로, RG 흐름과 CFT의 관련 연산자 수로 설명됩니다.
 
 ### 7.6 Koopman 연산자와의 관계
 
@@ -467,6 +646,30 @@ Low-rank hypothesis는 **Koopman 연산자 이론**과 병행하지만 구별되
 | Low-rank 의미 | 상호작용 위상의 소수 지배적 특이 모드 | 역학의 소수 지배적 고유함수 |
 
 두 프레임워크 모두 같은 물리적 현상의 표현입니다: 전이 근처의 복잡계는 소수의 집단적 자유도에 의해 지배됩니다.
+
+### 7.7 Low-Rank Hypothesis와 현대 ML 연구의 접점
+
+Low-rank hypothesis는 물리학에서 출발했지만, 현대 ML 연구의 핵심 결과들과 깊이 연결됩니다:
+
+#### Implicit Rank Regularization (Arora et al., 2019)
+
+경사 하강법(GD)으로 행렬 분해를 학습하면, 명시적 정칙화 없이도 **저랭크 해가 자연스럽게 선호**됩니다. 심층 행렬 분해 $W = W_L \cdots W_2 W_1$에서 깊이가 증가할수록 이 implicit bias가 강화됩니다. 이것은 low-rank hypothesis의 ML 내부 메커니즘입니다: 물리 시스템이 저랭크인 것뿐 아니라, **신경망 최적화 자체가 저랭크를 선호**합니다.
+
+#### LoRA: Low-Rank Adaptation (Hu et al., 2021)
+
+대규모 언어 모델의 미세조정에서 가중치 업데이트 $\Delta W = BA$ ($B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times d}$, $r \ll d$)로 제한해도 전체 미세조정과 동등한 성능을 달성합니다. 이것이 가능한 이유는:
+
+- 미세조정 시 가중치 변화가 **본질적으로 저랭크 부분공간**에 놓여 있음
+- 이는 사전학습된 모델이 이미 "관련 연산자"를 학습했고, 미세조정은 소수의 방향만 조정하면 되기 때문
+- Low-rank hypothesis의 직접적 응용: 실질적 자유도 $r \ll d$
+
+#### ARSVD: Adaptive Rank SVD (2024)
+
+특이값 스펙트럼의 **스펙트럼 엔트로피**를 기반으로 최적 랭크를 적응적으로 결정하는 방법입니다. 본 프로젝트의 eRank (Roy & Vetterli, 2007)와 같은 정보이론적 접근이지만, 모델 압축에 직접 활용됩니다. 핵심 아이디어: "얼마나 압축할 수 있는가?"는 물리학의 "관련 자유도가 몇 개인가?"와 같은 질문입니다.
+
+#### AlphaPruning (NeurIPS 2024)
+
+가중치 행렬의 특이값 분포가 **heavy-tailed power law** $p(\sigma) \sim \sigma^{-\alpha}$를 따른다는 관찰에 기반한 가지치기(pruning) 방법입니다. 꼬리 지수 $\alpha$가 작을수록 해당 층이 더 잘 학습되었음(더 low-rank)을 나타내며, 이를 기반으로 층별 가지치기 비율을 결정합니다. 이것은 RG 관점에서 자연스럽습니다: 잘 학습된 층은 무관 연산자를 효과적으로 제거했으므로 더 공격적으로 압축할 수 있습니다.
 
 ---
 
@@ -495,6 +698,14 @@ A_k = \underset{\text{rank}(B) \leq k}{\arg\min} \|A - B\|_F, \qquad \|A - A_k\|
 $$
 
 이 정리는 `analyze_compression.py`에서 가중치 행렬을 압축할 때 사용되는 이론적 기반입니다.
+
+**현대 모델 압축과의 연결**: Eckart-Young 정리는 LoRA를 포함한 거의 모든 SVD 기반 모델 압축의 이론적 토대입니다:
+
+- **LoRA adapter**: 가중치 업데이트 $\Delta W = BA$는 Eckart-Young의 최적 랭크-$r$ 근사를 파라미터화한 것입니다
+- **SVD pruning**: 작은 특이값을 제거하는 것은 무관 연산자(RG 언어)를 폐기하는 것과 동치
+- **Implicit low-rank bias**: GD로 학습된 가중치가 이미 저랭크이므로, SVD 절단의 정보 손실이 작습니다
+
+본 프로젝트의 `analyze_compression.py`는 이 연결을 직접 검증합니다: SVD 절단 비율(90%, 75%, 50%, 25%, 10%)에 따른 자유에너지 열화를 온도별로 측정하여, **$T_c$에서 압축 민감도가 최대**임을 보여줍니다.
 
 ### 8.3 유효 랭크 (Effective Rank, erank)
 
@@ -642,6 +853,19 @@ $3 \times 3$ 커널과 확장 $[1, 2, 4, 8]$을 8개 층에 적용하면 수용 
 - 모델이 배위를 생성하고, Boltzmann 분포와의 차이를 줄이는 방향으로 학습
 - 이것은 본질적으로 **강화학습(RL) / 자기 대국(self-play)** 설정
 
+**RL 프레이밍**: VaTD를 강화학습의 언어로 정확히 대응시키면:
+
+| RL 개념 | VaTD 대응 | 구체적 구현 |
+|---|---|---|
+| **에이전트 (Agent)** | PixelCNN | 자기회귀 신경망 |
+| **상태 (State)** | 이전 스핀들 $s_{<i}$ | 래스터 순서로 생성된 앞선 스핀 |
+| **행동 (Action)** | 현재 스핀 선택 $s_i \in \{-1, +1\}$ | Bernoulli 확률로 샘플링 |
+| **에피소드** | 완전한 스핀 배위 $\mathbf{x}$ | 256개 스핀의 순차 생성 |
+| **보상 (Reward)** | $-(\log q_\theta(\mathbf{x}) + \beta E(\mathbf{x}))$ | 낮은 에너지 + 높은 엔트로피 |
+| **환경 (Environment)** | 물리 법칙 (Ising 해밀토니안) | `energy(samples, beta)` |
+
+핵심적인 차이: 일반적인 RL에서는 환경과의 상호작용이 필요하지만, VaTD에서는 에너지 함수가 해석적이므로 **환경 시뮬레이션이 불필요**합니다. 이것이 "데이터 없는 생성 모델"의 의미입니다 — 보상 함수(에너지)가 물리에서 직접 주어집니다.
+
 ### 10.2 KL 발산에서 자유에너지로
 
 학습된 분포 $q_\theta(\mathbf{x})$와 목표 Boltzmann 분포 $p_\beta(\mathbf{x}) = e^{-\beta E(\mathbf{x})}/Z(\beta)$ 사이의 KL 발산:
@@ -663,6 +887,25 @@ F_q = F_{\text{exact}} + T \cdot D_{\text{KL}}(q_\theta \| p_\beta) \geq F_{\tex
 $$
 
 $D_{\text{KL}} \geq 0$이므로 $F_q \geq F$이고, **등호 조건은 $q_\theta = p_\beta$일 때**입니다.
+
+**VAE ELBO vs VaTD 변분 자유에너지의 명시적 비교**:
+
+$$
+\boxed{
+\begin{aligned}
+\text{VAE:} \quad & -\text{ELBO} = \underbrace{\mathbb{E}_{q_\phi(z|x)}[-\log p_\theta(x|z)]}_{\text{재구성 오차}} + \underbrace{D_{\text{KL}}(q_\phi(z|x) \| p(z))}_{\text{사전분포 정칙화}} \\[6pt]
+\text{VaTD:} \quad & \beta F_q = \underbrace{\mathbb{E}_{q_\theta}[\beta E(\mathbf{x})]}_{\text{평균 에너지} \leftrightarrow \text{재구성 오차}} + \underbrace{\mathbb{E}_{q_\theta}[\log q_\theta(\mathbf{x})]}_{\text{음의 엔트로피} \leftrightarrow \text{KL 정칙화}}
+\end{aligned}
+}
+$$
+
+| 측면 | VAE | VaTD |
+|---|---|---|
+| 목표 | 데이터 분포 $p_{\text{data}}(x)$ 근사 | Boltzmann 분포 $p_\beta(\mathbf{x})$ 근사 |
+| 변분 분포 | 인코더 $q_\phi(z\|x)$ (잠재 공간) | 자기회귀 모델 $q_\theta(\mathbf{x})$ (배위 공간) |
+| 부등식 | $\log p(x) \geq \text{ELBO}$ | $F_q \geq F_{\text{exact}}$ |
+| 등호 조건 | 완벽한 인코더/디코더 | $q_\theta = p_\beta$ |
+| 훈련 데이터 | **필요** ($x \sim p_{\text{data}}$) | **불필요** (에너지 함수만 있으면 됨) |
 
 ### 10.3 훈련 목적함수
 
@@ -757,6 +1000,28 @@ $$
 | 기준선 $b$ | RLOO 기준선 |
 | REINFORCE 기울기 | 스코어 함수 $\times$ 어드밴티지 |
 
+### 11.7 현대 REINFORCE 변종들과의 비교
+
+VaTD의 온도별 RLOO는 최근 LLM 정렬(alignment) 연구에서 등장한 REINFORCE 변종들과 구조적으로 관련됩니다:
+
+| 방법 | 기준선 구성 | 정규화 | 핵심 아이디어 |
+|------|-----------|--------|------------|
+| **RLOO (VaTD)** | 온도 그룹 내 LOO 평균 | 온도별 독립 | 같은 물리 조건의 샘플끼리 비교 |
+| **GRPO** (DeepSeek, 2024) | 그룹 내 평균 + 표준편차 정규화 | $A_i = (r_i - \mu_G) / \sigma_G$ | 그룹별 z-score 정규화 |
+| **REINFORCE++** (Hu et al., 2025) | 글로벌 이동 평균 | 토큰 수준 KL 페널티 | 실시간 기준선 + KL 정칙화 |
+| **James-Stein baseline** (2025) | Shrinkage: $b^* = \lambda \bar{f}_{\text{group}} + (1-\lambda) \bar{f}_{\text{global}}$ | 최적 보간 | 그룹 vs 글로벌 기준선의 최적 혼합 |
+
+**VaTD의 온도별 RLOO는 어디에 위치하는가?**
+
+VaTD의 접근은 GRPO와 가장 유사합니다: 둘 다 **그룹별 독립적인 기준선**을 사용합니다.
+
+- GRPO에서 "그룹" = 같은 프롬프트에 대한 여러 응답
+- VaTD에서 "그룹" = 같은 온도 $\beta_k$에 대한 여러 배위
+
+차이점: GRPO는 표준편차로 정규화하지만, VaTD는 정규화하지 않습니다. 물리적으로 이것은 정당합니다: 같은 온도의 에너지 스케일은 이미 $\beta$에 의해 결정되므로, 추가 정규화가 물리적 신호를 왜곡할 수 있습니다.
+
+James-Stein shrinkage baseline은 향후 개선 방향을 제시합니다: 온도별 기준선(그룹)과 전체 기준선(글로벌)을 최적 비율로 혼합하면, 그룹 크기가 작을 때 (= 온도당 샘플 수가 적을 때) 분산을 더 줄일 수 있습니다.
+
 ---
 
 ## 12. 핵심 연결: 왜 임계점에서 Low-Rank인가?
@@ -801,6 +1066,23 @@ $$
 
 가중치 절단은 모델의 유효 해밀토니안에 대한 "섭동"을 도입하고, 그 응답(열화)은 $T_c$에서 $\chi$와 함께 발산합니다.
 
+#### Information Bottleneck Theory 관점
+
+이 압축 역설은 **Information Bottleneck (IB) Theory** (Tishby et al., 2000; Shwartz-Ziv & Tishby, 2017)의 관점에서 더 깊이 이해됩니다:
+
+IB 원리는 표현 $T$가 입력 $X$에 대한 압축 $I(X; T)$을 최소화하면서, 출력 $Y$에 대한 예측 $I(T; Y)$를 최대화하는 최적 트레이드오프를 찾습니다:
+
+$$
+\min_{p(t|x)} \; I(X; T) - \beta_{\text{IB}} \cdot I(T; Y)
+$$
+
+임계점은 이 트레이드오프의 **최적 지점**에 해당합니다:
+- **최대 압축** (낮은 eRank): 관련 없는 자유도가 모두 제거됨 → $I(X; T)$ 최소
+- **최대 예측력** (높은 압축 민감도): 남은 자유도가 물리의 핵심을 포착 → $I(T; Y)$ 최대
+- 더 이상 압축하면 핵심 정보가 손실 → 민감도 발산
+
+이것은 **적대적 강건성(adversarial robustness)**과도 연결됩니다: 임계점 표현은 가장 효율적이지만, 가중치에 대한 작은 섭동(적대적 공격)에 가장 취약합니다. 마치 연필을 세우는 것처럼, 최적 균형점이 곧 최대 불안정점입니다.
+
 ### 12.3 $d(\text{eRank})/dT$와 $C_v$의 관계
 
 비열은 에너지 요동의 **크기**를 측정합니다:
@@ -826,6 +1108,23 @@ eRank 히트맵(`LOW_RANK.md` Figure 1d)에서 **초기 층에서 랭크 하락�
 
 2D Ising 임계 고정점에서 관련 연산자는 정확히 **2개** ($\epsilon$과 $\sigma$)입니다. eRank가 $T_c$에서 $\sim 3$–$5$로 떨어지는 관측은, 네트워크가 이 소수의 관련 방향과 약간의 보정을 발견하는 것과 일치합니다.
 
+#### Rank Diminishing Theorem과의 연결
+
+Huang et al. (2022)은 심층 신경망에서 **층을 지나며 활성화 랭크가 단조 감소하는 보편적 성질**을 증명했습니다:
+
+$$
+\text{rank}(f_{l+1}(X)) \leq \text{rank}(f_l(X))
+$$
+
+여기서 $f_l(X)$는 $l$번째 층의 활성화입니다. 이 정리는 ReLU와 같은 비선형 활성화 함수가 행렬의 랭크를 보존하거나 감소시키는 성질에 기반합니다.
+
+이것은 **RG 흐름의 신경망 내부 반영**입니다:
+- RG: 각 조대화 스텝에서 무관 연산자가 소멸 → 유효 자유도 감소
+- 신경망: 각 층에서 활성화 랭크가 감소 → 독립 특성 채널 감소
+- 두 경우 모두 깊이(또는 스케일)가 증가할수록 **관련 정보만 남는** 정보 압축 과정
+
+본 프로젝트의 eRank 히트맵에서 관찰되는 "초기 층에서 급격한 랭크 하락, 후기 층에서 안정화" 패턴은 이 정리의 직접적 반영입니다.
+
 ### 12.5 유한 크기 효과
 
 $L = 16$에서의 주요 효과:
@@ -842,6 +1141,52 @@ $L = 16$은 다음과 같은 이유로 선택되었습니다:
 2. $N = 256$ 스핀의 순차 샘플링이 관리 가능
 3. 수용 영역이 격자를 완전히 포괄
 4. 계산물리학 벤치마크로 널리 사용됨
+
+### 12.6 실용적 함의: 신경망 설계에 대한 교훈
+
+본 프로젝트의 결과에서 도출되는, 물리-정보 기반 신경망 설계의 실용적 지침을 정리합니다:
+
+#### 임계점 근처 학습이 어려운 이유: Critical Slowing Down
+
+물리학에서 **critical slowing down**은 임계점 근방에서 시스템의 이완 시간(relaxation time)이 발산하는 현상입니다:
+
+$$
+\tau \sim \xi^z \sim |T - T_c|^{-z\nu}
+$$
+
+여기서 $z$는 동적 임계지수입니다. 신경망 학습에서 이것은 **Hessian의 조건수(condition number) 악화**로 나타납니다:
+
+- 임계점에서 손실 지형(loss landscape)의 곡률이 극도로 비등방적
+- 가장 급한 방향(관련 연산자)과 가장 완만한 방향(무관 연산자)의 곡률 비율이 발산
+- 이는 경사 하강법의 수렴 속도를 극적으로 저하시킴
+
+**실용적 대응**: 본 프로젝트에서 사용하는 2-phase curriculum (`curriculum_enabled: true`)은 이 문제의 물리적으로 동기부여된 해결책입니다.
+
+#### Curriculum Learning의 물리적 정당화
+
+2-phase curriculum (Phase 1: 고온만 → Phase 2: 점진적으로 $\beta_{\max}$ 확장)의 물리적 근거:
+
+1. **고온 = 쉬운 학습**: $T \gg T_c$에서 스핀이 거의 독립이므로, 독립 Bernoulli에 가까운 단순한 분포 → 빠른 초기 수렴
+2. **점진적 저온 확장**: 고온에서 학습한 가중치가 저온 학습의 좋은 초기화 제공 — RG 관점에서, 고온 고정점의 근방에서 학습을 시작하여 임계 고정점으로 이동
+3. **임계점 회피**: 임계점을 직접 학습하지 않고, 양쪽(고온/저온)에서 점진적으로 접근하여 critical slowing down을 완화
+
+이것은 시뮬레이티드 어닐링(simulated annealing)의 역방향 버전입니다: 어닐링은 고온에서 저온으로 냉각하여 최적해를 찾지만, curriculum learning은 쉬운 문제에서 어려운 문제로 확장하여 학습을 안정화합니다.
+
+#### 확장 합성곱의 필요성: $\xi$ 발산 → RF $\geq L$
+
+상관길이의 온도 의존성으로부터 수용 영역 요구사항이 직접 도출됩니다:
+
+$$
+\xi(T) \sim |T - T_c|^{-\nu} \xrightarrow{T \to T_c} L \quad \Longrightarrow \quad \text{RF} \geq L
+$$
+
+| 아키텍처 | RF ($3 \times 3$ 커널, 8층) | $L = 16$ 커버 | $L = 32$ 커버 |
+|---|---|---|---|
+| 일반 CNN (dilation = 1) | $17 \times 17$ | 겨우 충족 | 불충분 |
+| 확장 CNN (`[1,2,4,8]`) | $61 \times 61$ | 여유 있음 | 충족 |
+| 확장 CNN (`[1,2,4,8,16]`) | $125 \times 125$ | — | 여유 있음 |
+
+이것은 **격자 크기를 키울 때 자동으로 확장 패턴을 조정해야 하는** 설계 원칙을 제공합니다. 물리적으로 정당화된 아키텍처 선택입니다.
 
 ---
 
@@ -863,6 +1208,23 @@ $L = 16$은 다음과 같은 이유로 선택되었습니다:
 | RG 흐름 | CNN 풀링 / 깊은 층 | 층별 랭크 구조 |
 | 유클리드 작용 $S_E$ | 손실함수 (변분 손실) | $\log q + \beta E$ |
 | 경로적분 $\int \mathcal{D}\phi$ | 배위 합 (Monte Carlo) | REINFORCE 샘플링 |
+| 관련 연산자 (2개) | 주요 특성/주성분 | eRank $\approx 3$–$5$ at $T_c$ |
+| 무관 연산자 | 노이즈/중복 특성 | SVD에서 작은 특이값 |
+| Critical slowing down | Poor Hessian conditioning | Curriculum learning 필요성 |
+| 보편성류 | Transfer learning | 도메인 무관 특성 |
+
+### ML 전용 용어 해설
+
+| 용어 | 정의 | 본 문서에서의 맥락 |
+|---|---|---|
+| **ELBO** (Evidence Lower Bound) | VAE의 손실함수. $\log p(x) \geq \text{ELBO}$. 재구성 오차 + KL 정칙화 | VaTD의 변분 자유에너지와 구조적 동치 (Section 1.2, 10.2) |
+| **EBM** (Energy-Based Model) | 에너지 함수로 확률 정의: $p(x) \propto e^{-E(x)}$ | Boltzmann 분포와 동일 형태 (Section 1.3) |
+| **LoRA** (Low-Rank Adaptation) | 가중치 업데이트를 저랭크 $\Delta W = BA$로 제한하는 미세조정 | Low-rank hypothesis의 직접 응용 (Section 7.7) |
+| **Neural Collapse** | 분류기의 마지막 층에서 클래스 특성이 정규 심플렉스로 수렴하는 현상 | Rank collapse의 한 형태 (Section 5.4) |
+| **Grokking** | 암기 후 갑자기 일반화가 발생하는 현상. Effective rank 급락과 동반 | 상전이와 유사한 급격한 전환 (Section 5.4) |
+| **Information Bottleneck** | 압축과 예측의 최적 트레이드오프를 찾는 정보이론 원리 | 임계점 = 최적 압축-예측 균형 (Section 12.2) |
+| **Implicit Rank Regularization** | GD가 명시적 정칙화 없이 저랭크 해를 선호하는 현상 | Low-rank bias의 최적화 기원 (Section 7.7) |
+| **GRPO** (Group Relative Policy Optimization) | 그룹별 z-score 정규화를 사용하는 REINFORCE 변종 | VaTD의 온도별 RLOO와 구조적 유사 (Section 11.7) |
 
 ### HEP ↔ 응집물질 대응
 
@@ -913,3 +1275,29 @@ $L = 16$은 다음과 같은 이유로 선택되었습니다:
 11. **PixelCNN**: van den Oord, A. et al., "Conditional image generation with PixelCNN decoders," *NeurIPS* (2016).
 
 12. **차원 축소와 네트워크 역학**: Thibeault, V. et al., "Threefold way to the dimension reduction of dynamics on networks," *Physical Review Research* **2**, 043215 (2020).
+
+### 딥러닝-물리 연결
+
+13. **CNN과 RG의 정확한 매핑**: Mehta, P. & Schwab, D.J., "An exact mapping between the variational renormalization group and deep learning," *arXiv:1410.3831* (2014).
+
+14. **Implicit rank regularization**: Arora, S. et al., "Implicit regularization in deep matrix factorization," *NeurIPS* (2019).
+
+15. **LoRA**: Hu, E.J. et al., "LoRA: Low-rank adaptation of large language models," *ICLR* (2022).
+
+16. **Neural collapse**: Papyan, V. et al., "Prevalence of neural collapse during the terminal phase of deep learning training," *PNAS* **117**(40), 24652–24663 (2020).
+
+17. **Grokking**: Power, A. et al., "Grokking: Generalization beyond overfitting on small algorithmic datasets," *arXiv:2201.02177* (2022).
+
+18. **Information Bottleneck**: Shwartz-Ziv, R. & Tishby, N., "Opening the black box of deep neural networks via information," *arXiv:1703.00810* (2017).
+
+19. **Rank diminishing theorem**: Huang, W. et al., "On the rank diminishing phenomenon in deep neural networks," *NeurIPS* (2022).
+
+20. **AlphaPruning**: Lu, H. et al., "AlphaPruning: Using heavy-tailed self regularization theory for improved layer-wise pruning of large language models," *NeurIPS* (2024).
+
+21. **Edge of chaos**: Poole, B. et al., "Exponential expressivity in deep neural networks through transient chaos," *NeurIPS* (2016).
+
+22. **GRPO**: Shao, Z. et al., "DeepSeekMath: Pushing the limits of mathematical reasoning in open language models," *arXiv:2402.03300* (2024).
+
+23. **REINFORCE++**: Hu, J. et al., "REINFORCE++: A simple and efficient approach for aligning large language models," *arXiv:2501.03262* (2025).
+
+24. **Roberts et al. (criticality in neural networks)**: Roberts, D.A. et al., "The principles of deep learning theory," *Cambridge University Press* (2022); *Phys. Rev. Research* (2025).
