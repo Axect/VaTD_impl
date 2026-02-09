@@ -23,15 +23,20 @@ This project tests this hypothesis on the **2D Ising model** by probing the inte
 
 The 2D Ising model on an $L \times L$ square lattice with periodic boundary conditions is defined by:
 
-$$H = -J \sum_{\langle i,j \rangle} s_i \, s_j, \qquad s_i \in \{-1, +1\}, \quad J = 1$$
-
+$$
+H = -J \sum_{\langle i,j \rangle} s_i \, s_j, \qquad s_i \in \{-1, +1\}, \quad J = 1
+$$
 The equilibrium probability at inverse temperature $\beta = 1/T$ follows the Boltzmann distribution:
 
-$$p(x \mid T) = \frac{e^{-\beta \, H(x)}}{Z(\beta)}, \qquad Z(\beta) = \sum_x e^{-\beta \, H(x)}$$
+$$
+p(x \mid T) = \frac{e^{-\beta \, H(x)}}{Z(\beta)}, \qquad Z(\beta) = \sum_x e^{-\beta \, H(x)}
+$$
 
 Onsager's exact solution gives the critical temperature:
 
-$$T_c = \frac{2J}{\ln(1 + \sqrt{2})} \approx 2.269$$
+$$
+T_c = \frac{2J}{\ln(1 + \sqrt{2})} \approx 2.269
+$$
 
 At $T_c$, the system undergoes a second-order phase transition characterized by:
 
@@ -77,11 +82,15 @@ The physical analogy: at $T_c$, the system is like a **pencil balanced on its ti
 
 Defined by Roy & Bhattacharya (2007) via the Shannon entropy of the normalized singular value distribution:
 
-$$\text{erank}(\mathbf{A}) = \exp\bigl(H(\mathbf{p})\bigr)$$
+$$
+\text{erank}(\mathbf{A}) = \exp\bigl(H(\mathbf{p})\bigr)
+$$
 
 where
 
-$$p_i = \frac{\sigma_i}{\sum_j \sigma_j}, \qquad H(\mathbf{p}) = -\sum_i p_i \ln p_i$$
+$$
+p_i = \frac{\sigma_i}{\sum_j \sigma_j}, \qquad H(\mathbf{p}) = -\sum_i p_i \ln p_i
+$$
 
 Properties:
 - Returns a continuous scalar in $[1, \min(m, n)]$
@@ -93,7 +102,9 @@ Properties:
 
 A noise-robust alternative:
 
-$$\text{srank}(\mathbf{A}) = \frac{\|\mathbf{A}\|_F^2}{\|\mathbf{A}\|_2^2} = \frac{\sum_i \sigma_i^2}{\sigma_{\max}^2}$$
+$$
+\text{srank}(\mathbf{A}) = \frac{\|\mathbf{A}\|_F^2}{\|\mathbf{A}\|_2^2} = \frac{\sum_i \sigma_i^2}{\sigma_{\max}^2}
+$$
 
 The ratio of the Frobenius norm (total energy) to the spectral norm (largest mode energy). Less sensitive to small singular values compared to erank.
 
@@ -101,7 +112,9 @@ The ratio of the Frobenius norm (total energy) to the spectral norm (largest mod
 
 From condensed matter physics (inverse of the inverse participation ratio):
 
-$$\text{PR}(\mathbf{A}) = \frac{\left(\sum_i \sigma_i^2\right)^2}{\sum_i \sigma_i^4}$$
+$$
+\text{PR}(\mathbf{A}) = \frac{\left(\sum_i \sigma_i^2\right)^2}{\sum_i \sigma_i^4}
+$$
 
 Counts how many singular values "participate" in the spectrum. If $k$ singular values are equal and the rest are zero, $\text{PR} = k$.
 
@@ -134,8 +147,9 @@ Both are mean-centered before SVD to remove trivial DC offsets.
 **Temperature grid:** Log-spaced coarse grid (25 points) merged with linear dense grid around $T_c$ (15 points in $[0.8 T_c, 1.2 T_c]$). Critical mode uses 60 uniform points in $[0.5 T_c, 2.0 T_c]$.
 
 **Exact specific heat** is computed via central finite differences of Onsager's $\ln Z$:
-
-$$C_v(T) = \frac{\beta^2}{N} \frac{\partial^2 \ln Z}{\partial \beta^2} \approx \frac{\beta^2}{N} \cdot \frac{\ln Z(\beta + \delta) - 2\ln Z(\beta) + \ln Z(\beta - \delta)}{\delta^2}$$
+$$
+C_v(T) = \frac{\beta^2}{N} \frac{\partial^2 \ln Z}{\partial \beta^2} \approx \frac{\beta^2}{N} \cdot \frac{\ln Z(\beta + \delta) - 2\ln Z(\beta) + \ln Z(\beta - \delta)}{\delta^2}
+$$
 
 ### 4.2 Experiment 2: Weight Compression Test (`analyze_compression.py`)
 
@@ -147,13 +161,17 @@ $$C_v(T) = \frac{\beta^2}{N} \frac{\partial^2 \ln Z}{\partial \beta^2} \approx \
    - Create a deep copy of the model
    - SVD-truncate every Conv2d weight matrix (using the effective weight $W_{\text{eff}} = W \odot \text{mask}$ for masked layers):
 
-$$\mathbf{W} = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^\top \longrightarrow \mathbf{W}_k = \sum_{i=1}^{k} \sigma_i \, \mathbf{u}_i \, \mathbf{v}_i^\top, \quad k = \lfloor \text{frac} \times \text{full\_rank} \rfloor$$
+$$
+\mathbf{W} = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^\top \longrightarrow \mathbf{W}_k = \sum_{i=1}^{k} \sigma_i \, \mathbf{u}_i \, \mathbf{v}_i^\top, \quad k = \lfloor \text{frac} \times \text{full\_rank} \rfloor
+$$
 
    - Evaluate truncated model's log-probability on the reference samples
 
 4. **Degradation metric** (KL divergence per site):
 
-$$D(T, k) = \frac{1}{N} \, \mathbb{E}_{x \sim q_{\text{full}}}\!\Big[\log q_{\text{full}}(x \mid T) - \log q_k(x \mid T)\Big] = \frac{1}{N} \, \text{KL}(q_{\text{full}} \| q_k) \geq 0$$
+$$
+D(T, k) = \frac{1}{N} \, \mathbb{E}_{x \sim q_{\text{full}}}\!\Big[\log q_{\text{full}}(x \mid T) - \log q_k(x \mid T)\Big] = \frac{1}{N} \, \text{KL}(q_{\text{full}} \| q_k) \geq 0
+$$
 
 5. Optional **per-block sensitivity**: truncate only one residual block at a time (at 50% rank) to identify which blocks are most critical at which temperatures
 
@@ -201,7 +219,9 @@ The layer-averaged channel eRank (blue, left axis) is overlaid with Onsager's ex
 
 This reflects a fundamental distinction:
 
-$$C_v(T) \sim \text{magnitude of fluctuations} \quad \longleftrightarrow \quad \text{eRank}(T) \sim \text{dimensionality of fluctuations}$$
+$$
+C_v(T) \sim \text{magnitude of fluctuations} \quad \longleftrightarrow \quad \text{eRank}(T) \sim \text{dimensionality of fluctuations}
+$$
 
 At criticality, fluctuations are enormous but all aligned along the same few scaling directions. The fluctuations are large ($C_v \uparrow$) but low-dimensional ($\text{eRank} \downarrow$).
 
@@ -235,7 +255,9 @@ This is the direct analog of the **scree plot** in PCA: the "elbow" moves leftwa
 
 The derivative $d(\text{eRank})/dT$ is computed via numerical gradient with Gaussian smoothing:
 
-$$\frac{d(\text{eRank})}{dT}\bigg|_{T_i} \approx \frac{\text{eRank}(T_{i+1}) - \text{eRank}(T_{i-1})}{T_{i+1} - T_{i-1}}$$
+$$
+\frac{d(\text{eRank})}{dT}\bigg|_{T_i} \approx \frac{\text{eRank}(T_{i+1}) - \text{eRank}(T_{i-1})}{T_{i+1} - T_{i-1}}
+$$
 
 The peak of $d(\text{eRank})/dT$ appears at $T \approx 2.5$, shifted slightly **above** $T_c = 2.269$. Three factors contribute:
 
@@ -296,11 +318,15 @@ The heatmap ($\text{rank fraction} \times \log_{10} T$, inferno colormap) shows 
 
 The $k = 10\%$ degradation curve (blue) is overlaid with exact $C_v$ (red) on dual axes. The **inset** normalizes both quantities in $T \in [1.5, 4.0]$ for direct shape comparison, revealing near-identical functional forms:
 
-$$D(T, k) \propto C_v(T) \qquad \text{near } T_c$$
+$$
+D(T, k) \propto C_v(T) \qquad \text{near } T_c
+$$
 
 This proportionality has a physical explanation. Specific heat measures the variance of energy fluctuations:
 
-$$C_v = \frac{\beta^2}{N}\,\text{Var}(E)$$
+$$
+C_v = \frac{\beta^2}{N}\,\text{Var}(E)
+$$
 
 Weight truncation introduces a perturbation $\delta W$ to the learned Hamiltonian. Near $T_c$, the susceptibility to perturbation diverges alongside $C_v$, so the KL divergence $D(T, k)$ inherits the same scaling.
 
@@ -327,7 +353,9 @@ This resolves via the distinction between the **data manifold** and the **transf
 
 Formally, this connects to the divergence of susceptibility $\chi$ at criticality. The susceptibility measures the response to external perturbation $h$:
 
-$$\chi = \frac{\partial \langle m \rangle}{\partial h}\bigg|_{h=0} \sim |T - T_c|^{-\gamma}, \quad \gamma = 7/4$$
+$$
+\chi = \frac{\partial \langle m \rangle}{\partial h}\bigg|_{h=0} \sim |T - T_c|^{-\gamma}, \quad \gamma = 7/4
+$$
 
 Analogously, truncating weights introduces a "perturbation" to the model's effective Hamiltonian, and the response (degradation) diverges at $T_c$.
 
@@ -382,7 +410,7 @@ python analyze_compression.py --replot runs/Ising_VaTD_v0.16/DiscretePixelCNN_lr
 
 ## References
 
-1. **Low-rank hypothesis**: Thiede, Giannakis, et al., "The low-rank hypothesis of complex systems," *Nature Physics* (2024).
-2. **Effective rank**: Roy, O. & Bhattacharya, M., "Effective rank for matrices," *IEEE Trans. Signal Processing* (2007).
+1. **Low-rank hypothesis**: Thibeault, V., Allard, A., & Desrosiers, P., "The low-rank hypothesis of complex systems," *Nature Physics* **20**, 294–302 (2024).
+2. **Effective rank**: Roy, O. & Vetterli, M., "The effective rank: A measure of effective dimensionality," *15th European Signal Processing Conference (EUSIPCO)*, 606–610 (2007).
 3. **Onsager solution**: Onsager, L., "Crystal statistics. I. A two-dimensional model with an order-disorder transition," *Physical Review* 65, 117 (1944).
 4. **VaTD**: Wu, D., Wang, L., & Zhang, P., "Solving statistical mechanics using variational autoregressive networks," *Physical Review Letters* 122, 080602 (2019).
