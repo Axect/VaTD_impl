@@ -1,476 +1,217 @@
-# PyTorch Template Project
+# VaTD: Variational Thermodynamic Divergence for 2D Ising Model
 
-[English](README.md) | [한글](README_KR.md)
+Learning the Boltzmann distribution of the 2D Ising model via variational free energy minimization.
+Supports autoregressive PixelCNN and Discrete Flow Matching architectures, validated against Onsager's exact partition function solution.
 
-A flexible and reusable template for PyTorch-based machine learning experiments. Streamline your workflow with YAML configurations, integrated hyperparameter optimization (Optuna), experiment tracking (Weights & Biases), custom components, and easy result analysis.
+## Setup
 
-## Key Features
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -r requirements.txt
+wandb login  # optional, for W&B experiment tracking
+```
 
-* **YAML Configuration:** Easily manage all experiment settings (model, optimizer, scheduler, training parameters) using simple YAML files
+## Training
 
-* **Hyperparameter Optimization:** Automatically find the best hyperparameters using Optuna integration
+All training runs are launched through `main.py` with a YAML config file.
+The model type is auto-detected from the `net` field and routed to the appropriate trainer.
 
-* **Experiment Tracking:** Log metrics, configurations, and models seamlessly with Weights & Biases
+### PixelCNN (v0.16, Compact + Experimental Variants)
 
-* **Advanced Pruning:** Speed up optimization using custom pruners like the Predicted Final Loss (PFL) Pruner
+```bash
+# Compact: 4-layer dilated, multi-scale skip connections, ~46% fewer params than v0.15
+python main.py --run_config configs/v0.16/ising_pixelcnn_compact.yaml --device cuda:0
 
-* **Customizable Components:** Easily add or modify models ([`model.py`](model.py)), learning rate schedulers, optimizers, and the training loop ([`Trainer` in `util.py`](util.py)).
+# Hyper-Connection variants (HC / mHC fusion between residual blocks)
+python main.py --run_config configs/v0.16/ising_pixelcnn_hc.yaml --device cuda:0
+python main.py --run_config configs/v0.16/ising_pixelcnn_mhc.yaml --device cuda:0
 
-* **Analysis Tools:** Interactively load, analyze, and evaluate trained models and optimization results ([`analyze.py`](analyze.py)).
+# Alternative scan paths (diagonal: ~8x sampling speedup, hilbert: 2D locality)
+python main.py --run_config configs/v0.16/ising_pixelcnn_diagonal.yaml --device cuda:0
+python main.py --run_config configs/v0.16/ising_pixelcnn_hilbert.yaml --device cuda:0
 
-* **Reproducibility:** Ensure consistent results with built-in seed management.
+# Muon optimizer (Newton-Schulz orthogonalization for 2D weights)
+python main.py --run_config configs/v0.16/ising_pixelcnn_muon.yaml --device cuda:0
+```
 
-## Quick Start
+### PixelCNN (v0.15, Dilated Convolutions)
 
-1.  **Create Your Repository:** Click "Use this template" on the GitHub page to create your own repository based on this template.
+```bash
+# Dilated only (pure REINFORCE, no MCMC)
+python main.py --run_config configs/v0.15/ising_pixelcnn_dilated_only.yaml --device cuda:0
 
-2.  **Clone Your Repository:**
-    ```bash
-    git clone https://github.com/<your-username>/<your-new-repository-name>.git
-    cd <your-new-repository-name>
-    ```
+# Dilated + MCMC guidance (Swendsen-Wang)
+python main.py --run_config configs/v0.15/ising_pixelcnn_improved.yaml --device cuda:0
+```
 
-3.  **Set Up Environment & Install Dependencies:** (Using [uv](https://github.com/astral-sh/uv) is recommended)
-    ```bash
-    # Create and activate virtual environment
-    uv venv
-    source .venv/bin/activate # On Windows use `.venv\Scripts\activate`
+### PixelCNN (v0.13, Sequential Training)
 
-    # Install prerequsites (Recommended)
-    uv pip install -U torch wandb rich beaupy fireducks numpy optuna matplotlib scienceplots
+```bash
+python main.py --run_config configs/v0.13/ising_pixelcnn_onecycle.yaml --device cuda:0
+```
 
-    # Or execute install script (shell script)
-    sh install_requirements.sh
+### Discrete Flow Matching (v0.14)
 
-    # Or sync requirements (caution: this version is optimized for cuda environment)
-    uv pip sync requirements.txt
+```bash
+python main.py --run_config configs/v0.14/ising_dfm.yaml --device cuda:0
+```
 
-    # Or using pip: pip install -r requirements.txt
-    ```
+### Hyperparameter Optimization
 
-4.  **(Optional) Login to Weights & Biases:**
-    ```bash
-    # only once per a machine
-    wandb login
-    ```
+```bash
+python main.py --run_config configs/v0.13/ising_pixelcnn_onecycle.yaml \
+               --optimize_config configs/optimize_template.yaml --device cuda:0
+```
 
-5.  **Run a Default Experiment:**
-    ```bash
-    python main.py --run_config configs/run_template.yaml
-    ```
+## Analysis
 
-6.  **Run Hyperparameter Optimization:**
-    ```bash
-    python main.py --run_config configs/run_template.yaml --optimize_config configs/optimize_template.yaml
-    ```
+### Thermodynamic Validation
 
-7.  **Analyze Results:**
-    ```bash
-    python analyze.py
-    ```
+Compare learned free energy against Onsager's exact solution across the temperature range.
 
-## Documentation
+```bash
+python analyze.py
+```
 
-For a deeper dive into the components and customization options, check out the detailed documentation:
+### Critical Temperature Analysis
 
-* **[Project Documentation](https://axect.github.io/pytorch_template)** (Covers Configuration, Execution, Training Loop, Model Definition, Optimization, Pruning, Analysis) (Generated by [Tutorial-Codebase-Knowledge](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge))
+Estimate Tc from specific heat capacity peaks.
 
-## Outline
+```bash
+python analyze_critical_temp.py --project Ising_VaTD_v0.15 \
+    --group <group_name> --seed 42
+```
 
--   [PyTorch Template Project](#pytorch-template-project)
--   [Project Structure](#project-structure)
--   [Prerequisites](#prerequisites)
--   [Usage](#usage)
-    -   [1. Configure Your Run](#1-configure-your-run)
-    -   [2. (Optional) Configure Optimization](#2-optional-configure-optimization)
-    -   [3. Run the Experiment](#3-run-the-experiment)
-    -   [4. Analyze Results](#4-analyze-results)
--   [Configuration Files](#configuration-files)
-    -   [Run Configuration (`run_template.yaml`)](#run-configuration-run_templateyaml)
-    -   [Optimization Configuration (`optimize_template.yaml`)](#optimization-configuration-optimize_templateyaml)
--   [Customization](#customization)
-    -   [1. Customizing Run Configurations](#1-customizing-run-configurations)
-    -   [2. Customizing Optimization Search Space](#2-customizing-optimization-search-space)
-    -   [3. Using Different Optuna Samplers (e.g., GridSampler)](#3-using-different-optuna-samplers-eg-gridsampler)
-    -   [4. Adding Custom Models, Optimizers, Schedulers, Pruners](#4-adding-custom-models-optimizers-schedulers-pruners)
-    -   [5. Customizing Data Loading](#5-customizing-data-loading)
-    -   [6. Customizing the Training Loop](#6-customizing-the-training-loop)
--   [Analysis Script (`analyze.py`)](#analysis-script-analyzepy)
--   [Contributing](#contributing)
--   [License](#license)
--   [Appendix](#appendix)
-    -   [PFL (Predicted Final Loss) Pruner](#pfl-predicted-final-loss-pruner)
+---
+
+## Low-Rank Hypothesis Experiments
+
+Experimental verification of the "Low-rank hypothesis of complex systems" (Nature Physics, 2024) using neural networks trained on the 2D Ising model.
+See [`docs/LOW_RANK.md`](docs/LOW_RANK.md) for background.
+
+### Experiment 1: Internal Representation Rank (`analyze_rank.py`)
+
+Measures the effective rank of internal feature maps as a function of temperature.
+Tests whether activation rank peaks near the critical temperature Tc.
+
+```bash
+# Interactive mode
+python analyze_rank.py
+
+# CLI mode
+python analyze_rank.py \
+    --project Ising_VaTD_v0.15 \
+    --group DiscretePixelCNN_lr1e-3_e500_f2d43d \
+    --seed 42 --device cuda:0
+
+# Quick mode (fewer temperatures, smaller batches)
+python analyze_rank.py \
+    --project Ising_VaTD_v0.15 \
+    --group DiscretePixelCNN_lr1e-3_e500_f2d43d \
+    --seed 42 --device cuda:0 --quick
+
+# Replot from existing CSV (no GPU needed)
+python analyze_rank.py \
+    --replot runs/Ising_VaTD_v0.15/DiscretePixelCNN_lr1e-3_e500_f2d43d/rank_analysis_42.csv
+```
+
+**Output:**
+- `figs/<group>/rank_vs_temperature.png` — 2x2 figure (channel/spatial eRank, eRank vs Cv, heatmap)
+- `figs/<group>/singular_value_spectra.png` — Scree plots at 3 representative temperatures
+- `runs/<project>/<group>/rank_analysis_<seed>.csv`
+
+**Options:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--batch_size` | 200 | Samples per temperature |
+| `--n_batches` | 3 | Batches per temperature |
+| `--quick` | off | Reduced grid (20 temps, batch=100) |
+| `--replot <csv>` | - | Regenerate plots from existing data |
+
+### Experiment 2: Low-Rank Compression Test (`analyze_compression.py`)
+
+Applies SVD truncation to model weights and measures per-temperature free energy degradation.
+Identifies which temperature region is most sensitive to weight compression.
+
+```bash
+# Interactive mode
+python analyze_compression.py
+
+# CLI mode (full, ~20 min on RTX 3090)
+python analyze_compression.py \
+    --project Ising_VaTD_v0.15 \
+    --group DiscretePixelCNN_lr1e-3_e500_f2d43d \
+    --seed 42 --device cuda:0
+
+# Quick mode (~5 min)
+python analyze_compression.py \
+    --project Ising_VaTD_v0.15 \
+    --group DiscretePixelCNN_lr1e-3_e500_f2d43d \
+    --seed 42 --device cuda:0 --quick
+
+# With per-block sensitivity analysis
+python analyze_compression.py \
+    --project Ising_VaTD_v0.15 \
+    --group DiscretePixelCNN_lr1e-3_e500_f2d43d \
+    --seed 42 --device cuda:0 --per_layer
+
+# Replot from existing CSV
+python analyze_compression.py \
+    --replot runs/Ising_VaTD_v0.15/DiscretePixelCNN_lr1e-3_e500_f2d43d/compression_42.csv
+```
+
+**Output:**
+- `figs/<group>/weight_svd_spectra.png` — Weight SVD decay per residual block
+- `figs/<group>/compression_test.png` — 2x2 figure (degradation curves, heatmap, Cv comparison, relative degradation)
+- `figs/<group>/compression_per_block.png` — Per-block sensitivity heatmap (with `--per_layer`)
+- `runs/<project>/<group>/compression_<seed>.csv`
+- `runs/<project>/<group>/compression_per_block_<seed>.csv` (with `--per_layer`)
+
+**Options:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--batch_size` | 200 | Samples per temperature |
+| `--quick` | off | Reduced grid (20 temps, batch=100, 3 rank fracs) |
+| `--per_layer` | off | Per-block sensitivity analysis (rank=50%) |
+| `--replot <csv>` | - | Regenerate plots from existing data |
+
+**Rank fractions tested:** 90%, 75%, 50%, 25%, 10% (quick: 75%, 50%, 25%)
+
+### Experiment 3: ERF Rank (planned)
+
+Verify correlation length divergence directly via Jacobian SVD of the Effective Receptive Field.
 
 ## Project Structure
 
-- `config.py`: Defines `RunConfig` and `OptimizeConfig` for managing experiment and optimization settings.
-- `main.py`: Entry point, handles arguments and experiment execution.
-- `model.py`: Contains model architectures (e.g., MLP).
-- `util.py`: Utility functions (data loading, training loop, analysis helpers, etc.).
-- `analyze.py`: Script for analyzing completed runs and optimizations.
-- `hyperbolic_lr.py`: Implementation of custom hyperbolic learning rate schedulers.
-- `pruner.py`: Contains custom pruners like PFLPruner.
-- `configs/`: Directory for configuration files.
-    - `run_template.yaml`: Template for basic run configuration.
-    - `optimize_template.yaml`: Template for optimization configuration.
-- `runs/`: Directory where experiment results (models, configs) are saved.
-- `requirements.txt`: Lists project dependencies.
-- `README.md`: This file.
-- `RELEASES.md`: Project release notes.
-
-## Prerequisites
-
-- Python 3.x
-- Git
-
-## Usage
-
-1.  **Configure Your Run:**
-    - Modify `configs/run_template.yaml` or create a copy (e.g., `configs/my_experiment.yaml`) and adjust the parameters. See the [Customization](#customization) section for details.
-
-2.  **(Optional) Configure Optimization:**
-    - If you want to perform hyperparameter optimization, modify `configs/optimize_template.yaml` or create a copy (e.g., `configs/my_optimization.yaml`). Define the `search_space`, `sampler`, and `pruner`. See the [Customization](#customization) section.
-
-3.  **Run the Experiment:**
-
-    - **Single Run:**
-      ```sh
-      python main.py --run_config configs/run_template.yaml
-      ```
-      (Replace `run_template.yaml` with your specific run configuration file if needed).
-
-    - **Optimization Run:**
-      ```sh
-      python main.py --run_config configs/run_template.yaml --optimize_config configs/optimize_template.yaml
-      ```
-      (Replace file names as needed). This will use Optuna to search for the best hyperparameters based on your `optimize_template.yaml`.
-
-4.  **Analyze Results:**
-    - Use the interactive analysis script:
-      ```sh
-      python analyze.py
-      ```
-    - Follow the prompts to select the project, run group, and seed to load and analyze the model.
-
-## Configuration Files
-
-### Run Configuration (`run_template.yaml`)
-
--   `project`: Project name (used for wandb and results saving).
--   `device`: Device ('cpu', 'cuda:0', etc.).
--   `net`: Path to the model class (e.g., `model.MLP`).
--   `optimizer`: Path to the optimizer class (e.g., `torch.optim.adamw.AdamW`, `splus.SPlus`).
--   `scheduler`: Path to the scheduler class (e.g., `hyperbolic_lr.ExpHyperbolicLR`, `torch.optim.lr_scheduler.CosineAnnealingLR`).
--   `epochs`: Number of training epochs.
--   `batch_size`: Training batch size.
--   `seeds`: List of random seeds for running the experiment multiple times.
--   `net_config`: Dictionary of arguments passed to the model's `__init__` method.
--   `optimizer_config`: Dictionary of arguments for the optimizer.
--   `scheduler_config`: Dictionary of arguments for the scheduler.
--   `early_stopping_config`: Configuration for early stopping.
-    -   `enabled`: `true` or `false`.
-    -   `patience`: How many epochs to wait after last improvement.
-    -   `mode`: 'min' or 'max'.
-    -   `min_delta`: Minimum change to qualify as an improvement.
-
-### Optimization Configuration (`optimize_template.yaml`)
-
--   `study_name`: Name for the Optuna study.
--   `trials`: Number of optimization trials to run.
--   `seed`: Random seed for the optimization sampler.
--   `metric`: Metric to optimize (e.g., `val_loss`).
--   `direction`: 'minimize' or 'maximize'.
--   `sampler`: Optuna sampler configuration.
-    -   `name`: Path to the sampler class (e.g., `optuna.samplers.TPESampler`).
-    -   `kwargs`: (Optional) Arguments for the sampler.
--   `pruner`: (Optional) Optuna pruner configuration.
-    -   `name`: Path to the pruner class (e.g., `pruner.PFLPruner`).
-    -   `kwargs`: Arguments for the pruner.
--   `search_space`: Defines hyperparameters to search. Nested under `net_config`, `optimizer_config`, etc.
-    -   `type`: 'int', 'float', or 'categorical'.
-    -   `min`, `max`: Range for numerical types.
-    -   `log`: `true` for logarithmic scale (float).
-    -   `step`: Step size (int).
-    -   `choices`: List of options (categorical).
-
-## Customization
-
-This template is designed for flexibility. Here’s how to customize different parts:
-
-### 1. Customizing Run Configurations
-
-Modify the parameters in a run configuration YAML file (like `configs/run_template.yaml`) to change experiment settings.
-
-**Example:** Let's create `configs/run_mlp_small_fastlr.yaml` based on `run_template.yaml` but with a smaller network and a different learning rate.
-
-*Original `configs/run_template.yaml` (simplified):*
-```yaml
-# configs/run_template.yaml
-project: PyTorch_Template
-device: cuda:0
-net: model.MLP
-optimizer: torch.optim.adamw.AdamW
-scheduler: hyperbolic_lr.ExpHyperbolicLR
-epochs: 50
-seeds: [89, 231, 928, 814, 269]
-net_config:
-  nodes: 64 # Original nodes
-  layers: 4
-optimizer_config:
-  lr: 1.e-3 # Original LR
-scheduler_config:
-  upper_bound: 250
-  max_iter: 50
-  infimum_lr: 1.e-5
-...
-````
-
-*New `configs/run_mlp_small_fastlr.yaml`:*
-
-```yaml
-# configs/run_mlp_small_fastlr.yaml
-project: PyTorch_Template_SmallMLP # Maybe change project name
-device: cuda:0
-net: model.MLP
-optimizer: torch.optim.adamw.AdamW
-scheduler: hyperbolic_lr.ExpHyperbolicLR # Or change scheduler
-epochs: 50
-seeds: [42, 123] # Use different seeds if desired
-net_config:
-  nodes: 32   # Changed nodes
-  layers: 3   # Changed layers
-optimizer_config:
-  lr: 5.e-3 # Changed learning rate
-scheduler_config: # Adjust scheduler params if needed, e.g., related to epochs or LR
-  upper_bound: 250
-  max_iter: 50
-  infimum_lr: 1.e-5
-... # Keep or adjust other settings like early_stopping
+```
+.
+├── main.py                  # Entry point: energy function, model dispatch
+├── model.py                 # DiscretePixelCNN (masked conv, HC/mHC, diagonal/hilbert)
+├── model_dfm.py             # DiscreteFlowMatcher (parallel sampling)
+├── util.py                  # Trainer class (standard/accumulated/sequential modes)
+├── util_dfm.py              # FlowMatchingTrainer class
+├── config.py                # RunConfig, OptimizeConfig (YAML → importlib instantiation)
+├── vatd_exact_partition.py  # Onsager exact partition function (16×16)
+├── analyze.py               # Interactive thermodynamic analysis
+├── analyze_rank.py          # Exp 1: Activation rank vs temperature
+├── analyze_compression.py   # Exp 2: Weight SVD compression test
+├── analyze_critical_temp.py # Critical temperature estimation
+├── hyperbolic_lr.py         # ExpHyperbolicLR scheduler
+├── splus.py                 # SPlus optimizer (matrix preconditioning)
+├── muon.py                  # MuonWithAdamW optimizer (Newton-Schulz)
+├── pruner.py                # PFLPruner for Optuna
+├── mHC.cu/                  # MHCLayer submodule (doubly stochastic hyper-connections)
+├── configs/                 # YAML configs (versioned: v0.13 ~ v0.16)
+├── docs/                    # Research documents
+│   ├── LOW_RANK.md          # Low-Rank Hypothesis specification
+│   ├── path_generation_methods.md
+│   └── ...
+├── runs/                    # Saved models, configs, CSV results
+└── figs/                    # Generated analysis figures
 ```
 
-Now you can run this specific configuration:
+## References
 
-```sh
-python main.py --run_config configs/run_mlp_small_fastlr.yaml
-```
-
-### 2. Customizing Optimization Search Space
-
-Modify the `search_space` section in your optimization configuration file (e.g., `configs/optimize_template.yaml`) to change which hyperparameters Optuna searches over and their ranges/choices.
-
-**Example:** Adjusting the search space in `configs/optimize_template.yaml`.
-
-*Original `search_space` (simplified):*
-
-```yaml
-# configs/optimize_template.yaml
-...
-search_space:
-  net_config:
-    nodes:
-      type: categorical
-      choices: [32, 64, 128] # Original choices
-    layers:
-      type: int
-      min: 3
-      max: 5 # Original max
-  optimizer_config:
-    lr:
-      type: float
-      min: 1.e-3 # Original min LR
-      max: 1.e-2
-      log: true
-  scheduler_config:
-    infimum_lr: # Only searching infimum_lr
-      type: float
-      min: 1.e-7
-      max: 1.e-4
-      log: true
-...
-```
-
-*Modified `search_space`:*
-
-```yaml
-# configs/optimize_template.yaml
-...
-search_space:
-  net_config:
-    nodes:
-      type: categorical
-      choices: [64, 128, 256] # Changed choices for nodes
-    layers:
-      type: int
-      min: 4 # Changed min layers
-      max: 6 # Changed max layers
-  optimizer_config:
-    lr:
-      type: float
-      min: 5.e-4 # Changed min LR
-      max: 5.e-3 # Changed max LR
-      log: true
-  scheduler_config:
-    # Add search for upper_bound
-    upper_bound:
-        type: int
-        min: 100
-        max: 300
-        step: 50
-    infimum_lr:
-      type: float
-      min: 1.e-6 # Changed range
-      max: 1.e-5
-      log: true
-...
-```
-
-This updated configuration will search over different node sizes, layer counts, learning rates, and scheduler parameters.
-
-### 3. Using Different Optuna Samplers (e.g., GridSampler)
-
-You can change the sampler used by Optuna by modifying the `sampler` section in `configs/optimize_template.yaml`.
-
-**Example:** Switching from `TPESampler` to `GridSampler`.
-
-*Original `sampler` section:*
-
-```yaml
-# configs/optimize_template.yaml
-...
-sampler:
-  name: optuna.samplers.TPESampler
-  #kwargs:
-  #  n_startup_trials: 10
-...
-```
-
-*Using `GridSampler`:*
-
-```yaml
-# configs/optimize_template.yaml
-...
-sampler:
-  name: optuna.samplers.GridSampler # Changed sampler name
-  # kwargs: {} # GridSampler often doesn't need kwargs here
-...
-# IMPORTANT CONDITION for GridSampler:
-# All parameters defined in the 'search_space' MUST be of type 'categorical'.
-# GridSampler explores all combinations of the categorical choices.
-# If your search_space contains 'int' or 'float' types, using GridSampler
-# will cause an error based on the current implementation in config.py.
-# (See _create_sampler and grid_search_space methods)
-
-# Example search_space compatible with GridSampler:
-search_space:
-  net_config:
-    nodes:
-      type: categorical
-      choices: [64, 128]
-    layers:
-      type: categorical # Must be categorical
-      choices: [3, 4]
-  optimizer_config:
-    lr:
-      type: categorical # Must be categorical
-      choices: [1.e-3, 5.e-3]
-  scheduler_config:
-    infimum_lr:
-      type: categorical # Must be categorical
-      choices: [1.e-5, 1.e-6]
-...
-```
-
-**Condition:** To use `GridSampler`, ensure *all* parameters listed under `search_space` have `type: categorical`. The code automatically constructs the required format for `GridSampler` but only if this condition is met.
-
-### 4. Adding Custom Models, Optimizers, Schedulers, Pruners
-
-  - **Models:** Create your model class (inheriting from `torch.nn.Module`) in `model.py` or a new Python file. Ensure its `__init__` method accepts a config dictionary (e.g., `net_config` from the YAML) as the first argument. Update the `net:` path in your run config YAML.
-  - **Optimizers/Schedulers:** Implement your custom classes or use existing ones from `torch.optim` or elsewhere (like `hyperbolic_lr.py`). Update the `optimizer:` or `scheduler:` path and `*_config` dictionaries in the YAML. The template uses `importlib` to load classes dynamically based on the paths provided.
-  - **Pruners:** Create your pruner class (inheriting from `pruner.BasePruner` or implementing the Optuna pruner interface) in `pruner.py` or a new file. Update the `pruner:` section in the optimization YAML.
-
-### 5. Customizing Data Loading
-
-  - Modify the `load_data` function in `util.py` to load your specific dataset. It should return PyTorch `Dataset` objects for training and validation.
-
-### 6. Customizing the Training Loop
-
-  - Modify the `Trainer` class in `util.py`. Adjust the `train_epoch`, `val_epoch`, and `train` methods for your specific task, loss functions, or metrics. Ensure the `train` method returns the value specified as the `metric` in your optimization config if applicable.
-
-## Analysis Script (`analyze.py`)
-
-The `analyze.py` script provides an interactive command-line interface to load and inspect results from completed runs.
-
-  - It uses helper functions from `util.py` (like `select_project`, `select_group`, `select_seed`, `load_model`, `load_study`, `load_best_model`) to navigate the saved runs in the `runs/` directory.
-  - You can easily extend the `main` function in `analyze.py` to perform more detailed analysis, plotting, or evaluation specific to your project needs.
-
-## Contributing
-
-Contributions are welcome\! Please feel free to submit a Pull Request.
-
-## License
-
-This project is provided as a template and is intended to be freely used, modified, and distributed. Users of this template are encouraged to choose a license that best suits their specific project needs.
-
-For the template itself:
-
-  - You are free to use, modify, and distribute this template.
-  - No attribution is required, although it is appreciated.
-  - The template is provided "as is", without warranty of any kind.
-
-When using this template for your own project, please remember to:
-
-1.  Remove this license section or replace it with your chosen license.
-2.  Ensure all dependencies and libraries used in your project comply with their respective licenses.
-
-For more information on choosing a license, visit [https://choosealicense.com/](https://choosealicense.com/).
-
-## Acknowledgments
-
-This template includes copies of external libraries and tools, such as:
-
-- [HyperbolicLR](https://github.com/Axect/HyperbolicLR) for hyperbolic curve based learning rate scheduling.
-
-- [SPlus](https://github.com/kvfrans/splus) for SPlus optimizer.
-
-## Appendix
-
-<details>
-<summary><strong>PFL (Predicted Final Loss) Pruner</strong></summary>
-
-### Overview
-
-The PFL pruner (`pruner.PFLPruner`) is a custom pruner inspired by techniques to predict the final performance of a training run based on early-stage metrics. It helps optimize hyperparameter search by early stopping unpromising trials based on their predicted final loss (`pfl`).
-
-### Key Features
-
-  - Maintains a list of the `top_k` best-performing completed trials based on their final validation loss.
-  - For ongoing trials (after a warmup period), it predicts the final loss based on the current loss history.
-  - It compares the current trial's predicted final loss (`pfl`) with the minimum `pfl` observed among the `top_k` completed trials.
-  - Prunes the current trial if its predicted final loss is worse (lower, since `pfl` is -log10(loss)) than the worst `pfl` in the top-k list.
-  - Supports multi-seed runs by averaging metrics across seeds for decision making.
-  - Integrates with Optuna's study mechanism.
-
-### Configuration
-
-In your `optimize_template.yaml`, configure the pruner under the `pruner` section:
-
-```yaml
-pruner:
-  name: pruner.PFLPruner # Path to the pruner class
-  kwargs:
-    n_startup_trials: 10    # Number of trials to complete before pruning starts
-    n_warmup_epochs: 10     # Number of epochs within a trial before pruning is considered
-    top_k: 10               # Number of best completed trials to keep track of
-    target_epoch: 50        # The target epoch used for predicting final loss
-```
-
-### How It Works
-
-1.  The first `n_startup_trials` run to completion without being pruned to establish baseline performance.
-2.  For subsequent trials, pruning is considered only after `n_warmup_epochs`.
-3.  The pruner calculates the average predicted final loss (`pfl`) for the current trial based on the loss history across its seeds.
-4.  It compares this `pfl` to the `pfl` values of the `top_k` trials that have already completed.
-5.  If the current trial's `pfl` is lower than the minimum `pfl` recorded among the top completed trials, the trial is pruned (as lower `pfl` indicates worse predicted performance).
-6.  When a trial completes, its final validation loss and `pfl` are considered for inclusion in the `top_k` list.
-
-</details>
+- VaTD: Variational Thermodynamic Divergence
+- Onsager (1944): Exact solution of the 2D Ising model
+- Low-Rank Hypothesis: Nature Physics (2024), "Low-rank hypothesis of complex systems"

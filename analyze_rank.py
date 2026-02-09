@@ -428,30 +428,37 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     return path
 
 
-def plot_derank_dt(df, L, figs_dir):
+def plot_derank_dt(df, L, figs_dir, suffix=""):
     """
     Standalone figure comparing d(eRank)/dT with exact specific heat Cv.
 
     The effective rank is an entropy-like quantity, so its temperature
     derivative should peak at Tc, mirroring the specific heat Cv = dE/dT.
     Both are normalized to [0,1] for shape comparison.
+
+    Args:
+        suffix: filename suffix (e.g. "_critical") to distinguish modes.
     """
     from scipy.ndimage import gaussian_filter1d
 
     Tc = CRITICAL_TEMPERATURE
-    temperatures = np.linspace(0.5, 10.0, 500)
-    Cv = exact_specific_heat(L, temperatures)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
 
     # Average channel eRank across all layers
     avg_rank = df.groupby("T")["channel_erank"].mean().sort_index()
     T_arr = avg_rank.index.values
     rank_arr = avg_rank.values
 
-    # Compute d(eRank)/dT with Gaussian smoothing
+    # Exact Cv over the same T range (dense for smooth curve)
+    T_cv = np.linspace(T_arr.min(), T_arr.max(), 500)
+    Cv = exact_specific_heat(L, T_cv)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Compute d(eRank)/dT — use lighter smoothing when data is dense
     d_rank_raw = np.gradient(rank_arr, T_arr)
-    d_rank = gaussian_filter1d(d_rank_raw, sigma=3)
+    # Adapt sigma to grid density: fewer points → more smoothing
+    sigma = max(1, min(3, len(T_arr) // 15))
+    d_rank = gaussian_filter1d(d_rank_raw, sigma=sigma)
 
     # Normalize both for shape comparison
     d_norm = (d_rank - d_rank.min()) / (d_rank.max() - d_rank.min() + 1e-10)
@@ -459,7 +466,7 @@ def plot_derank_dt(df, L, figs_dir):
 
     ax.plot(T_arr, d_norm, "b-o", markersize=3, linewidth=1.5,
             label="$d$(eRank)/$dT$ (normalized)")
-    ax.plot(temperatures, Cv_norm, "r-", linewidth=2, alpha=0.7,
+    ax.plot(T_cv, Cv_norm, "r-", linewidth=2, alpha=0.7,
             label="Exact $C_v$ (Onsager, normalized)")
     ax.axvline(Tc, color="gray", ls="--", alpha=0.5, lw=1,
                label=f"$T_c = {Tc:.3f}$")
@@ -471,11 +478,11 @@ def plot_derank_dt(df, L, figs_dir):
         fontsize=13, fontweight="bold",
     )
     ax.legend(fontsize=10)
-    ax.set_xlim(0.5, 6.0)
+    ax.set_xlim(T_arr.min() - 0.05, min(T_arr.max() + 0.05, 6.0))
     ax.grid(True, alpha=0.15)
 
     plt.tight_layout()
-    path = Path(figs_dir) / "derank_dt_vs_Cv.png"
+    path = Path(figs_dir) / f"derank_dt_vs_Cv{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -580,6 +587,10 @@ def main():
         help="Quick mode: fewer temperatures and smaller batches",
     )
     parser.add_argument(
+        "--critical", action="store_true",
+        help="Critical mode: dense uniform T grid around Tc for smooth d(eRank)/dT",
+    )
+    parser.add_argument(
         "--replot", type=str, default=None,
         help="Skip sampling; regenerate plots from existing CSV file",
     )
@@ -650,9 +661,22 @@ def main():
     output_dir = Path(f"runs/{project}/{group_name}")
 
     # ── Temperature grid ──
-    if args.quick:
+    mode_tag = "full"
+    if args.critical:
+        Tc = CRITICAL_TEMPERATURE
+        # Dense uniform grid: smooth finite differences for d(eRank)/dT
+        temps = np.linspace(0.5 * Tc, 2.0 * Tc, 60)
+        batch_size, n_batches = args.batch_size, args.n_batches
+        mode_tag = "critical"
+        console.print(
+            f"[magenta]Critical mode: {len(temps)} temps in "
+            f"[{temps.min():.3f}, {temps.max():.3f}], "
+            f"batch={batch_size}, {n_batches} batches[/magenta]"
+        )
+    elif args.quick:
         temps = temperature_grid(T_min=0.8, T_max=6.0, n_coarse=12, n_critical=8)
         batch_size, n_batches = 100, 2
+        mode_tag = "quick"
         console.print("[yellow]Quick mode: 20 temps, batch=100, 2 batches[/yellow]")
     else:
         temps = temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15)
@@ -668,34 +692,37 @@ def main():
     console.print("\n[bold cyan]Phase 1: Effective rank analysis[/bold cyan]")
     df = run_analysis(model, temps, device, batch_size, n_batches, console)
 
-    csv_path = output_dir / f"rank_analysis_{seed}.csv"
+    csv_suffix = f"_{mode_tag}" if mode_tag != "full" else ""
+    csv_path = output_dir / f"rank_analysis{csv_suffix}_{seed}.csv"
     df.to_csv(csv_path, index=False)
     console.print(f"[green]Data saved:[/green] {csv_path}")
 
     # ── Phase 2: Plots ──
     console.print("\n[bold cyan]Phase 2: Generating plots[/bold cyan]")
 
-    fig_path = plot_rank_vs_temperature(df, L, figs_dir)
-    console.print(f"[green]Main plot:[/green] {fig_path}")
-
-    fig_path = plot_derank_dt(df, L, figs_dir)
+    fig_path = plot_derank_dt(df, L, figs_dir, suffix=f"_{mode_tag}" if mode_tag != "full" else "")
     console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
-    # Select 3 representative temperatures for scree plots
-    selected_T = [
-        temps[temps > 2.0 * Tc].min(),    # high T (disordered)
-        temps[np.argmin(np.abs(temps - Tc))],  # near Tc
-        temps[temps < 0.6 * Tc].max(),    # low T (ordered)
-    ]
-    console.print(
-        f"Scree plot temperatures: "
-        f"{', '.join(f'T={t:.3f}' for t in selected_T)}"
-    )
+    if mode_tag != "critical":
+        # Full/quick mode: also generate 2x2 overview and scree plots
+        fig_path = plot_rank_vs_temperature(df, L, figs_dir)
+        console.print(f"[green]Main plot:[/green] {fig_path}")
 
-    fig_path = plot_singular_value_spectra(
-        model, selected_T, device, batch_size, n_batches, L, figs_dir, console,
-    )
-    console.print(f"[green]Scree plot:[/green] {fig_path}")
+        # Select 3 representative temperatures for scree plots
+        selected_T = [
+            temps[temps > 2.0 * Tc].min(),    # high T (disordered)
+            temps[np.argmin(np.abs(temps - Tc))],  # near Tc
+            temps[temps < 0.6 * Tc].max(),    # low T (ordered)
+        ]
+        console.print(
+            f"Scree plot temperatures: "
+            f"{', '.join(f'T={t:.3f}' for t in selected_T)}"
+        )
+
+        fig_path = plot_singular_value_spectra(
+            model, selected_T, device, batch_size, n_batches, L, figs_dir, console,
+        )
+        console.print(f"[green]Scree plot:[/green] {fig_path}")
 
     # ── Summary ──
     console.print("\n[bold cyan]Summary: Peak effective rank by layer[/bold cyan]")
