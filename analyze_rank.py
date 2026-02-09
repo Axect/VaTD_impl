@@ -390,30 +390,6 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
     ax.set_title("eRank (entropy-like) vs $C_v$ ($\\sim d$S$/dT$)")
 
-    # Inset: d(eRank)/dT near Tc only, where the signal is clean
-    inset = ax.inset_axes([0.42, 0.08, 0.55, 0.42])
-    T_crit_lo, T_crit_hi = 1.5, 4.0
-    crit_mask = (T_arr >= T_crit_lo) & (T_arr <= T_crit_hi)
-    T_crit = T_arr[crit_mask]
-    rank_crit = rank_arr[crit_mask]
-    d_rank_crit = np.gradient(rank_crit, T_crit)
-
-    Cv_crit_mask = (temperatures >= T_crit_lo) & (temperatures <= T_crit_hi)
-
-    # Normalize for shape comparison
-    d_norm = (d_rank_crit - d_rank_crit.min()) / (d_rank_crit.max() - d_rank_crit.min() + 1e-10)
-    Cv_crit = Cv[Cv_crit_mask]
-    Cv_norm = (Cv_crit - Cv_crit.min()) / (Cv_crit.max() - Cv_crit.min() + 1e-10)
-
-    inset.plot(T_crit, d_norm, "b-o", markersize=3, linewidth=1.5, label="$d$(eRank)$/dT$")
-    inset.plot(temperatures[Cv_crit_mask], Cv_norm, "r-", linewidth=1.5, alpha=0.7, label="$C_v$")
-    inset.axvline(Tc, color="gray", ls="--", alpha=0.4, lw=0.7)
-    inset.set_xlabel("$T$", fontsize=7)
-    inset.set_ylabel("Normalized", fontsize=7)
-    inset.tick_params(labelsize=6)
-    inset.legend(fontsize=5, loc="upper right")
-    inset.set_title("Critical region", fontsize=7)
-
     # ── [1,1] Heatmap ──
     ax = axes[1, 1]
     numeric_layers = [l for l in layers if l.startswith("layer_")]
@@ -447,6 +423,59 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     plt.tight_layout()
 
     path = Path(figs_dir) / "rank_vs_temperature.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_derank_dt(df, L, figs_dir):
+    """
+    Standalone figure comparing d(eRank)/dT with exact specific heat Cv.
+
+    The effective rank is an entropy-like quantity, so its temperature
+    derivative should peak at Tc, mirroring the specific heat Cv = dE/dT.
+    Both are normalized to [0,1] for shape comparison.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    Tc = CRITICAL_TEMPERATURE
+    temperatures = np.linspace(0.5, 10.0, 500)
+    Cv = exact_specific_heat(L, temperatures)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Average channel eRank across all layers
+    avg_rank = df.groupby("T")["channel_erank"].mean().sort_index()
+    T_arr = avg_rank.index.values
+    rank_arr = avg_rank.values
+
+    # Compute d(eRank)/dT with Gaussian smoothing
+    d_rank_raw = np.gradient(rank_arr, T_arr)
+    d_rank = gaussian_filter1d(d_rank_raw, sigma=3)
+
+    # Normalize both for shape comparison
+    d_norm = (d_rank - d_rank.min()) / (d_rank.max() - d_rank.min() + 1e-10)
+    Cv_norm = (Cv - Cv.min()) / (Cv.max() - Cv.min() + 1e-10)
+
+    ax.plot(T_arr, d_norm, "b-o", markersize=3, linewidth=1.5,
+            label="$d$(eRank)/$dT$ (normalized)")
+    ax.plot(temperatures, Cv_norm, "r-", linewidth=2, alpha=0.7,
+            label="Exact $C_v$ (Onsager, normalized)")
+    ax.axvline(Tc, color="gray", ls="--", alpha=0.5, lw=1,
+               label=f"$T_c = {Tc:.3f}$")
+
+    ax.set_xlabel("Temperature $T$", fontsize=12)
+    ax.set_ylabel("Normalized value", fontsize=12)
+    ax.set_title(
+        f"$d$(eRank)/$dT$ vs Specific Heat $C_v$  ($L={L}$)",
+        fontsize=13, fontweight="bold",
+    )
+    ax.legend(fontsize=10)
+    ax.set_xlim(0.5, 6.0)
+    ax.grid(True, alpha=0.15)
+
+    plt.tight_layout()
+    path = Path(figs_dir) / "derank_dt_vs_Cv.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -588,6 +617,10 @@ def main():
 
         fig_path = plot_rank_vs_temperature(df, L, figs_dir)
         console.print(f"[green]Main plot:[/green] {fig_path}")
+
+        fig_path = plot_derank_dt(df, L, figs_dir)
+        console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
+
         console.print("[bold green]Replot complete.[/bold green]")
         return
 
@@ -644,6 +677,9 @@ def main():
 
     fig_path = plot_rank_vs_temperature(df, L, figs_dir)
     console.print(f"[green]Main plot:[/green] {fig_path}")
+
+    fig_path = plot_derank_dt(df, L, figs_dir)
+    console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
     # Select 3 representative temperatures for scree plots
     selected_T = [
