@@ -1282,6 +1282,14 @@ def load_model(project, group_name, seed, weights_only=True):
 
     # Use weights_only option in torch.load
     state_dict = torch.load(model_path, map_location="cpu", weights_only=weights_only)
+
+    # Remap legacy key names (MHCFusion2D.mhc → HCFusion2D.layer)
+    remapped = {}
+    for k, v in state_dict.items():
+        new_k = k.replace(".skip_fusion.mhc.", ".skip_fusion.layer.")
+        remapped[new_k] = v
+    state_dict = remapped
+
     model.load_state_dict(state_dict)
 
     return model, config
