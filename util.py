@@ -123,7 +123,7 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu"):
     return fig
 
 
-def set_seed(seed: int):
+def set_seed(seed: int, cudnn_benchmark: bool = False):
     # random
     random.seed(seed)
     # numpy
@@ -131,8 +131,11 @@ def set_seed(seed: int):
     # pytorch
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = not cudnn_benchmark
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    # TF32: A100+ Tensor Core acceleration for FP32 ops (~2x throughput, ~mantissa 10 bits)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def augment_samples(samples, fix_first=None):
@@ -1124,7 +1127,9 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
     complete_seeds = 0
     try:
         for seed in seeds:
-            set_seed(seed)
+            net_cfg = run_config.gen_config().get("net_config", {})
+            cudnn_benchmark = net_cfg.get("cudnn_benchmark", False)
+            set_seed(seed, cudnn_benchmark=cudnn_benchmark)
 
             model = run_config.create_model().to(device)
             optimizer = run_config.create_optimizer(model)

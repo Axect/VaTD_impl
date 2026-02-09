@@ -4,6 +4,10 @@
 # per-sample mixing weights. Near the critical temperature Tc≈2.269, the
 # system undergoes a phase transition — this allows the fusion layer to
 # adapt its strategy dynamically based on temperature.
+#
+# A100-optimized: Large batch (2048) with fewer accumulation steps (4).
+# Same total samples/epoch as v0.16 (65,536), but 4x better RLOO baseline
+# per step and reduced CUDA kernel launch overhead.
 
 project: Ising_VaTD_v0.18
 device: cuda:0
@@ -11,7 +15,7 @@ net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 250
-batch_size: 512
+batch_size: 2048
 seeds: [42]
 
 net_config:
@@ -20,17 +24,23 @@ net_config:
   fix_first: 1
 
   # Temperature sampling configuration
-  batch_size: 512
+  # batch_size × num_beta × accumulation_steps = 2048 × 8 × 4 = 65,536 samples/epoch
+  batch_size: 2048
   num_beta: 8
   beta_min: 0.2
   beta_max: 1.0
 
   # Training Mode: Sequential
+  # 4 accum steps with batch=2048 gives same total samples as 16 steps with batch=512,
+  # but with 4x lower RLOO baseline variance per optimizer step.
   training_mode: sequential
-  accumulation_steps: 16
+  accumulation_steps: 4
 
   # MCMC Guided Training: DISABLED (pure REINFORCE)
   mcmc_enabled: false
+
+  # A100 CUDA backend: cuDNN autotuner finds optimal conv algorithms
+  cudnn_benchmark: true
 
   # 2-Phase Curriculum Learning
   curriculum_enabled: true
