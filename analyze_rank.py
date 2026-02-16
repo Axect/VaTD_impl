@@ -94,6 +94,78 @@ def participation_ratio(singular_values):
     return (sv2.sum() ** 2 / (sv2**2).sum()).item()
 
 
+def numerical_rank(singular_values, threshold=0.99):
+    """
+    Numerical rank: minimum k such that Σᵢ₌₁ᵏ σᵢ² / Σ σⱼ² ≥ threshold.
+
+    The only discrete (integer) rank metric. Directly answers
+    "how many components carry threshold% of the energy?"
+    """
+    sv = singular_values[singular_values > 1e-10]
+    if len(sv) == 0:
+        return 1
+    energy = sv**2
+    total = energy.sum()
+    cumsum = torch.cumsum(energy, dim=0)
+    mask = cumsum >= threshold * total
+    if mask.any():
+        return (mask.float().argmax() + 1).item()
+    return len(sv)
+
+
+def spectral_gap_ratio(singular_values):
+    """
+    Spectral gap ratio: σ₁ / σ₂.
+
+    Measures dominance of the leading mode. High at low-T (single ordered
+    state dominates), ~1 near Tc (gapless critical spectrum), intermediate
+    at high-T.
+    """
+    sv = singular_values[singular_values > 1e-10]
+    if len(sv) < 2:
+        return float("inf")
+    return (sv[0] / sv[1]).item()
+
+
+def renyi_rank(singular_values, alpha=2.0):
+    """
+    Rényi rank: exp(H_α(p)) where H_α = 1/(1-α) · ln(Σ pᵢ^α).
+
+    Uses L1-normalized singular values: p_i = σ_i / Σσ_j (same convention
+    as eRank). α=2 gives the "collision rank", more sensitive to dominant
+    modes than Shannon-based eRank (α→1).
+    """
+    sv = singular_values[singular_values > 1e-10]
+    if len(sv) == 0:
+        return 1.0
+    p = sv / sv.sum()
+    H_alpha = (1.0 / (1.0 - alpha)) * torch.log((p**alpha).sum())
+    return torch.exp(H_alpha).item()
+
+
+def mp_edge_ratio(singular_values, N, M):
+    """
+    Marchenko-Pastur edge ratio: σ₁ / λ₊.
+
+    Compares the leading singular value to the theoretical bulk edge
+    from Random Matrix Theory: λ₊ = σ_noise · (1 + √γ) · √max(N,M).
+    σ_noise is robustly estimated from the median of the lower 50% of SVs.
+    γ = min(N,M) / max(N,M).
+
+    Ratio > 1 indicates signal components exceeding the noise bulk.
+    """
+    sv = singular_values[singular_values > 1e-10]
+    if len(sv) < 2:
+        return 1.0
+    n_lower = max(len(sv) // 2, 1)
+    sigma_noise = sv[-n_lower:].median().item()
+    if sigma_noise < 1e-12:
+        return float("inf")
+    gamma = min(N, M) / max(N, M)
+    lambda_plus = sigma_noise * (1.0 + np.sqrt(gamma)) * np.sqrt(max(N, M))
+    return (sv[0].item() / lambda_plus)
+
+
 # ──────────────────────────────────────────────────────────────
 # Exact Specific Heat (Onsager)
 # ──────────────────────────────────────────────────────────────
@@ -215,7 +287,11 @@ def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, conso
     Returns a DataFrame with columns:
         T, beta, T_over_Tc, layer,
         channel_erank, channel_stable_rank, channel_pr,
-        spatial_erank, spatial_stable_rank, spatial_pr
+        channel_numerical_rank_99, channel_numerical_rank_95,
+        channel_spectral_gap, channel_renyi2, channel_mp_edge,
+        spatial_erank, spatial_stable_rank, spatial_pr,
+        spatial_numerical_rank_99, spatial_numerical_rank_95,
+        spatial_spectral_gap, spatial_renyi2, spatial_mp_edge
     """
     if console is None:
         console = Console()
@@ -283,9 +359,19 @@ def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, conso
                         "channel_erank": effective_rank(S_ch),
                         "channel_stable_rank": stable_rank(S_ch),
                         "channel_pr": participation_ratio(S_ch),
+                        "channel_numerical_rank_99": numerical_rank(S_ch, 0.99),
+                        "channel_numerical_rank_95": numerical_rank(S_ch, 0.95),
+                        "channel_spectral_gap": spectral_gap_ratio(S_ch),
+                        "channel_renyi2": renyi_rank(S_ch, 2.0),
+                        "channel_mp_edge": mp_edge_ratio(S_ch, N, C),
                         "spatial_erank": effective_rank(S_sp),
                         "spatial_stable_rank": stable_rank(S_sp),
                         "spatial_pr": participation_ratio(S_sp),
+                        "spatial_numerical_rank_99": numerical_rank(S_sp, 0.99),
+                        "spatial_numerical_rank_95": numerical_rank(S_sp, 0.95),
+                        "spatial_spectral_gap": spectral_gap_ratio(S_sp),
+                        "spatial_renyi2": renyi_rank(S_sp, 2.0),
+                        "spatial_mp_edge": mp_edge_ratio(S_sp, N, H * W),
                     }
                 )
 
@@ -313,11 +399,13 @@ def _layer_label(name):
 
 def plot_rank_vs_temperature(df, L, figs_dir):
     """
-    2×2 figure:
+    3×2 figure:
       [0,0] Channel effective rank vs T per layer
       [0,1] Spatial effective rank vs T per layer
-      [1,0] Avg channel erank vs T + exact Cv overlay
-      [1,1] Heatmap of channel erank [layer × T]
+      [1,0] Numerical Rank vs T (99% and 95% thresholds)
+      [1,1] Spectral Gap Ratio vs T (log scale)
+      [2,0] Avg channel erank vs T + exact Cv overlay
+      [2,1] Heatmap of channel erank [layer × T]
     """
     temperatures = np.sort(df["T"].unique())
     Cv = exact_specific_heat(L, temperatures)
@@ -326,7 +414,9 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     n_layers = len(layers)
     colors = LAYER_CMAP(np.linspace(0.15, 0.85, n_layers))
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    has_extended = "channel_numerical_rank_99" in df.columns
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
     Tc = CRITICAL_TEMPERATURE
 
     # ── [0,0] Channel effective rank ──
@@ -363,15 +453,58 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     ax.legend(fontsize=6, ncol=2)
     ax.grid(True, alpha=0.15)
 
-    # ── [1,0] d(eRank)/dT vs Cv ──
-    # The effective rank acts as an entropy-like quantity;
-    # its temperature derivative should mirror the specific heat.
+    # ── [1,0] Numerical Rank vs T ──
     ax = axes[1, 0]
+    if has_extended:
+        for ci, layer in enumerate(layers):
+            ld = df[df["layer"] == layer].sort_values("T")
+            ax.plot(
+                ld["T"], ld["channel_numerical_rank_99"],
+                "o-", color=colors[ci], markersize=3, linewidth=1.2,
+                label=f"{_layer_label(layer)} (99%)", alpha=0.85,
+            )
+            ax.plot(
+                ld["T"], ld["channel_numerical_rank_95"],
+                "s--", color=colors[ci], markersize=2, linewidth=0.8,
+                alpha=0.5,
+            )
+        ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+        ax.set_xlabel("Temperature $T$")
+        ax.set_ylabel("Numerical Rank $k$")
+        ax.set_title("Numerical Rank (solid: 99%, dashed: 95%)")
+        ax.set_xscale("log")
+        ax.legend(fontsize=5, ncol=2)
+        ax.grid(True, alpha=0.15)
+    else:
+        ax.set_visible(False)
+
+    # ── [1,1] Spectral Gap Ratio vs T ──
+    ax = axes[1, 1]
+    if has_extended:
+        for ci, layer in enumerate(layers):
+            ld = df[df["layer"] == layer].sort_values("T")
+            ax.plot(
+                ld["T"], ld["channel_spectral_gap"],
+                "o-", color=colors[ci], markersize=3, linewidth=1.2,
+                label=_layer_label(layer), alpha=0.85,
+            )
+        ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+        ax.set_xlabel("Temperature $T$")
+        ax.set_ylabel("$\\sigma_1 / \\sigma_2$")
+        ax.set_title("Spectral Gap Ratio")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.legend(fontsize=6, ncol=2)
+        ax.grid(True, alpha=0.15)
+    else:
+        ax.set_visible(False)
+
+    # ── [2,0] eRank vs Cv (dual axis) ──
+    ax = axes[2, 0]
     avg_rank = df.groupby("T")["channel_erank"].mean().sort_index()
     T_arr = avg_rank.index.values
     rank_arr = avg_rank.values
 
-    # Main plot: eRank(T) vs Cv(T) on dual axes
     ax.plot(
         T_arr, rank_arr,
         "b-o", markersize=4, linewidth=2, label="Avg Channel eRank",
@@ -394,8 +527,8 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
     ax.set_title("eRank (entropy-like) vs $C_v$ ($\\sim d$S$/dT$)")
 
-    # ── [1,1] Heatmap ──
-    ax = axes[1, 1]
+    # ── [2,1] Heatmap ──
+    ax = axes[2, 1]
     numeric_layers = [l for l in layers if l.startswith("layer_")]
     if numeric_layers:
         pivot = df[df["layer"].isin(numeric_layers)].pivot_table(
@@ -565,6 +698,143 @@ def plot_singular_value_spectra(
     return path
 
 
+def plot_extended_metrics(df, L, figs_dir):
+    """
+    2×2 figure for the Nature Physics 2024 extended rank metrics:
+      [0,0] Rényi Rank (α=2) vs T per layer
+      [0,1] MP Edge Ratio vs T per layer
+      [1,0] All 5 rank metrics (normalized) overlaid
+      [1,1] Metric correlation heatmap near Tc
+    """
+    if "channel_renyi2" not in df.columns:
+        return None
+
+    layers = sorted(df["layer"].unique(), key=_layer_sort_key)
+    n_layers = len(layers)
+    colors = LAYER_CMAP(np.linspace(0.15, 0.85, n_layers))
+    Tc = CRITICAL_TEMPERATURE
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # ── [0,0] Rényi Rank (α=2) vs T ──
+    ax = axes[0, 0]
+    for ci, layer in enumerate(layers):
+        ld = df[df["layer"] == layer].sort_values("T")
+        ax.plot(
+            ld["T"], ld["channel_renyi2"],
+            "o-", color=colors[ci], markersize=3, linewidth=1.2,
+            label=_layer_label(layer), alpha=0.85,
+        )
+    ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("Rényi Rank ($\\alpha=2$)")
+    ax.set_title("Rényi Rank (collision rank)")
+    ax.set_xscale("log")
+    ax.legend(fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.15)
+
+    # ── [0,1] MP Edge Ratio vs T ──
+    ax = axes[0, 1]
+    for ci, layer in enumerate(layers):
+        ld = df[df["layer"] == layer].sort_values("T")
+        mp_vals = ld["channel_mp_edge"].replace([np.inf, -np.inf], np.nan)
+        ax.plot(
+            ld["T"], mp_vals,
+            "o-", color=colors[ci], markersize=3, linewidth=1.2,
+            label=_layer_label(layer), alpha=0.85,
+        )
+    ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+    ax.axhline(1.0, color="gray", ls=":", alpha=0.5, lw=0.8, label="MP bulk edge")
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("$\\sigma_1 / \\lambda_+$")
+    ax.set_title("Marchenko-Pastur Edge Ratio")
+    ax.set_xscale("log")
+    ax.legend(fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.15)
+
+    # ── [1,0] All 5 rank metrics (normalized to [0,1]) overlaid ──
+    ax = axes[1, 0]
+    metric_cols = {
+        "channel_erank": "eRank (Shannon)",
+        "channel_stable_rank": "Stable Rank",
+        "channel_pr": "Participation Ratio",
+        "channel_renyi2": "Rényi Rank (α=2)",
+        "channel_numerical_rank_99": "Numerical Rank (99%)",
+    }
+    metric_styles = ["o-", "s-", "^-", "D-", "v-"]
+    metric_colors = plt.cm.tab10(np.linspace(0, 0.5, len(metric_cols)))
+
+    avg_metrics = df.groupby("T")[list(metric_cols.keys())].mean().sort_index()
+    T_arr = avg_metrics.index.values
+
+    for (col, label), style, mc in zip(metric_cols.items(), metric_styles, metric_colors):
+        vals = avg_metrics[col].values.astype(float)
+        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+        norm_vals = (vals - vmin) / (vmax - vmin + 1e-10)
+        ax.plot(
+            T_arr, norm_vals,
+            style, color=mc, markersize=3, linewidth=1.2,
+            label=label, alpha=0.85,
+        )
+    ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("Normalized rank [0, 1]")
+    ax.set_title("All Rank Metrics (layer-averaged, normalized)")
+    ax.set_xscale("log")
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.15)
+
+    # ── [1,1] Metric correlation heatmap near Tc ──
+    ax = axes[1, 1]
+    near_Tc = df[(df["T"] > 0.8 * Tc) & (df["T"] < 1.2 * Tc)]
+    corr_cols = [
+        "channel_erank", "channel_stable_rank", "channel_pr",
+        "channel_renyi2", "channel_numerical_rank_99",
+        "channel_spectral_gap", "channel_mp_edge",
+    ]
+    corr_labels = [
+        "eRank", "sRank", "PR", "Rényi₂", "NumRank₉₉", "Gap", "MP Edge",
+    ]
+    available_cols = [c for c in corr_cols if c in near_Tc.columns]
+    available_labels = [corr_labels[corr_cols.index(c)] for c in available_cols]
+
+    if len(near_Tc) > 2 and len(available_cols) > 1:
+        corr_data = near_Tc[available_cols].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(corr_data) > 2:
+            corr_matrix = corr_data.corr().values
+            im = ax.imshow(corr_matrix, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+            ax.set_xticks(range(len(available_labels)))
+            ax.set_xticklabels(available_labels, rotation=45, ha="right", fontsize=7)
+            ax.set_yticks(range(len(available_labels)))
+            ax.set_yticklabels(available_labels, fontsize=7)
+            for i in range(len(available_labels)):
+                for j in range(len(available_labels)):
+                    ax.text(j, i, f"{corr_matrix[i, j]:.2f}",
+                            ha="center", va="center", fontsize=6,
+                            color="white" if abs(corr_matrix[i, j]) > 0.5 else "black")
+            plt.colorbar(im, ax=ax, label="Pearson $r$")
+            ax.set_title(f"Metric Correlations near $T_c$ ({0.8*Tc:.2f}–{1.2*Tc:.2f})")
+        else:
+            ax.text(0.5, 0.5, "Insufficient data\nnear Tc",
+                    transform=ax.transAxes, ha="center", va="center")
+            ax.set_title("Metric Correlations near $T_c$")
+    else:
+        ax.text(0.5, 0.5, "Insufficient data\nnear Tc",
+                transform=ax.transAxes, ha="center", va="center")
+        ax.set_title("Metric Correlations near $T_c$")
+
+    fig.suptitle(
+        f"Extended Rank Metrics: Nature Physics 2024 ($L={L}$, $T_c \\approx {Tc:.3f}$)",
+        fontsize=14, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    path = Path(figs_dir) / "extended_rank_metrics.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 # ──────────────────────────────────────────────────────────────
 # Entry Point
 # ──────────────────────────────────────────────────────────────
@@ -635,6 +905,10 @@ def main():
 
         fig_path = plot_derank_dt(df, L, figs_dir)
         console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
+
+        ext_path = plot_extended_metrics(df, L, figs_dir)
+        if ext_path:
+            console.print(f"[green]Extended metrics plot:[/green] {ext_path}")
 
         console.print("[bold green]Replot complete.[/bold green]")
         return
@@ -711,8 +985,12 @@ def main():
     fig_path = plot_derank_dt(df, L, figs_dir, suffix=f"_{mode_tag}" if mode_tag != "full" else "")
     console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
+    ext_path = plot_extended_metrics(df, L, figs_dir)
+    if ext_path:
+        console.print(f"[green]Extended metrics plot:[/green] {ext_path}")
+
     if mode_tag != "critical":
-        # Full/quick mode: also generate 2x2 overview and scree plots
+        # Full/quick mode: also generate 3x2 overview and scree plots
         fig_path = plot_rank_vs_temperature(df, L, figs_dir)
         console.print(f"[green]Main plot:[/green] {fig_path}")
 
@@ -750,6 +1028,25 @@ def main():
             f"{_layer_label(layer):>10s}  {peak_rank:>10.2f}  {peak_T:>7.3f}  "
             f"{peak_T / Tc:>6.3f}  {min_rank:>9.2f}  {ratio:>6.2f}x"
         )
+
+    # Extended metrics summary (if available)
+    if "channel_renyi2" in df.columns:
+        console.print("\n[bold cyan]Extended Metrics at T nearest Tc[/bold cyan]")
+        T_nearest_Tc = df.iloc[(df["T"] - Tc).abs().argsort().iloc[0]]["T"]
+        near_df = df[df["T"] == T_nearest_Tc]
+        console.print(f"T = {T_nearest_Tc:.4f} (T/Tc = {T_nearest_Tc / Tc:.4f})")
+        console.print(f"{'Layer':>10s}  {'Rényi₂':>8s}  {'NumRk99':>8s}  "
+                      f"{'Gap σ₁/σ₂':>10s}  {'MP Edge':>8s}")
+        console.print("-" * 52)
+        for layer in sorted(near_df["layer"].unique(), key=_layer_sort_key):
+            row = near_df[near_df["layer"] == layer].iloc[0]
+            gap_str = f"{row['channel_spectral_gap']:.2f}" if np.isfinite(row['channel_spectral_gap']) else "inf"
+            mp_str = f"{row['channel_mp_edge']:.2f}" if np.isfinite(row['channel_mp_edge']) else "inf"
+            console.print(
+                f"{_layer_label(layer):>10s}  {row['channel_renyi2']:>8.2f}  "
+                f"{int(row['channel_numerical_rank_99']):>8d}  "
+                f"{gap_str:>10s}  {mp_str:>8s}"
+            )
 
     console.print(f"\n[bold green]Analysis complete.[/bold green]")
     console.print(f"Figures: {figs_dir}/")
