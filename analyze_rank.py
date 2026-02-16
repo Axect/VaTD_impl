@@ -113,19 +113,6 @@ def numerical_rank(singular_values, threshold=0.99):
     return len(sv)
 
 
-def spectral_gap_ratio(singular_values):
-    """
-    Spectral gap ratio: σ₁ / σ₂.
-
-    Measures dominance of the leading mode. High at low-T (single ordered
-    state dominates), ~1 near Tc (gapless critical spectrum), intermediate
-    at high-T.
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) < 2:
-        return float("inf")
-    return (sv[0] / sv[1]).item()
-
 
 def renyi_rank(singular_values, alpha=2.0):
     """
@@ -143,27 +130,92 @@ def renyi_rank(singular_values, alpha=2.0):
     return torch.exp(H_alpha).item()
 
 
-def mp_edge_ratio(singular_values, N, M):
+
+def nuclear_rank(singular_values):
     """
-    Marchenko-Pastur edge ratio: σ₁ / λ₊.
+    Nuclear rank: Σσᵢ / σ_max  (L1/L∞ ratio).
 
-    Compares the leading singular value to the theoretical bulk edge
-    from Random Matrix Theory: λ₊ = σ_noise · (1 + √γ) · √max(N,M).
-    σ_noise is robustly estimated from the median of the lower 50% of SVs.
-    γ = min(N,M) / max(N,M).
+    The L1 analog of stable rank (which uses L2²/L∞²). Counts how many
+    singular values "participate" by magnitude rather than energy.
+    Always nuclear_rank ≥ stable_rank (Cauchy-Schwarz).
 
-    Ratio > 1 indicates signal components exceeding the noise bulk.
+    From Thibeault et al., Nature Physics (2024).
     """
     sv = singular_values[singular_values > 1e-10]
-    if len(sv) < 2:
+    if len(sv) == 0:
         return 1.0
-    n_lower = max(len(sv) // 2, 1)
-    sigma_noise = sv[-n_lower:].median().item()
-    if sigma_noise < 1e-12:
-        return float("inf")
-    gamma = min(N, M) / max(N, M)
-    lambda_plus = sigma_noise * (1.0 + np.sqrt(gamma)) * np.sqrt(max(N, M))
-    return (sv[0].item() / lambda_plus)
+    return (sv.sum() / sv[0]).item()
+
+
+def elbow_rank(singular_values):
+    """
+    Elbow rank: index of maximum perpendicular distance from the diagonal y = 1 - x.
+
+    Given normalized cumulative singular values, finds the "elbow" point where
+    the spectrum transitions from signal to noise. This is the geometric method
+    from the Thibeault et al. (2024) codebase.
+
+    Returns integer rank (1-indexed).
+    """
+    sv = singular_values[singular_values > 1e-10]
+    if len(sv) <= 1:
+        return 1
+    # Normalize SVs to [0, 1] range on x-axis
+    n = len(sv)
+    x = torch.arange(1, n + 1, dtype=torch.float64) / n  # [1/n, 2/n, ..., 1]
+    # Cumulative energy fraction
+    energy = sv**2
+    y = torch.cumsum(energy, dim=0) / energy.sum()
+    # Distance from diagonal y = x (the "null" line for uniform spectrum)
+    # For the elbow method: distance from line connecting (0,0) to (1,1)
+    # d = |y_i - x_i| / sqrt(2)
+    dist = (y - x).abs()
+    return (dist.argmax() + 1).item()
+
+
+def optimal_hard_threshold(singular_values, N, M):
+    """
+    Gavish & Donoho (2014) optimal hard threshold for singular values.
+
+    Returns the number of singular values above the optimal threshold
+    λ* = ω(β) · σ_median · √max(N,M), where β = min(N,M)/max(N,M)
+    and ω(β) is the optimal threshold coefficient.
+
+    σ_median is the median singular value (robust noise estimator).
+    For unknown noise level, σ_noise = median(σ) / √(μ_β), where
+    μ_β is the median of the Marchenko-Pastur distribution.
+
+    Reference: Gavish & Donoho, "The optimal hard threshold for
+    singular values is 4/√3", IEEE Trans. Inf. Theory (2014).
+    """
+    sv = singular_values[singular_values > 1e-10]
+    if len(sv) <= 1:
+        return 1
+
+    beta = min(N, M) / max(N, M)
+
+    # Optimal threshold coefficient ω(β) from Gavish & Donoho
+    # Approximation valid for all β ∈ (0, 1]:
+    # ω(β) ≈ 0.56·β³ - 0.95·β² + 1.82·β + 1.43
+    omega = 0.56 * beta**3 - 0.95 * beta**2 + 1.82 * beta + 1.43
+
+    # Estimate noise level from median SV
+    sv_median = sv.median().item()
+
+    # Median of MP distribution (approximation for β → 0 is √(2β))
+    # More accurate: μ_β ≈ √(2β + β²/3) for moderate β
+    mu_beta = np.sqrt(2 * beta + beta**2 / 3)
+    if mu_beta < 1e-12:
+        return len(sv)
+
+    sigma_noise = sv_median / (mu_beta * np.sqrt(max(N, M)))
+
+    # Threshold
+    threshold = omega * sigma_noise * np.sqrt(max(N, M))
+
+    # Count SVs above threshold
+    count = (sv > threshold).sum().item()
+    return max(count, 1)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -288,10 +340,12 @@ def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, conso
         T, beta, T_over_Tc, layer,
         channel_erank, channel_stable_rank, channel_pr,
         channel_numerical_rank_99, channel_numerical_rank_95,
-        channel_spectral_gap, channel_renyi2, channel_mp_edge,
+        channel_renyi2,
+        channel_nuclear_rank, channel_elbow_rank, channel_opt_threshold,
         spatial_erank, spatial_stable_rank, spatial_pr,
         spatial_numerical_rank_99, spatial_numerical_rank_95,
-        spatial_spectral_gap, spatial_renyi2, spatial_mp_edge
+        spatial_renyi2,
+        spatial_nuclear_rank, spatial_elbow_rank, spatial_opt_threshold
     """
     if console is None:
         console = Console()
@@ -361,17 +415,19 @@ def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, conso
                         "channel_pr": participation_ratio(S_ch),
                         "channel_numerical_rank_99": numerical_rank(S_ch, 0.99),
                         "channel_numerical_rank_95": numerical_rank(S_ch, 0.95),
-                        "channel_spectral_gap": spectral_gap_ratio(S_ch),
                         "channel_renyi2": renyi_rank(S_ch, 2.0),
-                        "channel_mp_edge": mp_edge_ratio(S_ch, N, C),
+                        "channel_nuclear_rank": nuclear_rank(S_ch),
+                        "channel_elbow_rank": elbow_rank(S_ch),
+                        "channel_opt_threshold": optimal_hard_threshold(S_ch, N, C),
                         "spatial_erank": effective_rank(S_sp),
                         "spatial_stable_rank": stable_rank(S_sp),
                         "spatial_pr": participation_ratio(S_sp),
                         "spatial_numerical_rank_99": numerical_rank(S_sp, 0.99),
                         "spatial_numerical_rank_95": numerical_rank(S_sp, 0.95),
-                        "spatial_spectral_gap": spectral_gap_ratio(S_sp),
                         "spatial_renyi2": renyi_rank(S_sp, 2.0),
-                        "spatial_mp_edge": mp_edge_ratio(S_sp, N, H * W),
+                        "spatial_nuclear_rank": nuclear_rank(S_sp),
+                        "spatial_elbow_rank": elbow_rank(S_sp),
+                        "spatial_opt_threshold": optimal_hard_threshold(S_sp, N, H * W),
                     }
                 )
 
@@ -403,7 +459,7 @@ def plot_rank_vs_temperature(df, L, figs_dir):
       [0,0] Channel effective rank vs T per layer
       [0,1] Spatial effective rank vs T per layer
       [1,0] Numerical Rank vs T (99% and 95% thresholds)
-      [1,1] Spectral Gap Ratio vs T (log scale)
+      [1,1] Nuclear Rank vs T per layer
       [2,0] Avg channel erank vs T + exact Cv overlay
       [2,1] Heatmap of channel erank [layer × T]
     """
@@ -478,22 +534,21 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     else:
         ax.set_visible(False)
 
-    # ── [1,1] Spectral Gap Ratio vs T ──
+    # ── [1,1] Nuclear Rank vs T ──
     ax = axes[1, 1]
-    if has_extended:
+    if has_extended and "channel_nuclear_rank" in df.columns:
         for ci, layer in enumerate(layers):
             ld = df[df["layer"] == layer].sort_values("T")
             ax.plot(
-                ld["T"], ld["channel_spectral_gap"],
+                ld["T"], ld["channel_nuclear_rank"],
                 "o-", color=colors[ci], markersize=3, linewidth=1.2,
                 label=_layer_label(layer), alpha=0.85,
             )
         ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
         ax.set_xlabel("Temperature $T$")
-        ax.set_ylabel("$\\sigma_1 / \\sigma_2$")
-        ax.set_title("Spectral Gap Ratio")
+        ax.set_ylabel("Nuclear Rank ($\\Sigma\\sigma_i / \\sigma_{max}$)")
+        ax.set_title("Nuclear Rank (L1/L$\\infty$)")
         ax.set_xscale("log")
-        ax.set_yscale("log")
         ax.legend(fontsize=6, ncol=2)
         ax.grid(True, alpha=0.15)
     else:
@@ -702,7 +757,7 @@ def plot_extended_metrics(df, L, figs_dir):
     """
     2×2 figure for the Nature Physics 2024 extended rank metrics:
       [0,0] Rényi Rank (α=2) vs T per layer
-      [0,1] MP Edge Ratio vs T per layer
+      [0,1] Optimal Hard Threshold (Gavish & Donoho) vs T per layer
       [1,0] All 5 rank metrics (normalized) overlaid
       [1,1] Metric correlation heatmap near Tc
     """
@@ -733,36 +788,43 @@ def plot_extended_metrics(df, L, figs_dir):
     ax.legend(fontsize=6, ncol=2)
     ax.grid(True, alpha=0.15)
 
-    # ── [0,1] MP Edge Ratio vs T ──
+    # ── [0,1] Optimal Hard Threshold (Gavish & Donoho) vs T ──
     ax = axes[0, 1]
-    for ci, layer in enumerate(layers):
-        ld = df[df["layer"] == layer].sort_values("T")
-        mp_vals = ld["channel_mp_edge"].replace([np.inf, -np.inf], np.nan)
-        ax.plot(
-            ld["T"], mp_vals,
-            "o-", color=colors[ci], markersize=3, linewidth=1.2,
-            label=_layer_label(layer), alpha=0.85,
-        )
-    ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
-    ax.axhline(1.0, color="gray", ls=":", alpha=0.5, lw=0.8, label="MP bulk edge")
-    ax.set_xlabel("Temperature $T$")
-    ax.set_ylabel("$\\sigma_1 / \\lambda_+$")
-    ax.set_title("Marchenko-Pastur Edge Ratio")
-    ax.set_xscale("log")
-    ax.legend(fontsize=6, ncol=2)
-    ax.grid(True, alpha=0.15)
+    if "channel_opt_threshold" in df.columns:
+        for ci, layer in enumerate(layers):
+            ld = df[df["layer"] == layer].sort_values("T")
+            ax.plot(
+                ld["T"], ld["channel_opt_threshold"],
+                "o-", color=colors[ci], markersize=3, linewidth=1.2,
+                label=_layer_label(layer), alpha=0.85,
+            )
+        ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+        ax.set_xlabel("Temperature $T$")
+        ax.set_ylabel("Rank (Gavish-Donoho)")
+        ax.set_title("Optimal Hard Threshold (RMT)")
+        ax.set_xscale("log")
+        ax.legend(fontsize=6, ncol=2)
+        ax.grid(True, alpha=0.15)
+    else:
+        ax.set_visible(False)
 
-    # ── [1,0] All 5 rank metrics (normalized to [0,1]) overlaid ──
+    # ── [1,0] All rank metrics (normalized to [0,1]) overlaid ──
     ax = axes[1, 0]
     metric_cols = {
         "channel_erank": "eRank (Shannon)",
         "channel_stable_rank": "Stable Rank",
+        "channel_nuclear_rank": "Nuclear Rank",
         "channel_pr": "Participation Ratio",
         "channel_renyi2": "Rényi Rank (α=2)",
         "channel_numerical_rank_99": "Numerical Rank (99%)",
+        "channel_elbow_rank": "Elbow Rank",
+        "channel_opt_threshold": "Opt. Threshold (G&D)",
     }
-    metric_styles = ["o-", "s-", "^-", "D-", "v-"]
-    metric_colors = plt.cm.tab10(np.linspace(0, 0.5, len(metric_cols)))
+    # Filter to columns that exist in the DataFrame
+    metric_cols = {k: v for k, v in metric_cols.items() if k in df.columns}
+    n_metrics = len(metric_cols)
+    metric_styles = ["o-", "s-", "^-", "D-", "v-", "P-", "X-", "h-"][:n_metrics]
+    metric_colors = plt.cm.tab10(np.linspace(0, 0.7, n_metrics))
 
     avg_metrics = df.groupby("T")[list(metric_cols.keys())].mean().sort_index()
     T_arr = avg_metrics.index.values
@@ -788,12 +850,13 @@ def plot_extended_metrics(df, L, figs_dir):
     ax = axes[1, 1]
     near_Tc = df[(df["T"] > 0.8 * Tc) & (df["T"] < 1.2 * Tc)]
     corr_cols = [
-        "channel_erank", "channel_stable_rank", "channel_pr",
-        "channel_renyi2", "channel_numerical_rank_99",
-        "channel_spectral_gap", "channel_mp_edge",
+        "channel_erank", "channel_stable_rank", "channel_nuclear_rank",
+        "channel_pr", "channel_renyi2", "channel_numerical_rank_99",
+        "channel_elbow_rank", "channel_opt_threshold",
     ]
     corr_labels = [
-        "eRank", "sRank", "PR", "Rényi₂", "NumRank₉₉", "Gap", "MP Edge",
+        "eRank", "sRank", "nRank", "PR", "Rényi₂", "NumRk₉₉",
+        "Elbow", "Opt.Thr",
     ]
     available_cols = [c for c in corr_cols if c in near_Tc.columns]
     available_labels = [corr_labels[corr_cols.index(c)] for c in available_cols]
@@ -1035,17 +1098,19 @@ def main():
         T_nearest_Tc = df.iloc[(df["T"] - Tc).abs().argsort().iloc[0]]["T"]
         near_df = df[df["T"] == T_nearest_Tc]
         console.print(f"T = {T_nearest_Tc:.4f} (T/Tc = {T_nearest_Tc / Tc:.4f})")
-        console.print(f"{'Layer':>10s}  {'Rényi₂':>8s}  {'NumRk99':>8s}  "
-                      f"{'Gap σ₁/σ₂':>10s}  {'MP Edge':>8s}")
-        console.print("-" * 52)
+        console.print(
+            f"{'Layer':>10s}  {'Rényi₂':>8s}  {'NumRk99':>8s}  "
+            f"{'nRank':>7s}  {'Elbow':>6s}  {'OptThr':>7s}"
+        )
+        console.print("-" * 56)
         for layer in sorted(near_df["layer"].unique(), key=_layer_sort_key):
             row = near_df[near_df["layer"] == layer].iloc[0]
-            gap_str = f"{row['channel_spectral_gap']:.2f}" if np.isfinite(row['channel_spectral_gap']) else "inf"
-            mp_str = f"{row['channel_mp_edge']:.2f}" if np.isfinite(row['channel_mp_edge']) else "inf"
             console.print(
                 f"{_layer_label(layer):>10s}  {row['channel_renyi2']:>8.2f}  "
                 f"{int(row['channel_numerical_rank_99']):>8d}  "
-                f"{gap_str:>10s}  {mp_str:>8s}"
+                f"{row['channel_nuclear_rank']:>7.2f}"
+                f"  {int(row['channel_elbow_rank']):>6d}"
+                f"  {int(row['channel_opt_threshold']):>7d}"
             )
 
     console.print(f"\n[bold green]Analysis complete.[/bold green]")
