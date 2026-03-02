@@ -54,6 +54,12 @@ net_config:
   cond_dim: 64
   dropout: 0.0
 
+  # 2D Periodic Relative Position Bias (PBC lattice topology)
+  use_rel_pos_bias: true
+
+  # AMP (bfloat16 for A100 — REINFORCE-safe)
+  use_amp: true
+
   # Temperature-dependent Output Scaling (Parameter-free)
   logit_temp_scale: true
   temp_scale_min: 0.1

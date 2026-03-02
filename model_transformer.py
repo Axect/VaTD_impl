@@ -6,13 +6,14 @@ the same VaTD training objective (variational free energy minimization
 via REINFORCE).  Designed to test the architecture independence of the
 low-rank phenomenon observed in DiscretePixelCNN.
 
-Architecture
-------------
+Architecture (v0.20.1 — Tier 1 engineering fixes)
+--------------------------------------------------
   Flatten 16×16 → 256-token sequence (raster order)
   Token embedding: nn.Embedding(q, d_model)
-  Position embedding: learnable nn.Parameter([L², d_model])
+  Position embedding: optional absolute + periodic 2D relative bias
   Temperature conditioning: AdaLN in every block
-  Causal self-attention with KV-cache for O(L²) sampling
+  Manual QKV + F.scaled_dot_product_attention (FlashAttention)
+  Proper projected KV-cache for O(L²) sampling with O(d²) per step
   Output: nn.Linear(d_model, q) → per-position logits
 
 Interface is identical to DiscretePixelCNN:
@@ -23,7 +24,7 @@ Interface is identical to DiscretePixelCNN:
 import torch
 from torch import nn
 import torch.nn.functional as F
-import math
+from torch.nn.functional import scaled_dot_product_attention as _sdpa
 
 
 # ──────────────────────────────────────────────────────────────
@@ -78,8 +79,17 @@ class CausalTransformerBlock(nn.Module):
 
     AdaLN → MHSA (causal) → residual → AdaLN → FFN → residual
 
-    Supports KV-cache for incremental decoding: when past_kv is provided,
-    only the new query token is computed and the cache is extended.
+    Uses manual QKV projections + F.scaled_dot_product_attention for
+    FlashAttention support and correct projected KV-cache.
+
+    KV-cache stores post-projection K, V as [B, n_heads, L, head_dim]
+    so incremental decoding only projects the new token (O(d²) per step
+    instead of O(L·d²) with the old nn.MHA approach, which re-projected
+    all cached states at every step — a correctness bug, not just perf).
+
+    When ``attn_bias`` is provided, SDPA falls back to the math kernel
+    (no FlashAttention); without bias, FlashAttention is used via
+    ``is_causal=True``.
     """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, cond_dim: int,
@@ -90,9 +100,13 @@ class CausalTransformerBlock(nn.Module):
         self.head_dim = d_model // n_heads
 
         self.adaln1 = AdaLN(d_model, cond_dim)
-        self.attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True,
-        )
+        # Manual QKV projections (replaces nn.MultiheadAttention)
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        self.attn_dropout = dropout
+
         self.adaln2 = AdaLN(d_model, cond_dim)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -100,36 +114,68 @@ class CausalTransformerBlock(nn.Module):
             nn.Linear(d_ff, d_model),
         )
 
-    def forward(self, x, cond, past_kv=None):
+    def _reshape_heads(self, t, B):
+        """Reshape [B, L, d_model] → [B, n_heads, L, head_dim]."""
+        return t.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, x, cond, past_kv=None, attn_bias=None):
         """
         Args:
             x: [B, L, d_model] (full sequence) or [B, 1, d_model] (incremental)
             cond: [B, cond_dim]
-            past_kv: optional tuple (past_key, past_value), each [B, n_kv, d_model]
+            past_kv: optional tuple (past_key, past_value),
+                     each [B, n_heads, kv_len, head_dim]
+            attn_bias: optional additive bias for attention scores.
+                Full-sequence: [n_heads, L, L]
+                Incremental:   [n_heads, 1, kv_len]
 
         Returns:
             output: [B, L, d_model] or [B, 1, d_model]
-            new_kv: tuple (key, value) for the full sequence so far
+            new_kv: tuple (key, value), each [B, n_heads, kv_len, head_dim]
         """
+        B = x.shape[0]
+
         # Self-attention with causal mask
         h = self.adaln1(x, cond)
 
-        if past_kv is None:
-            # Full sequence: standard causal attention
-            L = h.shape[1]
-            causal_mask = nn.Transformer.generate_square_subsequent_mask(
-                L, device=h.device, dtype=h.dtype
-            )
-            attn_out, _ = self.attn(h, h, h, attn_mask=causal_mask, is_causal=True)
-            new_kv = (h, h)  # Store full KV for future incremental steps
-        else:
-            # Incremental: h is [B, 1, d_model], attend to all past + current
+        # Project Q, K, V and reshape to multi-head format
+        q = self._reshape_heads(self.W_q(h), B)  # [B, n_heads, L_q, head_dim]
+        k = self._reshape_heads(self.W_k(h), B)
+        v = self._reshape_heads(self.W_v(h), B)
+
+        # Concatenate with cached K, V (incremental decoding)
+        if past_kv is not None:
             past_k, past_v = past_kv
-            full_k = torch.cat([past_k, h], dim=1)  # [B, n_kv+1, d_model]
-            full_v = torch.cat([past_v, h], dim=1)
-            # No mask needed: query is single token, attends to all past (causal by construction)
-            attn_out, _ = self.attn(h, full_k, full_v)
-            new_kv = (full_k, full_v)
+            k = torch.cat([past_k, k], dim=2)  # [B, n_heads, kv_len, head_dim]
+            v = torch.cat([past_v, v], dim=2)
+
+        new_kv = (k, v)  # Store projected K, V
+
+        # Compute attention
+        drop_p = self.attn_dropout if self.training else 0.0
+
+        if past_kv is None and attn_bias is None:
+            # Full sequence, no bias → FlashAttention via is_causal
+            attn_out = _sdpa(q, k, v, is_causal=True, dropout_p=drop_p)
+        else:
+            # Build explicit mask when bias is present or doing incremental
+            if past_kv is None:
+                # Full sequence with bias: causal mask + bias
+                L = q.shape[2]
+                causal = torch.full(
+                    (L, L), float('-inf'), device=q.device, dtype=q.dtype
+                )
+                causal = torch.triu(causal, diagonal=1)
+                mask = causal.unsqueeze(0) + attn_bias  # [n_heads, L, L]
+            else:
+                # Incremental: single query → all keys causal by construction
+                mask = attn_bias  # [n_heads, 1, kv_len] or None
+
+            attn_out = _sdpa(q, k, v, attn_mask=mask, dropout_p=drop_p)
+
+        # Reshape back: [B, n_heads, L, head_dim] → [B, L, d_model]
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, -1, self.d_model)
+        attn_out = self.W_o(attn_out)
 
         x = x + attn_out
 
@@ -163,12 +209,13 @@ class CausalTransformerBackbone(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, cond, past_kvs=None):
+    def forward(self, x, cond, past_kvs=None, attn_bias=None):
         """
         Args:
             x: [B, L, d_model] or [B, 1, d_model]
             cond: [B, cond_dim]
             past_kvs: optional list of (key, value) tuples, one per block
+            attn_bias: optional additive attention bias, passed to each block
 
         Returns:
             x: [B, L, d_model] or [B, 1, d_model]
@@ -177,7 +224,7 @@ class CausalTransformerBackbone(nn.Module):
         new_kvs = []
         for i, block in enumerate(self.blocks):
             past_kv = past_kvs[i] if past_kvs is not None else None
-            x, kv = block(x, cond, past_kv=past_kv)
+            x, kv = block(x, cond, past_kv=past_kv, attn_bias=attn_bias)
             new_kvs.append(kv)
         return self.final_norm(x), new_kvs
 
@@ -253,11 +300,45 @@ class SpinGPT(nn.Module):
         cond_dim = hparams.get("cond_dim", 64)
         dropout = hparams.get("dropout", 0.0)
 
-        # ── Token and position embeddings ──
+        # ── Token embedding ──
         self.tok_embed = nn.Embedding(self.category, self._d_model)
-        self.pos_embed = nn.Parameter(
-            torch.randn(self.seq_len, self._d_model) * 0.02
-        )
+
+        # ── 2D Relative Position Bias (optional, periodic for PBC) ──
+        self.use_rel_pos_bias = hparams.get("use_rel_pos_bias", False)
+        self.drop_abs_pos_when_rel = hparams.get("drop_abs_pos_when_rel", False)
+
+        # ── Position embeddings ──
+        if self.use_rel_pos_bias and self.drop_abs_pos_when_rel:
+            # Drop absolute position embeddings (zero buffer, non-learnable)
+            self.register_buffer(
+                "pos_embed", torch.zeros(self.seq_len, self._d_model)
+            )
+        else:
+            self.pos_embed = nn.Parameter(
+                torch.randn(self.seq_len, self._d_model) * 0.02
+            )
+
+        if self.use_rel_pos_bias:
+            # Periodic distances for PBC lattice topology
+            positions = torch.arange(self.seq_len)
+            row = positions // W
+            col = positions % W
+            # Absolute row/col differences
+            abs_dr = (row.unsqueeze(0) - row.unsqueeze(1)).abs()  # [L, L]
+            abs_dc = (col.unsqueeze(0) - col.unsqueeze(1)).abs()  # [L, L]
+            # Periodic wrapping: min(d, size - d)
+            periodic_dr = torch.min(abs_dr, H - abs_dr)  # range [0, H//2]
+            periodic_dc = torch.min(abs_dc, W - abs_dc)  # range [0, W//2]
+            # Flat index into compact bias table
+            max_dc = W // 2 + 1
+            rel_pos_index = periodic_dr * max_dc + periodic_dc  # [L, L]
+            self.register_buffer("rel_pos_index", rel_pos_index)
+
+            num_rel_pos = (H // 2 + 1) * (W // 2 + 1)
+            self.rel_pos_bias_table = nn.Parameter(
+                torch.zeros(n_heads, num_rel_pos)
+            )
+            nn.init.trunc_normal_(self.rel_pos_bias_table, std=0.02)
 
         # ── Temperature conditioning MLP ──
         # Maps scalar T → cond_dim vector
@@ -281,6 +362,41 @@ class SpinGPT(nn.Module):
         self.output_head = nn.Linear(self._d_model, self.category)
 
         self.to(device)
+
+    def _get_rel_pos_bias(self, query_len, kv_len=None):
+        """
+        Compute relative position bias for attention.
+
+        Args:
+            query_len: number of query positions (L for full, 1 for incremental)
+            kv_len: number of key/value positions (defaults to query_len)
+
+        Returns:
+            [n_heads, query_len, kv_len] additive bias tensor
+        """
+        if not self.use_rel_pos_bias:
+            return None
+
+        if kv_len is None:
+            kv_len = query_len
+
+        if query_len == self.seq_len and kv_len == self.seq_len:
+            # Full sequence: use pre-computed index [L, L]
+            idx = self.rel_pos_index  # [L, L]
+        else:
+            # Incremental or partial: compute the relevant slice
+            # For incremental decoding at position `pos` (query_len=1, kv_len=pos+1),
+            # we need the row `pos` of the full index table, columns 0..pos
+            # But we don't know `pos` here; caller should pass the right slice.
+            # Fallback: compute from full table
+            # query positions: last `query_len` positions of a kv_len-length sequence
+            start_q = kv_len - query_len
+            idx = self.rel_pos_index[start_q:kv_len, :kv_len]  # [query_len, kv_len]
+
+        # Gather bias: [n_heads, query_len, kv_len]
+        bias = self.rel_pos_bias_table[:, idx.reshape(-1)]  # [n_heads, query_len*kv_len]
+        bias = bias.reshape(-1, query_len, kv_len)  # [n_heads, query_len, kv_len]
+        return bias
 
     def _compute_temp_scale(self, T):
         """
@@ -344,8 +460,11 @@ class SpinGPT(nn.Module):
         # Temperature conditioning
         cond = self._get_cond(T)  # [B, cond_dim]
 
+        # 2D relative position bias (if enabled)
+        attn_bias = self._get_rel_pos_bias(L)
+
         # Transformer backbone (no KV-cache for training)
-        x, _ = self.backbone(x, cond)  # [B, L, d_model]
+        x, _ = self.backbone(x, cond, attn_bias=attn_bias)  # [B, L, d_model]
 
         # Output logits
         logits = self.output_head(x)  # [B, L, q]
@@ -411,7 +530,8 @@ class SpinGPT(nn.Module):
             else:
                 shifted = zero_start  # Only 1 fixed token
             x = shifted + self.pos_embed[:prefill_len]
-            _, past_kvs = self.backbone(x, cond)
+            prefill_bias = self._get_rel_pos_bias(prefill_len)
+            _, past_kvs = self.backbone(x, cond, attn_bias=prefill_bias)
         else:
             past_kvs = None
 
@@ -426,8 +546,11 @@ class SpinGPT(nn.Module):
 
             x_i = x_i + self.pos_embed[i:i+1]  # [B, 1, d_model]
 
+            # Incremental relative position bias: query=position i, keys=0..i
+            incr_bias = self._get_rel_pos_bias(query_len=1, kv_len=i + 1)
+
             # Run through backbone with KV-cache
-            out_i, past_kvs = self.backbone(x_i, cond, past_kvs=past_kvs)
+            out_i, past_kvs = self.backbone(x_i, cond, past_kvs=past_kvs, attn_bias=incr_bias)
             logits_i = self.output_head(out_i.squeeze(1))  # [B, q]
 
             if isinstance(temp_scale, torch.Tensor):

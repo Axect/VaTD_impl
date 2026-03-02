@@ -292,6 +292,37 @@ class Trainer:
         # Phase 2: Gradual expansion to full range
         self.phase2_epochs = getattr(model, "phase2_epochs", 100)
 
+        # Zero-variance effective action loss (v0.21)
+        hparams = getattr(model, "hparams", {})
+        self.alpha_zv = hparams.get("alpha_zv", 0.0)
+
+        # AMP (Automatic Mixed Precision) — bfloat16 for REINFORCE stability
+        self.use_amp = hparams.get("use_amp", False)
+        if self.use_amp and "cuda" in str(device):
+            self.amp_dtype = torch.bfloat16
+        else:
+            self.use_amp = False
+            self.amp_dtype = None
+
+        # Variance-based adaptive temperature sampling (v0.21)
+        self.adaptive_sampling_enabled = hparams.get("adaptive_sampling_enabled", False)
+        self.adaptive_sampling_warmup = hparams.get("adaptive_sampling_warmup", 20)
+        self.adaptive_sampling_num_bins = hparams.get("adaptive_sampling_num_bins", 32)
+        self.adaptive_sampling_kappa = hparams.get("adaptive_sampling_kappa", 1.0)
+        self.adaptive_sampling_epsilon = hparams.get("adaptive_sampling_epsilon", 1e-6)
+        self.adaptive_sampling_momentum = hparams.get("adaptive_sampling_momentum", 0.95)
+
+        # Initialize EMA variance bins (in log-beta space)
+        if self.adaptive_sampling_enabled:
+            n_bins = self.adaptive_sampling_num_bins
+            self.ema_var = torch.ones(n_bins, device=device)  # Initialize uniform
+            self.log_bin_edges = torch.linspace(
+                math.log(model.beta_min), math.log(model.beta_max),
+                n_bins + 1, device=device,
+            )
+            self.log_bin_centers = 0.5 * (self.log_bin_edges[:-1] + self.log_bin_edges[1:])
+            self.log_bin_width = self.log_bin_edges[1] - self.log_bin_edges[0]
+
         # Pre-compute fixed betas for validation (from energy_fn)
         # Validation uses fixed wider range (0.1-2.0) for extrapolation testing
         # Training uses model's beta range from config
@@ -369,6 +400,86 @@ class Trainer:
             )
             return self.model.beta_min, effective_beta_max
 
+    def _sample_betas(self, num_beta, beta_min, beta_max):
+        """
+        Sample beta values for training.
+
+        Uses adaptive variance-proportional sampling if enabled and past warmup,
+        otherwise falls back to log-uniform sampling.
+
+        Args:
+            num_beta: number of betas to sample
+            beta_min: minimum beta (from curriculum or config)
+            beta_max: maximum beta (from curriculum or config)
+
+        Returns:
+            beta_samples: [num_beta] tensor of sampled beta values
+        """
+        if (
+            self.adaptive_sampling_enabled
+            and self.current_epoch >= self.adaptive_sampling_warmup
+        ):
+            return self._sample_adaptive_betas(num_beta, beta_min, beta_max)
+
+        # Default: log-uniform sampling
+        log_beta = torch.rand(num_beta, device=self.device) * (
+            math.log(beta_max) - math.log(beta_min)
+        ) + math.log(beta_min)
+        return torch.exp(log_beta)
+
+    def _sample_adaptive_betas(self, num_beta, beta_min, beta_max):
+        """
+        Sample betas proportional to EMA variance: p(bin_k) ∝ (σ²_k + ε)^κ.
+
+        Draws bin indices from the categorical distribution, then samples
+        beta uniformly within each bin (in log-space).
+        """
+        eps = self.adaptive_sampling_epsilon
+        kappa = self.adaptive_sampling_kappa
+
+        # Compute sampling probabilities
+        probs = (self.ema_var + eps) ** kappa
+        probs = probs / probs.sum()
+
+        # Sample bin indices
+        bin_indices = torch.multinomial(probs, num_beta, replacement=True)
+
+        # Sample beta within each bin (uniform in log-space)
+        log_beta = (
+            self.log_bin_edges[bin_indices]
+            + torch.rand(num_beta, device=self.device) * self.log_bin_width
+        )
+        # Clamp to valid range
+        log_beta = log_beta.clamp(min=math.log(beta_min), max=math.log(beta_max))
+        return torch.exp(log_beta)
+
+    def _update_ema_variance(self, beta_samples, reinforce_weight_view):
+        """
+        Update EMA variance bins with observed per-temperature variance.
+
+        Args:
+            beta_samples: [num_beta] sampled betas
+            reinforce_weight_view: [num_beta, batch_size] REINFORCE weights
+        """
+        if not self.adaptive_sampling_enabled:
+            return
+
+        momentum = self.adaptive_sampling_momentum
+        log_betas = torch.log(beta_samples)
+
+        # Assign each beta to its nearest bin
+        bin_indices = torch.bucketize(log_betas, self.log_bin_edges) - 1
+        bin_indices = bin_indices.clamp(0, self.adaptive_sampling_num_bins - 1)
+
+        # Compute per-temperature variance and update EMA
+        variances = reinforce_weight_view.var(dim=1)  # [num_beta]
+        for i in range(len(beta_samples)):
+            b = bin_indices[i].item()
+            self.ema_var[b] = (
+                momentum * self.ema_var[b]
+                + (1 - momentum) * variances[i].item()
+            )
+
     def step(self, batch_size, T):
         # Sample from PixelCNN (no gradient tracking needed for sampling)
         with torch.no_grad():
@@ -383,11 +494,8 @@ class Trainer:
         # Get curriculum-adjusted beta range
         beta_min, beta_max = self.get_curriculum_beta_range()
 
-        # Log-uniform sampling over current beta range
-        log_beta_samples = torch.rand(num_beta, device=self.device) * (
-            math.log(beta_max) - math.log(beta_min)
-        ) + math.log(beta_min)
-        beta_samples = torch.exp(log_beta_samples)
+        # Sample betas (adaptive or log-uniform)
+        beta_samples = self._sample_betas(num_beta, beta_min, beta_max)
 
         T_samples = 1.0 / beta_samples
         T_expanded = T_samples.repeat_interleave(batch_size)
@@ -425,6 +533,9 @@ class Trainer:
         # Full REINFORCE weight: log q + β·E
         reinforce_weight = log_prob_view.detach() + beta_energy
 
+        # Update EMA variance bins
+        self._update_ema_variance(beta_samples, reinforce_weight.detach())
+
         # RLOO: Leave-One-Out baseline for variance reduction
         # For each sample, baseline is mean of all OTHER samples
         # Shape: reinforce_weight is (num_beta, batch_size)
@@ -438,6 +549,16 @@ class Trainer:
 
         # REINFORCE loss: gradient is E[(log q + β·E - baseline) · ∇log q]
         loss = torch.mean(advantage * log_prob_view)
+
+        # Zero-variance effective action loss (v0.21)
+        zv_loss_val = 0.0
+        if self.alpha_zv > 0:
+            T_view = (1.0 / beta_expanded)  # [num_beta, batch_size]
+            effective_action = energy_view + T_view * log_prob_view
+            zv_loss = self.alpha_zv * effective_action.var(dim=1).mean()
+            loss = loss + zv_loss
+            zv_loss_val = zv_loss.item()
+
         loss.backward()
 
         # Log the actual Free Energy (not the surrogate loss)
@@ -474,6 +595,19 @@ class Trainer:
             "beta_samples_min": beta_samples.min().item(),
             "beta_samples_max": beta_samples.max().item(),
         }
+
+        if self.alpha_zv > 0:
+            stats["zv_loss"] = zv_loss_val
+
+        if self.adaptive_sampling_enabled:
+            stats["adaptive_active"] = (
+                self.current_epoch >= self.adaptive_sampling_warmup
+            )
+            stats["ema_var_max"] = self.ema_var.max().item()
+            peak_bin = self.ema_var.argmax().item()
+            stats["ema_var_peak_T"] = (
+                1.0 / math.exp(self.log_bin_centers[peak_bin].item())
+            )
 
         return stats
 
@@ -514,13 +648,12 @@ class Trainer:
         all_beta_samples = []
         last_samples = None
 
+        epoch_zv_loss = 0.0
+
         # Multiple optimizer steps per epoch (like refs/vatd)
         for step in range(num_steps):
-            # Log-uniform sampling over current beta range
-            log_beta = torch.rand(num_beta, device=self.device) * (
-                math.log(beta_max) - math.log(beta_min)
-            ) + math.log(beta_min)
-            beta_samples = torch.exp(log_beta)
+            # Sample betas (adaptive or log-uniform)
+            beta_samples = self._sample_betas(num_beta, beta_min, beta_max)
 
             all_beta_samples.append(beta_samples.clone())
 
@@ -549,6 +682,9 @@ class Trainer:
             # REINFORCE weight: log q + beta * E
             reinforce_weight = log_prob_view.detach() + beta_energy
 
+            # Update EMA variance bins
+            self._update_ema_variance(beta_samples, reinforce_weight.detach())
+
             # RLOO: Leave-One-Out baseline for variance reduction
             sum_weight = reinforce_weight.sum(dim=1, keepdim=True)
             loo_baseline = (sum_weight - reinforce_weight) / (batch_size - 1)
@@ -557,6 +693,16 @@ class Trainer:
             # REINFORCE loss
             self.optimizer.zero_grad()
             loss = (advantage * log_prob_view).mean()
+
+            # Zero-variance effective action loss (v0.21)
+            step_zv = 0.0
+            if self.alpha_zv > 0:
+                T_view = (1.0 / beta_expanded)
+                effective_action = energy_view + T_view * log_prob_view
+                zv_loss = self.alpha_zv * effective_action.var(dim=1).mean()
+                loss = loss + zv_loss
+                step_zv = zv_loss.item()
+
             loss.backward()
 
             # Gradient clipping and optimizer step
@@ -573,6 +719,7 @@ class Trainer:
                 epoch_loss += actual_loss / num_steps
                 epoch_log_prob += log_prob_view.mean().item() / num_steps
                 epoch_energy += energy_view.mean().item() / num_steps
+            epoch_zv_loss += step_zv / num_steps
 
         # Compute final statistics
         all_betas = torch.cat(all_beta_samples)
@@ -598,6 +745,19 @@ class Trainer:
             "beta_samples_max": all_betas.max().item(),
             "optimizer_steps_per_epoch": num_steps,
         }
+
+        if self.alpha_zv > 0:
+            stats["zv_loss"] = epoch_zv_loss
+
+        if self.adaptive_sampling_enabled:
+            stats["adaptive_active"] = (
+                self.current_epoch >= self.adaptive_sampling_warmup
+            )
+            stats["ema_var_max"] = self.ema_var.max().item()
+            peak_bin = self.ema_var.argmax().item()
+            stats["ema_var_peak_T"] = (
+                1.0 / math.exp(self.log_bin_centers[peak_bin].item())
+            )
 
         return stats
 
@@ -649,12 +809,11 @@ class Trainer:
         all_beta_samples = []
         last_samples = None
 
+        epoch_zv_loss = 0.0
+
         for step in range(num_steps):
-            # Log-uniform sampling over current beta range
-            log_beta = torch.rand(num_beta, device=self.device) * (
-                math.log(beta_max) - math.log(beta_min)
-            ) + math.log(beta_min)
-            beta_samples = torch.exp(log_beta)
+            # Sample betas (adaptive or log-uniform)
+            beta_samples = self._sample_betas(num_beta, beta_min, beta_max)
             all_beta_samples.append(beta_samples.clone())
 
             T_samples = 1.0 / beta_samples
@@ -673,6 +832,10 @@ class Trainer:
             step_loss = 0.0
             step_log_prob = 0.0
             step_energy = 0.0
+            step_zv_loss = 0.0
+
+            # Collect REINFORCE weights for EMA variance update
+            rw_for_ema = []
 
             for i in range(num_beta):
                 start_idx = i * batch_size
@@ -685,19 +848,36 @@ class Trainer:
                 beta_i = beta_samples[i]
 
                 # Forward pass with single temperature (no crosstalk)
-                log_prob_i = self.model.log_prob(samples_i, T=T_i)
+                # AMP autocast wraps log_prob + loss (sampling stays fp32)
+                with torch.amp.autocast(
+                    device_type='cuda', dtype=self.amp_dtype,
+                    enabled=self.use_amp,
+                ):
+                    log_prob_i = self.model.log_prob(samples_i, T=T_i)
 
-                # REINFORCE weight: log q + beta * E
-                beta_energy_i = beta_i * energy_i
-                reinforce_weight_i = log_prob_i.detach() + beta_energy_i
+                    # REINFORCE weight: log q + beta * E
+                    beta_energy_i = beta_i * energy_i
+                    reinforce_weight_i = log_prob_i.detach() + beta_energy_i
 
-                # RLOO baseline within this temperature group
-                sum_weight = reinforce_weight_i.sum()
-                loo_baseline_i = (sum_weight - reinforce_weight_i) / (batch_size - 1)
-                advantage_i = (reinforce_weight_i - loo_baseline_i).detach()
+                    # Collect for EMA update
+                    rw_for_ema.append(reinforce_weight_i.detach().squeeze(-1))
 
-                # REINFORCE loss for this temperature
-                loss_i = (advantage_i * log_prob_i).mean()
+                    # RLOO baseline within this temperature group
+                    sum_weight = reinforce_weight_i.sum()
+                    loo_baseline_i = (sum_weight - reinforce_weight_i) / (batch_size - 1)
+                    advantage_i = (reinforce_weight_i - loo_baseline_i).detach()
+
+                    # REINFORCE loss for this temperature
+                    loss_i = (advantage_i * log_prob_i).mean()
+
+                    # Zero-variance effective action loss (v0.21)
+                    # E_eff = E + T * ln q — should be constant for perfect learning
+                    if self.alpha_zv > 0:
+                        effective_action_i = energy_i + T_samples[i] * log_prob_i
+                        zv_loss_i = self.alpha_zv * effective_action_i.var()
+                        loss_i = loss_i + zv_loss_i
+                        step_zv_loss += zv_loss_i.item() / num_beta
+
                 loss_i.backward()  # Gradients accumulate
 
                 # Accumulate statistics
@@ -705,6 +885,10 @@ class Trainer:
                     step_loss += (log_prob_i + beta_energy_i).mean().item() / num_beta
                     step_log_prob += log_prob_i.mean().item() / num_beta
                     step_energy += energy_i.mean().item() / num_beta
+
+            # Update EMA variance bins for adaptive sampling
+            rw_stacked = torch.stack(rw_for_ema, dim=0)  # [num_beta, batch_size]
+            self._update_ema_variance(beta_samples, rw_stacked)
 
             # Step 3: MCMC Correction (Replay Buffer + Symmetry Augmentation)
             if self.mcmc_enabled and self.current_epoch % self.mcmc_freq == 0:
@@ -753,8 +937,12 @@ class Trainer:
                 mcmc_targets = augment_samples(mcmc_targets, fix_first=self.model.fix_first)
 
                 # Teacher Forcing: Maximize likelihood of MCMC samples
-                log_prob_mcmc = self.model.log_prob(mcmc_targets, T=T_buffer)
-                loss_mle = -log_prob_mcmc.mean()
+                with torch.amp.autocast(
+                    device_type='cuda', dtype=self.amp_dtype,
+                    enabled=self.use_amp,
+                ):
+                    log_prob_mcmc = self.model.log_prob(mcmc_targets, T=T_buffer)
+                    loss_mle = -log_prob_mcmc.mean()
 
                 # Backward MLE loss with weight
                 (loss_mle * self.mcmc_weight).backward()
@@ -773,6 +961,7 @@ class Trainer:
             epoch_loss += step_loss / num_steps
             epoch_log_prob += step_log_prob / num_steps
             epoch_energy += step_energy / num_steps
+            epoch_zv_loss += step_zv_loss / num_steps
 
         # Compute final statistics
         all_betas = torch.cat(all_beta_samples)
@@ -798,9 +987,22 @@ class Trainer:
             "beta_samples_max": all_betas.max().item(),
             "optimizer_steps_per_epoch": num_steps,
         }
-        
+
         if self.mcmc_enabled:
-             stats["mcmc_loss"] = mcmc_loss_acc
+            stats["mcmc_loss"] = mcmc_loss_acc
+
+        if self.alpha_zv > 0:
+            stats["zv_loss"] = epoch_zv_loss
+
+        if self.adaptive_sampling_enabled:
+            stats["adaptive_active"] = (
+                self.current_epoch >= self.adaptive_sampling_warmup
+            )
+            stats["ema_var_max"] = self.ema_var.max().item()
+            peak_bin = self.ema_var.argmax().item()
+            stats["ema_var_peak_T"] = (
+                1.0 / math.exp(self.log_bin_centers[peak_bin].item())
+            )
 
         return stats
 
@@ -885,6 +1087,15 @@ class Trainer:
             tqdm.write(f"[Curriculum] 2-Phase enabled:")
             tqdm.write(f"  Phase 1: epochs 0-{self.phase1_epochs}, beta_max={self.phase1_beta_max:.3f} (high temp)")
             tqdm.write(f"  Phase 2: epochs {self.phase1_epochs}+, gradual expansion to full range")
+
+        # Log v0.21 features at start
+        if self.alpha_zv > 0:
+            tqdm.write(f"[v0.21] Zero-variance effective action loss: alpha_zv={self.alpha_zv}")
+        if self.adaptive_sampling_enabled:
+            tqdm.write(f"[v0.21] Adaptive temperature sampling enabled:")
+            tqdm.write(f"  warmup={self.adaptive_sampling_warmup} epochs, "
+                       f"bins={self.adaptive_sampling_num_bins}, "
+                       f"kappa={self.adaptive_sampling_kappa}")
 
         # Log training mode at start
         if self.training_mode == "accumulated":
@@ -1010,6 +1221,14 @@ class Trainer:
             log_dict["sampling/beta_samples_mean"] = train_stats["beta_samples_mean"]
             log_dict["sampling/beta_samples_min"] = train_stats["beta_samples_min"]
             log_dict["sampling/beta_samples_max"] = train_stats["beta_samples_max"]
+
+            # --- v0.21 metrics ---
+            if "zv_loss" in train_stats:
+                log_dict["train/zv_loss"] = train_stats["zv_loss"]
+            if "adaptive_active" in train_stats:
+                log_dict["sampling/adaptive_active"] = int(train_stats["adaptive_active"])
+                log_dict["sampling/ema_var_max"] = train_stats["ema_var_max"]
+                log_dict["sampling/ema_var_peak_T"] = train_stats["ema_var_peak_T"]
 
             # --- exact/ section (exact error metrics) ---
             if self.exact_logz_values is not None:

@@ -57,8 +57,7 @@ import argparse
 
 from util import select_project, select_group, select_seed, select_device, load_model
 from main import create_ising_energy_fn
-from vatd_exact_partition import CRITICAL_TEMPERATURE
-from analyze_rank import temperature_grid, exact_specific_heat
+from analyze_rank import temperature_grid, exact_specific_heat, get_critical_temperature
 
 
 # ──────────────────────────────────────────────────────────────
@@ -70,6 +69,11 @@ PER_LAYER_RANK_FRACTION = 0.5
 
 LAYER_CMAP = plt.cm.viridis
 RANK_CMAP = plt.cm.plasma
+
+
+def _is_spingpt(model):
+    """Detect SpinGPT (Transformer) vs PixelCNN architecture."""
+    return hasattr(model, 'backbone')
 
 
 # ──────────────────────────────────────────────────────────────
@@ -87,27 +91,47 @@ def effective_rank(sv):
     return torch.exp(H).item()
 
 
+def _weight_to_2d(module, name):
+    """
+    Extract weight matrix as 2D tensor for SVD.
+
+    Handles Conv2d (with optional mask), Linear, and MultiheadAttention.in_proj_weight.
+    Returns (W_2d, shape) or (None, None) if not applicable.
+    """
+    if isinstance(module, torch.nn.Conv2d):
+        W = module.weight.data
+        if hasattr(module, "mask"):
+            W = W * module.mask
+        shape = W.shape
+        return W.reshape(shape[0], -1), shape
+    elif isinstance(module, torch.nn.Linear):
+        W = module.weight.data
+        return W, W.shape  # already [out, in]
+    elif isinstance(module, torch.nn.MultiheadAttention):
+        if module.in_proj_weight is not None:
+            W = module.in_proj_weight.data  # [3*d, d]
+            return W, W.shape
+    return None, None
+
+
 def get_weight_svd(model):
     """
-    Compute SVD of all Conv2d weights using effective weight (W * mask).
+    Compute SVD of all weight matrices (Conv2d, Linear, MHA).
 
     Returns dict: {layer_name: {shape, singular_values, full_rank, erank}}
     """
     results = {}
     for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Conv2d):
-            W = module.weight.data
-            if hasattr(module, "mask"):
-                W = W * module.mask
-            shape = W.shape
-            W_2d = W.reshape(shape[0], -1)
-            _, S, _ = torch.linalg.svd(W_2d, full_matrices=False)
-            results[name] = {
-                "shape": shape,
-                "singular_values": S.cpu(),
-                "full_rank": len(S),
-                "erank": effective_rank(S),
-            }
+        W_2d, shape = _weight_to_2d(module, name)
+        if W_2d is None:
+            continue
+        _, S, _ = torch.linalg.svd(W_2d, full_matrices=False)
+        results[name] = {
+            "shape": shape,
+            "singular_values": S.cpu(),
+            "full_rank": len(S),
+            "erank": effective_rank(S),
+        }
     return results
 
 
@@ -116,15 +140,62 @@ def get_weight_svd(model):
 # ──────────────────────────────────────────────────────────────
 
 
+def _truncate_weight(W_2d, orig_shape, rank_fraction):
+    """
+    SVD-truncate a 2D weight matrix and return reconstructed weight + info.
+
+    Returns (W_truncated_in_orig_shape, info_dict).
+    """
+    U, S, Vh = torch.linalg.svd(W_2d, full_matrices=False)
+    full_rank = len(S)
+    k = max(1, int(rank_fraction * full_rank))
+
+    W_trunc_2d = U[:, :k] @ torch.diag(S[:k]) @ Vh[:k, :]
+
+    energy_total = (S**2).sum().item()
+    energy_kept = (S[:k] ** 2).sum().item()
+
+    info = {
+        "full_rank": full_rank,
+        "kept_rank": k,
+        "energy_frac": energy_kept / max(energy_total, 1e-10),
+    }
+    return W_trunc_2d.reshape(orig_shape), info
+
+
+def _truncate_module_weights(module, name, rank_fraction):
+    """
+    Truncate weight(s) of a single module in-place. Returns info dict or None.
+    """
+    if isinstance(module, torch.nn.Conv2d):
+        W = module.weight.data
+        mask = module.mask if hasattr(module, "mask") else None
+        W_eff = W * mask if mask is not None else W
+        W_new, info = _truncate_weight(W_eff.reshape(W_eff.shape[0], -1), W_eff.shape, rank_fraction)
+        module.weight.data = W_new
+        return info
+    elif isinstance(module, torch.nn.Linear):
+        W = module.weight.data
+        W_new, info = _truncate_weight(W, W.shape, rank_fraction)
+        module.weight.data = W_new
+        return info
+    elif isinstance(module, torch.nn.MultiheadAttention):
+        if module.in_proj_weight is not None:
+            W = module.in_proj_weight.data
+            W_new, info = _truncate_weight(W, W.shape, rank_fraction)
+            module.in_proj_weight.data = W_new
+            return info
+    return None
+
+
 def truncate_model(model, rank_fraction):
     """
-    Create a deepcopy with all Conv2d weights SVD-truncated.
+    Create a deepcopy with all weight matrices SVD-truncated.
 
-    Uses effective weight (W * mask) for SVD to avoid including
-    masked positions that carry no learned information.
+    Handles Conv2d (with mask), Linear, and MultiheadAttention.
 
     Args:
-        model: DiscretePixelCNN
+        model: DiscretePixelCNN or SpinGPT
         rank_fraction: float in (0, 1] — fraction of singular values to keep
 
     Returns:
@@ -134,56 +205,32 @@ def truncate_model(model, rank_fraction):
     info = {}
 
     for name, module in model_copy.named_modules():
-        if isinstance(module, torch.nn.Conv2d):
-            W = module.weight.data
-            mask = module.mask if hasattr(module, "mask") else None
-            W_eff = W * mask if mask is not None else W
-            shape = W_eff.shape
-
-            W_2d = W_eff.reshape(shape[0], -1)
-            U, S, Vh = torch.linalg.svd(W_2d, full_matrices=False)
-
-            full_rank = len(S)
-            k = max(1, int(rank_fraction * full_rank))
-
-            W_trunc_2d = U[:, :k] @ torch.diag(S[:k]) @ Vh[:k, :]
-            module.weight.data = W_trunc_2d.reshape(shape)
-
-            energy_total = (S**2).sum().item()
-            energy_kept = (S[:k] ** 2).sum().item()
-
-            info[name] = {
-                "full_rank": full_rank,
-                "kept_rank": k,
-                "energy_frac": energy_kept / max(energy_total, 1e-10),
-            }
+        result = _truncate_module_weights(module, name, rank_fraction)
+        if result is not None:
+            info[name] = result
 
     return model_copy, info
 
 
 def truncate_block(model, block_idx, rank_fraction):
     """
-    Truncate only a specific residual block's Conv2d layers.
+    Truncate only a specific block's weight layers.
 
     Used for per-block sensitivity analysis: which blocks matter
     most at which temperatures?
+
+    Supports both PixelCNN (masked_conv.hidden_convs) and
+    SpinGPT (backbone.blocks).
     """
     model_copy = copy.deepcopy(model)
 
-    block = model_copy.masked_conv.hidden_convs[block_idx]
-    for module in block.modules():
-        if isinstance(module, torch.nn.Conv2d):
-            W = module.weight.data
-            mask = module.mask if hasattr(module, "mask") else None
-            W_eff = W * mask if mask is not None else W
-            shape = W_eff.shape
+    if _is_spingpt(model_copy):
+        block = model_copy.backbone.blocks[block_idx]
+    else:
+        block = model_copy.masked_conv.hidden_convs[block_idx]
 
-            W_2d = W_eff.reshape(shape[0], -1)
-            U, S, Vh = torch.linalg.svd(W_2d, full_matrices=False)
-            k = max(1, int(rank_fraction * len(S)))
-
-            W_trunc_2d = U[:, :k] @ torch.diag(S[:k]) @ Vh[:k, :]
-            module.weight.data = W_trunc_2d.reshape(shape)
+    for name, module in block.named_modules():
+        _truncate_module_weights(module, name, rank_fraction)
 
     return model_copy
 
@@ -193,9 +240,17 @@ def truncate_block(model, block_idx, rank_fraction):
 # ──────────────────────────────────────────────────────────────
 
 
-def generate_samples(model, temperatures, batch_size, device, console=None):
+def generate_samples(model, temperatures, batch_size, device, q=2, console=None):
     """
     Generate samples from the full model at each temperature.
+
+    Args:
+        model: DiscretePixelCNN or SpinGPT
+        temperatures: array of temperature values
+        batch_size: samples per temperature
+        device: torch device
+        q: number of states (2=Ising, >2=Potts)
+        console: Rich console
 
     Returns:
         samples_dict: {T: tensor(B, 1, H, W)}
@@ -205,7 +260,11 @@ def generate_samples(model, temperatures, batch_size, device, console=None):
         console = Console()
 
     L = model.size[0]
-    energy_fn = create_ising_energy_fn(L=L, d=2, device=device)
+    if q > 2:
+        from potts import create_potts_energy_fn
+        energy_fn = create_potts_energy_fn(L=L, q=q, d=2, device=device)
+    else:
+        energy_fn = create_ising_energy_fn(L=L, d=2, device=device)
 
     samples_dict = {}
     energies_dict = {}
@@ -268,6 +327,8 @@ def run_compression_analysis(
     batch_size=200,
     console=None,
     per_layer=False,
+    Tc=None,
+    q=2,
 ):
     """
     Full compression analysis pipeline.
@@ -283,6 +344,9 @@ def run_compression_analysis(
     """
     if console is None:
         console = Console()
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
 
     L = model.size[0]
     N = L * L
@@ -290,7 +354,7 @@ def run_compression_analysis(
     # ── Step 1: Generate samples ──
     console.print("\n[bold cyan]Step 1: Generating samples from full model[/bold cyan]")
     samples_dict, energies_dict = generate_samples(
-        model, temperatures, batch_size, device, console
+        model, temperatures, batch_size, device, q=q, console=console
     )
 
     # ── Step 2: Full model baseline ──
@@ -316,7 +380,7 @@ def run_compression_analysis(
             {
                 "T": T_val,
                 "beta": beta,
-                "T_over_Tc": T_val / CRITICAL_TEMPERATURE,
+                "T_over_Tc": T_val / Tc,
                 "rank_fraction": 1.0,
                 "log_q_per_site": lp_mean / N,
                 "beta_E_per_site": beta * E_mean / N,
@@ -361,7 +425,7 @@ def run_compression_analysis(
                     {
                         "T": T_val,
                         "beta": beta,
-                        "T_over_Tc": T_val / CRITICAL_TEMPERATURE,
+                        "T_over_Tc": T_val / Tc,
                         "rank_fraction": rf,
                         "log_q_per_site": lp_trunc / N,
                         "beta_E_per_site": beta * E_mean / N,
@@ -385,7 +449,10 @@ def run_compression_analysis(
             "\n[bold cyan]Step 4: Per-block sensitivity analysis "
             f"(rank_frac={PER_LAYER_RANK_FRACTION})[/bold cyan]"
         )
-        num_blocks = len(model.masked_conv.hidden_convs)
+        if _is_spingpt(model):
+            num_blocks = len(model.backbone.blocks)
+        else:
+            num_blocks = len(model.masked_conv.hidden_convs)
         layer_records = []
 
         with Progress(
@@ -416,7 +483,7 @@ def run_compression_analysis(
                     layer_records.append(
                         {
                             "T": T_val,
-                            "T_over_Tc": T_val / CRITICAL_TEMPERATURE,
+                            "T_over_Tc": T_val / Tc,
                             "block": bi,
                             "degradation": (lp_full - lp_trunc) / N,
                         }
@@ -439,12 +506,16 @@ def run_compression_analysis(
 
 
 def _block_label(name):
-    """Convert 'masked_conv.hidden_convs.3.0' → 'B3.1×1↓'."""
+    """Convert module name to human-readable label.
+
+    PixelCNN: 'masked_conv.hidden_convs.3.0' → 'B3.1×1↓'
+    SpinGPT:  'backbone.blocks.0.adaln1.proj' → 'B0.AdaLN₁'
+    """
     parts = name.split(".")
+    # ── PixelCNN patterns ──
     if "hidden_convs" in name:
         block_idx = parts[2]
         sub_idx = int(parts[3])
-        # Sequential indices: 0=1×1↓, 1=GELU, 2=k×k, 3=GELU, 4=1×1↑
         sub_names = {0: "1×1↓", 2: "k×k", 4: "1×1↑"}
         return f"B{block_idx}.{sub_names.get(sub_idx, sub_idx)}"
     elif "first_conv" in name:
@@ -456,20 +527,59 @@ def _block_label(name):
     elif "hidden_fcs" in name:
         idx = parts[2]
         return f"FC_{int(idx)+2}"
+    # ── SpinGPT patterns ──
+    elif "backbone.blocks" in name:
+        # Extract block index
+        block_idx = parts[2]
+        rest = ".".join(parts[3:])
+        if rest.startswith("adaln1"):
+            return f"B{block_idx}.AdaLN\u2081"
+        elif rest.startswith("adaln2"):
+            return f"B{block_idx}.AdaLN\u2082"
+        elif rest == "attn":
+            return f"B{block_idx}.Attn"
+        elif rest == "attn.out_proj":
+            return f"B{block_idx}.Attn\u2191"
+        elif rest.startswith("W_q"):
+            return f"B{block_idx}.W_q"
+        elif rest.startswith("W_k"):
+            return f"B{block_idx}.W_k"
+        elif rest.startswith("W_v"):
+            return f"B{block_idx}.W_v"
+        elif rest.startswith("W_o"):
+            return f"B{block_idx}.W_o"
+        elif rest == "ffn.0":
+            return f"B{block_idx}.FFN\u2193"
+        elif rest == "ffn.2":
+            return f"B{block_idx}.FFN\u2191"
+        return f"B{block_idx}.{rest}"
+    elif "output_head" in name:
+        return "Head"
+    elif "temp_mlp" in name:
+        return "TempMLP"
     return name
 
 
 def plot_weight_spectra(svd_info, figs_dir):
-    """Plot normalized singular value decay for each conv layer."""
-    # Group by residual block — plot one line per block's k×k conv
+    """Plot normalized singular value decay for representative layers."""
+    # PixelCNN: one line per block's k×k conv
     kxk_layers = {
         k: v
         for k, v in svd_info.items()
-        if "hidden_convs" in k and k.endswith(".2")  # k×k conv (middle)
+        if "hidden_convs" in k and k.endswith(".2")
     }
 
     if not kxk_layers:
-        # Fallback: plot all layers
+        # SpinGPT fallback: FFN down-proj and Q-projection per block
+        kxk_layers = {
+            k: v
+            for k, v in svd_info.items()
+            if k.endswith(".ffn.0") or k.endswith(".W_q")
+            or (k.endswith(".attn") and "out_proj" not in k)  # legacy MHA compat
+        }
+
+    if not kxk_layers:
+        # Final fallback: plot all layers
         kxk_layers = svd_info
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -491,7 +601,7 @@ def plot_weight_spectra(svd_info, figs_dir):
 
     ax.set_xlabel("Singular Value Index")
     ax.set_ylabel("$\\sigma_i / \\sigma_1$")
-    ax.set_title("Weight SVD Spectra (k×k Conv per Block)")
+    ax.set_title("Weight SVD Spectra (per Block)")
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.15)
     ax.set_ylim(1e-4, 1.5)
@@ -503,7 +613,7 @@ def plot_weight_spectra(svd_info, figs_dir):
     return path
 
 
-def plot_compression_results(df, L, figs_dir, df_layer=None):
+def plot_compression_results(df, L, figs_dir, df_layer=None, Tc=None, q=2):
     """
     2×2 figure (+ optional per-block figure):
       [0,0] Degradation D(T, k) curves for each rank fraction
@@ -511,7 +621,9 @@ def plot_compression_results(df, L, figs_dir, df_layer=None):
       [1,0] Max degradation vs exact Cv (dual axis)
       [1,1] Free energy F(T) curves for each rank fraction
     """
-    Tc = CRITICAL_TEMPERATURE
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
     temperatures = np.sort(df["T"].unique())
     rank_fractions = sorted(df["rank_fraction"].unique())
     # Exclude 1.0 for truncation analysis
@@ -594,16 +706,17 @@ def plot_compression_results(df, L, figs_dir, df_layer=None):
     ax.grid(True, alpha=0.15)
 
     ax2 = ax.twinx()
-    Cv = exact_specific_heat(L, temperatures)
-    ax2.plot(
-        temperatures,
-        Cv,
-        "r-",
-        linewidth=2,
-        alpha=0.6,
-        label="Exact $C_v$ (Onsager)",
-    )
-    ax2.set_ylabel("$C_v$ / site", color="red")
+    Cv = exact_specific_heat(L, temperatures, q=q)
+    if Cv is not None:
+        ax2.plot(
+            temperatures,
+            Cv,
+            "r-",
+            linewidth=2,
+            alpha=0.6,
+            label="Exact $C_v$ (Onsager)",
+        )
+        ax2.set_ylabel("$C_v$ / site", color="red")
 
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
@@ -641,8 +754,9 @@ def plot_compression_results(df, L, figs_dir, df_layer=None):
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.15)
 
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
     fig.suptitle(
-        f"Low-Rank Compression Test: 2D Ising ($L={L}$, $T_c \\approx {Tc:.3f}$)",
+        f"Low-Rank Compression Test: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14,
         fontweight="bold",
     )
@@ -655,12 +769,12 @@ def plot_compression_results(df, L, figs_dir, df_layer=None):
     # ── Per-block heatmap (separate figure) ──
     path_layer = None
     if df_layer is not None and not df_layer.empty:
-        path_layer = plot_per_block_sensitivity(df_layer, L, figs_dir)
+        path_layer = plot_per_block_sensitivity(df_layer, L, figs_dir, Tc=Tc)
 
     return path, path_layer
 
 
-def plot_per_block_sensitivity(df_layer, L, figs_dir):
+def plot_per_block_sensitivity(df_layer, L, figs_dir, Tc=None):
     """
     Per-block sensitivity heatmap: degradation when truncating
     each block individually at 50% rank.
@@ -668,7 +782,9 @@ def plot_per_block_sensitivity(df_layer, L, figs_dir):
     Cross-validates with Exp 1 (activation rank): blocks with high
     activation rank near Tc should also show high compression sensitivity.
     """
-    Tc = CRITICAL_TEMPERATURE
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
 
     blocks = sorted(df_layer["block"].unique())
     temperatures = np.sort(df_layer["T"].unique())
@@ -748,12 +864,10 @@ def main():
     args = parser.parse_args()
 
     console = Console()
-    Tc = CRITICAL_TEMPERATURE
 
     console.print(
         "[bold green]Experiment 2: Low-Rank Compression Test[/bold green]"
     )
-    console.print(f"Critical Temperature: Tc = {Tc:.4f}")
 
     # ── Replot mode ──
     if args.replot:
@@ -771,8 +885,9 @@ def main():
         )
         df_layer = pd.read_csv(layer_csv) if layer_csv.exists() else None
 
-        # Infer L
+        # Infer L and q from config
         config_path = csv_path.parent / "config.yaml"
+        Tc, q = None, 2
         if config_path.exists():
             from config import RunConfig
 
@@ -780,6 +895,8 @@ def main():
             L = config.net_config.get("size", 16)
             if not isinstance(L, int):
                 L = L[0]
+            q = config.net_config.get("category", 2)
+            Tc, _ = get_critical_temperature(config)
         else:
             L = 16
 
@@ -787,7 +904,7 @@ def main():
         figs_dir.mkdir(parents=True, exist_ok=True)
 
         fig_path, fig_layer_path = plot_compression_results(
-            df, L, figs_dir, df_layer
+            df, L, figs_dir, df_layer, Tc=Tc, q=q
         )
         console.print(f"[green]Main plot:[/green] {fig_path}")
         if fig_layer_path:
@@ -806,17 +923,26 @@ def main():
     model = model.to(device)
     model.eval()
 
+    # Determine model type and critical temperature
+    Tc, q = get_critical_temperature(config)
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    console.print(f"Model type: {model_label}")
+    console.print(f"Critical Temperature: Tc = {Tc:.4f}")
+
     # Use pure PyTorch for MHC fusion (avoids mHC.cu CUDA kernel issues)
     if hasattr(model, 'use_pytorch_mhc'):
         model.use_pytorch_mhc()
 
     L = model.size[0]
-    num_layers = len(model.masked_conv.hidden_convs)
+    if _is_spingpt(model):
+        num_layers = len(model.backbone.blocks)
+        arch_info = f"Transformer blocks: {num_layers}, d_model: {model.hparams.get('d_model', '?')}"
+    else:
+        num_layers = len(model.masked_conv.hidden_convs)
+        arch_info = f"Residual blocks: {num_layers}, Hidden channels: {model.masked_conv.hidden_channels}"
     num_params = sum(p.numel() for p in model.parameters())
     console.print(
-        f"Lattice: {L}x{L}, Params: {num_params:,}, "
-        f"Residual blocks: {num_layers}, "
-        f"Hidden channels: {model.masked_conv.hidden_channels}"
+        f"Lattice: {L}x{L}, Params: {num_params:,}, {arch_info}"
     )
 
     # ── Output directories ──
@@ -842,12 +968,12 @@ def main():
 
     # ── Temperature grid ──
     if args.quick:
-        temps = temperature_grid(T_min=0.8, T_max=6.0, n_coarse=12, n_critical=8)
+        temps = temperature_grid(T_min=0.8, T_max=6.0, n_coarse=12, n_critical=8, Tc=Tc)
         batch_size = 100
         rank_fractions = [0.75, 0.5, 0.25]
         console.print("[yellow]Quick mode: reduced grid & rank fractions[/yellow]")
     else:
-        temps = temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15)
+        temps = temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15, Tc=Tc)
         batch_size = args.batch_size
         rank_fractions = DEFAULT_RANK_FRACTIONS
 
@@ -867,6 +993,8 @@ def main():
         batch_size=batch_size,
         console=console,
         per_layer=args.per_layer,
+        Tc=Tc,
+        q=q,
     )
 
     # ── Save results ──
@@ -882,7 +1010,7 @@ def main():
     # ── Plots ──
     console.print("\n[bold cyan]Generating plots[/bold cyan]")
     fig_path, fig_layer_path = plot_compression_results(
-        df, L, figs_dir, df_layer
+        df, L, figs_dir, df_layer, Tc=Tc, q=q
     )
     console.print(f"[green]Main plot:[/green] {fig_path}")
     if fig_layer_path:
