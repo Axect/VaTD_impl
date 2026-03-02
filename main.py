@@ -20,6 +20,11 @@ def is_xy_model(net_name: str) -> bool:
     return "xy" in net_lower or "continuous" in net_lower
 
 
+def is_potts_model(net_config: dict) -> bool:
+    """Check if the model is for q-state Potts (q > 2)."""
+    return net_config.get("category", 2) > 2
+
+
 def create_adjacency_matrix(L, d=2):
     """
     Create adjacency matrix for a d-dimensional hypercube lattice with periodic boundary conditions.
@@ -186,8 +191,9 @@ def main():
     num_beta = net_config.get("num_beta", 8)
     fix_first = net_config.get("fix_first", None)
 
-    # Detect model type (XY vs Ising)
+    # Detect model type (XY vs Potts vs Ising)
     use_xy = is_xy_model(base_config.net)
+    use_potts = is_potts_model(net_config)
 
     if use_xy:
         # XY Model: continuous angles
@@ -223,6 +229,32 @@ def main():
         # Attach validation betas (no exact logZ for XY)
         energy_fn.fixed_val_betas = fixed_val_betas.tolist()
         energy_fn.exact_logz_values = None  # No exact solution for XY
+        print()
+
+    elif use_potts:
+        # q-state Potts Model: discrete states {0, ..., q-1}
+        q = net_config["category"]
+        from potts import create_potts_energy_fn
+        from potts_exact_partition import critical_temperature as potts_Tc
+        from util import generate_fixed_betas
+
+        energy_fn = create_potts_energy_fn(L=L, q=q, d=2, device=base_config.device)
+        Tc = potts_Tc(q)
+
+        # Validation beta range
+        val_beta_min = 0.3
+        val_beta_max = 3.0
+        val_num_beta = 8
+        fixed_val_betas = generate_fixed_betas(val_beta_min, val_beta_max, val_num_beta)
+
+        print(f"\n[{q}-state Potts Model] No exact finite-lattice partition function")
+        print(f"Training beta range: [{train_beta_min:.3f}, {train_beta_max:.3f}]")
+        print(f"Validation beta range: [{val_beta_min:.3f}, {val_beta_max:.3f}]")
+        print(f"Critical temperature: Tc = {Tc:.6f} (βc = {1.0/Tc:.6f})")
+
+        energy_fn.fixed_val_betas = fixed_val_betas.tolist()
+        energy_fn.exact_logz_values = None  # No exact solution for Potts q > 2
+        energy_fn.critical_temperature = Tc
         print()
 
     else:

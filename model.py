@@ -921,7 +921,7 @@ class DiscretePixelCNN(nn.Module):
         self.device = device
 
         self.channel = 1  # Single channel for lattice
-        self.category = 2  # Spin up/down
+        self.category = hparams.get("category", 2)  # Number of states (2=Ising, q=Potts)
         self.augment_channels = 1  # Temperature
 
         # Lattice size
@@ -936,8 +936,14 @@ class DiscretePixelCNN(nn.Module):
         self.num_beta = hparams["num_beta"]
         self.beta_min = hparams["beta_min"]
         self.beta_max = hparams["beta_max"]
-        self.mapping = lambda x: 2 * x - 1  # Map {0,1} to {-1,1}
-        self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
+
+        # State mapping: depends on number of categories
+        if self.category == 2:
+            self.mapping = lambda x: 2 * x - 1  # Ising: {0,1} → {-1,+1}
+            self.reverse_mapping = lambda x: torch.div(x + 1, 2, rounding_mode="trunc")
+        else:
+            self.mapping = lambda x: x           # Potts: {0,...,q-1} kept as-is
+            self.reverse_mapping = lambda x: x
 
         # Path type: "raster" (default), "diagonal" (8x faster), or "hilbert" (best locality)
         self.path_type = hparams.get("path_type", "raster")

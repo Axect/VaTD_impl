@@ -1,0 +1,72 @@
+# v0.20 Spin-GPT: Autoregressive Transformer for 2D Ising Model
+#
+# Tests architecture independence of the low-rank phenomenon.
+# Same VaTD training objective (REINFORCE + variational free energy),
+# but replaces the PixelCNN backbone with a causal Transformer.
+#
+# Autoregressive sampling is O(L²) per token → much more VRAM than PixelCNN.
+# Use small batch (64) with more accumulation steps to compensate.
+# batch_size × num_beta × accumulation_steps = 64 × 8 × 32 = 16,384 samples/epoch
+
+project: Ising_VaTD_v0.20
+device: cuda:0
+net: model_transformer.SpinGPT
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 250
+batch_size: 64
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+  category: 2  # Ising: {0,1} → {-1,+1}
+
+  # Temperature sampling configuration
+  batch_size: 64
+  num_beta: 8
+  beta_min: 0.2
+  beta_max: 1.0
+
+  # Training Mode: Sequential with gradient accumulation
+  # More accum steps to compensate smaller batch
+  training_mode: sequential
+  accumulation_steps: 32
+
+  # MCMC: DISABLED (pure REINFORCE)
+  mcmc_enabled: false
+
+  # CUDA backend
+  cudnn_benchmark: true
+
+  # 2-Phase Curriculum Learning
+  curriculum_enabled: true
+  phase1_epochs: 50
+  phase1_beta_max: 0.35
+  phase2_epochs: 100
+
+  # Transformer architecture
+  d_model: 128
+  n_heads: 4
+  n_layers: 4
+  d_ff: 512
+  cond_dim: 64
+  dropout: 0.0
+
+  # Temperature-dependent Output Scaling (Parameter-free)
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+optimizer_config:
+  lr: 3.e-4
+  weight_decay: 1.e-2
+
+scheduler_config:
+  upper_bound: 300
+  max_iter: 250
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

@@ -44,178 +44,56 @@ from rich.progress import (
 import argparse
 
 from util import select_project, select_group, select_seed, select_device, load_model
-from vatd_exact_partition import logZ as exact_logZ, CRITICAL_TEMPERATURE
+
+
+def get_critical_temperature(config):
+    """Determine critical temperature from model config (Ising or Potts)."""
+    net_config = config.net_config if hasattr(config, 'net_config') else {}
+    q = net_config.get("category", 2)
+    return get_critical_temperature_from_q(q)
+
+
+def get_critical_temperature_from_q(q):
+    """Get critical temperature from number of states q."""
+    if q == 2:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        return CRITICAL_TEMPERATURE, q
+    else:
+        from potts_exact_partition import critical_temperature
+        return critical_temperature(q), q
 
 
 # ──────────────────────────────────────────────────────────────
-# Rank Metrics
+# Rank Metrics (unified two-parameter Rényi-normalization framework)
 # ──────────────────────────────────────────────────────────────
+from unified_rank_metrics import (
+    # Core unified function
+    renyi_effective_rank,
+    # Named grid wrappers (α, norm) → metric
+    effective_rank,           # (α=1,  L1)   = eRank
+    von_neumann_effective_rank,  # (α=1,  L2sq) = exp(S_vN)
+    stable_rank,              # (α=∞,  L2sq)
+    participation_ratio,      # (α=2,  L2sq)
+    nuclear_rank,             # (α=∞,  L1)
+    renyi2_rank,              # (α=2,  L1)
+    # Raw entropies (no exponentiation)
+    shannon_entropy,
+    von_neumann_entropy,
+    # Standalone metrics (not in grid)
+    numerical_rank,
+    elbow_rank,
+    optimal_hard_threshold,
+    spectral_gap_ratio,
+    # RMT spectral unfolding (BBP outlier detection)
+    marchenko_pastur_outlier_count,
+    # Full grid computation
+    compute_full_grid,
+    compute_entropy_grid,
+)
 
-
-def effective_rank(singular_values):
-    """
-    Effective rank via Shannon entropy of normalized singular values.
-
-    Roy & Bhattacharya (2007): erank(A) = exp(H(p))
-    where p_i = σ_i / Σ σ_j and H(p) = -Σ p_i log(p_i).
-
-    Returns a continuous scalar in [1, min(m,n)].
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) == 0:
-        return 1.0
-    p = sv / sv.sum()
-    H = -(p * torch.log(p)).sum()
-    return torch.exp(H).item()
-
-
-def stable_rank(singular_values):
-    """
-    Stable rank: ||A||_F² / ||A||_2² = Σσ_i² / σ_max².
-
-    More robust to noise than effective rank.
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) == 0:
-        return 1.0
-    return (sv**2).sum().item() / (sv[0] ** 2).item()
-
-
-def participation_ratio(singular_values):
-    """
-    Participation ratio: (Σσ_i²)² / Σσ_i⁴.
-
-    Counts how many singular values "participate" in the spectrum.
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) == 0:
-        return 1.0
-    sv2 = sv**2
-    return (sv2.sum() ** 2 / (sv2**2).sum()).item()
-
-
-def numerical_rank(singular_values, threshold=0.99):
-    """
-    Numerical rank: minimum k such that Σᵢ₌₁ᵏ σᵢ² / Σ σⱼ² ≥ threshold.
-
-    The only discrete (integer) rank metric. Directly answers
-    "how many components carry threshold% of the energy?"
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) == 0:
-        return 1
-    energy = sv**2
-    total = energy.sum()
-    cumsum = torch.cumsum(energy, dim=0)
-    mask = cumsum >= threshold * total
-    if mask.any():
-        return (mask.float().argmax() + 1).item()
-    return len(sv)
-
-
-
+# Backward-compatible alias for existing code
 def renyi_rank(singular_values, alpha=2.0):
-    """
-    Rényi rank: exp(H_α(p)) where H_α = 1/(1-α) · ln(Σ pᵢ^α).
-
-    Uses L1-normalized singular values: p_i = σ_i / Σσ_j (same convention
-    as eRank). α=2 gives the "collision rank", more sensitive to dominant
-    modes than Shannon-based eRank (α→1).
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) == 0:
-        return 1.0
-    p = sv / sv.sum()
-    H_alpha = (1.0 / (1.0 - alpha)) * torch.log((p**alpha).sum())
-    return torch.exp(H_alpha).item()
-
-
-
-def nuclear_rank(singular_values):
-    """
-    Nuclear rank: Σσᵢ / σ_max  (L1/L∞ ratio).
-
-    The L1 analog of stable rank (which uses L2²/L∞²). Counts how many
-    singular values "participate" by magnitude rather than energy.
-    Always nuclear_rank ≥ stable_rank (Cauchy-Schwarz).
-
-    From Thibeault et al., Nature Physics (2024).
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) == 0:
-        return 1.0
-    return (sv.sum() / sv[0]).item()
-
-
-def elbow_rank(singular_values):
-    """
-    Elbow rank: index of maximum perpendicular distance from the diagonal y = 1 - x.
-
-    Given normalized cumulative singular values, finds the "elbow" point where
-    the spectrum transitions from signal to noise. This is the geometric method
-    from the Thibeault et al. (2024) codebase.
-
-    Returns integer rank (1-indexed).
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) <= 1:
-        return 1
-    # Normalize SVs to [0, 1] range on x-axis
-    n = len(sv)
-    x = torch.arange(1, n + 1, dtype=torch.float64) / n  # [1/n, 2/n, ..., 1]
-    # Cumulative energy fraction
-    energy = sv**2
-    y = torch.cumsum(energy, dim=0) / energy.sum()
-    # Distance from diagonal y = x (the "null" line for uniform spectrum)
-    # For the elbow method: distance from line connecting (0,0) to (1,1)
-    # d = |y_i - x_i| / sqrt(2)
-    dist = (y - x).abs()
-    return (dist.argmax() + 1).item()
-
-
-def optimal_hard_threshold(singular_values, N, M):
-    """
-    Gavish & Donoho (2014) optimal hard threshold for singular values.
-
-    Returns the number of singular values above the optimal threshold
-    λ* = ω(β) · σ_median · √max(N,M), where β = min(N,M)/max(N,M)
-    and ω(β) is the optimal threshold coefficient.
-
-    σ_median is the median singular value (robust noise estimator).
-    For unknown noise level, σ_noise = median(σ) / √(μ_β), where
-    μ_β is the median of the Marchenko-Pastur distribution.
-
-    Reference: Gavish & Donoho, "The optimal hard threshold for
-    singular values is 4/√3", IEEE Trans. Inf. Theory (2014).
-    """
-    sv = singular_values[singular_values > 1e-10]
-    if len(sv) <= 1:
-        return 1
-
-    beta = min(N, M) / max(N, M)
-
-    # Optimal threshold coefficient ω(β) from Gavish & Donoho
-    # Approximation valid for all β ∈ (0, 1]:
-    # ω(β) ≈ 0.56·β³ - 0.95·β² + 1.82·β + 1.43
-    omega = 0.56 * beta**3 - 0.95 * beta**2 + 1.82 * beta + 1.43
-
-    # Estimate noise level from median SV
-    sv_median = sv.median().item()
-
-    # Median of MP distribution (approximation for β → 0 is √(2β))
-    # More accurate: μ_β ≈ √(2β + β²/3) for moderate β
-    mu_beta = np.sqrt(2 * beta + beta**2 / 3)
-    if mu_beta < 1e-12:
-        return len(sv)
-
-    sigma_noise = sv_median / (mu_beta * np.sqrt(max(N, M)))
-
-    # Threshold
-    threshold = omega * sigma_noise * np.sqrt(max(N, M))
-
-    # Count SVs above threshold
-    count = (sv > threshold).sum().item()
-    return max(count, 1)
+    return renyi_effective_rank(singular_values, alpha=alpha, norm="L1")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -223,14 +101,20 @@ def optimal_hard_threshold(singular_values, N, M):
 # ──────────────────────────────────────────────────────────────
 
 
-def exact_specific_heat(L, temperatures, J=1.0):
+def exact_specific_heat(L, temperatures, J=1.0, q=2):
     """
     Exact specific heat per site from Onsager's partition function.
 
-    Cv/N = β²/N · ∂²logZ/∂β²
+    Only available for q=2 (Ising). Returns None for Potts (q > 2).
 
+    Cv/N = β²/N · ∂²logZ/∂β²
     Computed via central finite differences of exact logZ.
     """
+    if q > 2:
+        return None
+
+    from vatd_exact_partition import logZ as exact_logZ
+
     N = L * L
     db = 1e-5
     Cv = np.zeros(len(temperatures))
@@ -261,25 +145,32 @@ def exact_specific_heat(L, temperatures, J=1.0):
 
 def collect_activations(model, samples, T_val, device):
     """
-    Collect intermediate activations from all residual blocks using forward pre-hooks.
+    Collect intermediate activations from all blocks using forward hooks.
 
-    Pre-hook on hidden_convs[i] captures the input to block i,
-    which is the output after residual addition at block i-1.
-    Pre-hook on first_fc captures the state after ALL residual blocks.
+    Dispatches to model-specific collector based on architecture:
+      - PixelCNN: hooks on masked_conv.hidden_convs[i] and first_fc
+      - Transformer (SpinGPT): hooks on backbone.blocks[i] output
 
     Args:
-        model: DiscretePixelCNN (eval mode)
-        samples: [B, 1, H, W] in {-1, +1}
+        model: DiscretePixelCNN or SpinGPT (eval mode)
+        samples: [B, 1, H, W] in physical representation
         T_val: scalar temperature
         device: torch device
 
     Returns:
         dict {layer_idx: Tensor[B, C, H, W], 'final': Tensor[B, C, H, W]}
     """
+    if hasattr(model, 'backbone'):
+        return _collect_activations_transformer(model, samples, T_val, device)
+    else:
+        return _collect_activations_pixelcnn(model, samples, T_val, device)
+
+
+def _collect_activations_pixelcnn(model, samples, T_val, device):
+    """PixelCNN: pre-hooks on hidden_convs[i] and first_fc."""
     captured = {}
     hooks = []
 
-    # Pre-hooks on each hidden conv block
     for i, conv in enumerate(model.masked_conv.hidden_convs):
 
         def make_hook(idx):
@@ -290,13 +181,54 @@ def collect_activations(model, samples, T_val, device):
 
         hooks.append(conv.register_forward_pre_hook(make_hook(i)))
 
-    # Pre-hook on first_fc → captures state after last residual block + skip fusion
     def final_hook(module, inp):
         captured["final"] = inp[0].detach().cpu()
 
     hooks.append(model.masked_conv.first_fc.register_forward_pre_hook(final_hook))
 
-    # Trigger forward pass via log_prob
+    T_tensor = torch.full((samples.shape[0],), T_val, device=device)
+    with torch.no_grad():
+        model.log_prob(samples, T=T_tensor)
+
+    for h in hooks:
+        h.remove()
+
+    return captured
+
+
+def _collect_activations_transformer(model, samples, T_val, device):
+    """
+    Transformer (SpinGPT): hooks on backbone.blocks[i] output.
+
+    Captures [B, L, d_model] and reshapes to [B, d_model, H, W]
+    for compatibility with the SVD analysis pipeline.
+    """
+    captured = {}
+    hooks = []
+    H, W = model.size
+
+    for i, block in enumerate(model.backbone.blocks):
+
+        def make_hook(idx):
+            def hook_fn(module, inp, out):
+                # out may be (tensor, kv_cache) tuple if block returns KV-cache
+                act = out[0] if isinstance(out, tuple) else out
+                act = act.detach().cpu()
+                B, L, D = act.shape
+                captured[idx] = act.permute(0, 2, 1).reshape(B, D, H, W)
+
+            return hook_fn
+
+        hooks.append(block.register_forward_hook(make_hook(i)))
+
+    # Final: after backbone.final_norm
+    def final_hook(module, inp, out):
+        act = out.detach().cpu()
+        B, L, D = act.shape
+        captured["final"] = act.permute(0, 2, 1).reshape(B, D, H, W)
+
+    hooks.append(model.backbone.final_norm.register_forward_hook(final_hook))
+
     T_tensor = torch.full((samples.shape[0],), T_val, device=device)
     with torch.no_grad():
         model.log_prob(samples, T=T_tensor)
@@ -312,14 +244,16 @@ def collect_activations(model, samples, T_val, device):
 # ──────────────────────────────────────────────────────────────
 
 
-def temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15):
+def temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15, Tc=None):
     """
     Generate temperature grid with extra density near Tc.
 
     Merges a log-spaced coarse grid with a linear dense grid
     around [0.8·Tc, 1.2·Tc].
     """
-    Tc = CRITICAL_TEMPERATURE
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
     T_coarse = np.logspace(np.log10(T_min), np.log10(T_max), n_coarse)
     T_dense = np.linspace(0.8 * Tc, 1.2 * Tc, n_critical)
     T_all = np.unique(np.concatenate([T_coarse, T_dense]))
@@ -332,25 +266,34 @@ def temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15):
 # ──────────────────────────────────────────────────────────────
 
 
-def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, console=None):
+def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, console=None, Tc=None):
     """
     For each temperature: generate samples → collect activations → compute rank metrics.
 
     Returns a DataFrame with columns:
         T, beta, T_over_Tc, layer,
-        channel_erank, channel_stable_rank, channel_pr,
+        channel_erank, channel_vn_erank, channel_stable_rank, channel_pr,
         channel_numerical_rank_99, channel_numerical_rank_95,
         channel_renyi2,
         channel_nuclear_rank, channel_elbow_rank, channel_opt_threshold,
-        spatial_erank, spatial_stable_rank, spatial_pr,
+        channel_H_shannon, channel_S_vN, channel_sgr_max, channel_sgr_k3,
+        channel_mp_outliers,
+        spatial_erank, spatial_vn_erank, spatial_stable_rank, spatial_pr,
         spatial_numerical_rank_99, spatial_numerical_rank_95,
         spatial_renyi2,
-        spatial_nuclear_rank, spatial_elbow_rank, spatial_opt_threshold
+        spatial_nuclear_rank, spatial_elbow_rank, spatial_opt_threshold,
+        spatial_H_shannon, spatial_S_vN, spatial_sgr_max, spatial_sgr_k3,
+        spatial_mp_outliers
     """
     if console is None:
         console = Console()
 
-    num_layers = len(model.masked_conv.hidden_convs)
+    if hasattr(model, 'backbone'):
+        # Transformer (SpinGPT): blocks in backbone
+        num_layers = len(model.backbone.blocks)
+    else:
+        # PixelCNN: hidden conv blocks
+        num_layers = len(model.masked_conv.hidden_convs)
     layer_keys = list(range(num_layers)) + ["final"]
 
     records = []
@@ -408,26 +351,40 @@ def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, conso
                     {
                         "T": T_val,
                         "beta": beta_val,
-                        "T_over_Tc": T_val / CRITICAL_TEMPERATURE,
+                        "T_over_Tc": T_val / Tc if Tc else T_val,
                         "layer": layer_name,
+                        # ── Channel metrics (unified framework) ──
                         "channel_erank": effective_rank(S_ch),
+                        "channel_vn_erank": von_neumann_effective_rank(S_ch),
                         "channel_stable_rank": stable_rank(S_ch),
                         "channel_pr": participation_ratio(S_ch),
                         "channel_numerical_rank_99": numerical_rank(S_ch, 0.99),
                         "channel_numerical_rank_95": numerical_rank(S_ch, 0.95),
-                        "channel_renyi2": renyi_rank(S_ch, 2.0),
+                        "channel_renyi2": renyi2_rank(S_ch),
                         "channel_nuclear_rank": nuclear_rank(S_ch),
                         "channel_elbow_rank": elbow_rank(S_ch),
                         "channel_opt_threshold": optimal_hard_threshold(S_ch, N, C),
+                        "channel_H_shannon": shannon_entropy(S_ch, norm="L1"),
+                        "channel_S_vN": von_neumann_entropy(S_ch),
+                        "channel_sgr_max": spectral_gap_ratio(S_ch, k=None),
+                        "channel_sgr_k3": spectral_gap_ratio(S_ch, k=3),
+                        "channel_mp_outliers": marchenko_pastur_outlier_count(S_ch, N, C),
+                        # ── Spatial metrics (unified framework) ──
                         "spatial_erank": effective_rank(S_sp),
+                        "spatial_vn_erank": von_neumann_effective_rank(S_sp),
                         "spatial_stable_rank": stable_rank(S_sp),
                         "spatial_pr": participation_ratio(S_sp),
                         "spatial_numerical_rank_99": numerical_rank(S_sp, 0.99),
                         "spatial_numerical_rank_95": numerical_rank(S_sp, 0.95),
-                        "spatial_renyi2": renyi_rank(S_sp, 2.0),
+                        "spatial_renyi2": renyi2_rank(S_sp),
                         "spatial_nuclear_rank": nuclear_rank(S_sp),
                         "spatial_elbow_rank": elbow_rank(S_sp),
                         "spatial_opt_threshold": optimal_hard_threshold(S_sp, N, H * W),
+                        "spatial_H_shannon": shannon_entropy(S_sp, norm="L1"),
+                        "spatial_S_vN": von_neumann_entropy(S_sp),
+                        "spatial_sgr_max": spectral_gap_ratio(S_sp, k=None),
+                        "spatial_sgr_k3": spectral_gap_ratio(S_sp, k=3),
+                        "spatial_mp_outliers": marchenko_pastur_outlier_count(S_sp, N, H * W),
                     }
                 )
 
@@ -453,7 +410,7 @@ def _layer_label(name):
     return name.replace("layer_", "Block ").replace("final", "Final")
 
 
-def plot_rank_vs_temperature(df, L, figs_dir):
+def plot_rank_vs_temperature(df, L, figs_dir, Tc=None, q=2):
     """
     3×2 figure:
       [0,0] Channel effective rank vs T per layer
@@ -463,8 +420,12 @@ def plot_rank_vs_temperature(df, L, figs_dir):
       [2,0] Avg channel erank vs T + exact Cv overlay
       [2,1] Heatmap of channel erank [layer × T]
     """
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
+
     temperatures = np.sort(df["T"].unique())
-    Cv = exact_specific_heat(L, temperatures)
+    Cv = exact_specific_heat(L, temperatures, q=q)
 
     layers = sorted(df["layer"].unique(), key=_layer_sort_key)
     n_layers = len(layers)
@@ -473,7 +434,6 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     has_extended = "channel_numerical_rank_99" in df.columns
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 15))
-    Tc = CRITICAL_TEMPERATURE
 
     # ── [0,0] Channel effective rank ──
     ax = axes[0, 0]
@@ -570,16 +530,18 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     ax.set_xscale("log")
     ax.grid(True, alpha=0.15)
 
-    ax2 = ax.twinx()
-    ax2.plot(
-        temperatures, Cv,
-        "r-", linewidth=2, alpha=0.6, label="Exact $C_v$ (Onsager)",
-    )
-    ax2.set_ylabel("$C_v$ / site", color="red")
-
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
+    if Cv is not None:
+        ax2 = ax.twinx()
+        ax2.plot(
+            temperatures, Cv,
+            "r-", linewidth=2, alpha=0.6, label="Exact $C_v$ (Onsager)",
+        )
+        ax2.set_ylabel("$C_v$ / site", color="red")
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
+    else:
+        ax.legend(fontsize=8, loc="upper left")
     ax.set_title("eRank (entropy-like) vs $C_v$ ($\\sim d$S$/dT$)")
 
     # ── [2,1] Heatmap ──
@@ -608,8 +570,9 @@ def plot_rank_vs_temperature(df, L, figs_dir):
         plt.colorbar(im, ax=ax, label="Effective Rank")
         ax.set_title("Channel eRank Heatmap")
 
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
     fig.suptitle(
-        f"Low-Rank Analysis: 2D Ising Model ($L={L}$, $T_c \\approx {Tc:.3f}$)",
+        f"Low-Rank Analysis: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14, fontweight="bold",
     )
     plt.tight_layout()
@@ -620,7 +583,7 @@ def plot_rank_vs_temperature(df, L, figs_dir):
     return path
 
 
-def plot_derank_dt(df, L, figs_dir, suffix=""):
+def plot_derank_dt(df, L, figs_dir, suffix="", Tc=None, q=2):
     """
     Standalone figure comparing d(eRank)/dT with exact specific heat Cv.
 
@@ -630,19 +593,23 @@ def plot_derank_dt(df, L, figs_dir, suffix=""):
 
     Args:
         suffix: filename suffix (e.g. "_critical") to distinguish modes.
+        Tc: critical temperature (auto-detected if None)
+        q: number of states (2=Ising, 3/4=Potts)
     """
     from scipy.ndimage import gaussian_filter1d
 
-    Tc = CRITICAL_TEMPERATURE
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
 
     # Average channel eRank across all layers
     avg_rank = df.groupby("T")["channel_erank"].mean().sort_index()
     T_arr = avg_rank.index.values
     rank_arr = avg_rank.values
 
-    # Exact Cv over the same T range (dense for smooth curve)
+    # Exact Cv over the same T range (dense for smooth curve) — Ising only
     T_cv = np.linspace(T_arr.min(), T_arr.max(), 500)
-    Cv = exact_specific_heat(L, T_cv)
+    Cv = exact_specific_heat(L, T_cv, q=q)
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -652,14 +619,17 @@ def plot_derank_dt(df, L, figs_dir, suffix=""):
     sigma = max(1, min(3, len(T_arr) // 15))
     d_rank = gaussian_filter1d(d_rank_raw, sigma=sigma)
 
-    # Normalize both for shape comparison
+    # Normalize d(eRank)/dT
     d_norm = (d_rank - d_rank.min()) / (d_rank.max() - d_rank.min() + 1e-10)
-    Cv_norm = (Cv - Cv.min()) / (Cv.max() - Cv.min() + 1e-10)
 
     ax.plot(T_arr, d_norm, "b-o", markersize=3, linewidth=1.5,
             label="$d$(eRank)/$dT$ (normalized)")
-    ax.plot(T_cv, Cv_norm, "r-", linewidth=2, alpha=0.7,
-            label="Exact $C_v$ (Onsager, normalized)")
+
+    if Cv is not None:
+        Cv_norm = (Cv - Cv.min()) / (Cv.max() - Cv.min() + 1e-10)
+        ax.plot(T_cv, Cv_norm, "r-", linewidth=2, alpha=0.7,
+                label="Exact $C_v$ (Onsager, normalized)")
+
     ax.axvline(Tc, color="gray", ls="--", alpha=0.5, lw=1,
                label=f"$T_c = {Tc:.3f}$")
 
@@ -682,6 +652,7 @@ def plot_derank_dt(df, L, figs_dir, suffix=""):
 
 def plot_singular_value_spectra(
     model, selected_temperatures, device, batch_size, n_batches, L, figs_dir, console,
+    Tc=None,
 ):
     """
     Scree plots at 3 representative temperatures: high-T, Tc, low-T.
@@ -689,7 +660,9 @@ def plot_singular_value_spectra(
     Shows how the singular value spectrum sharpens (low rank) or flattens
     (high rank) across the phase transition.
     """
-    Tc = CRITICAL_TEMPERATURE
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     for idx, T_val in enumerate(selected_temperatures):
@@ -753,7 +726,7 @@ def plot_singular_value_spectra(
     return path
 
 
-def plot_extended_metrics(df, L, figs_dir):
+def plot_extended_metrics(df, L, figs_dir, Tc=None, q=2):
     """
     2×2 figure for the Nature Physics 2024 extended rank metrics:
       [0,0] Rényi Rank (α=2) vs T per layer
@@ -764,10 +737,13 @@ def plot_extended_metrics(df, L, figs_dir):
     if "channel_renyi2" not in df.columns:
         return None
 
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
+
     layers = sorted(df["layer"].unique(), key=_layer_sort_key)
     n_layers = len(layers)
     colors = LAYER_CMAP(np.linspace(0.15, 0.85, n_layers))
-    Tc = CRITICAL_TEMPERATURE
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -811,11 +787,12 @@ def plot_extended_metrics(df, L, figs_dir):
     # ── [1,0] All rank metrics (normalized to [0,1]) overlaid ──
     ax = axes[1, 0]
     metric_cols = {
-        "channel_erank": "eRank (Shannon)",
-        "channel_stable_rank": "Stable Rank",
-        "channel_nuclear_rank": "Nuclear Rank",
-        "channel_pr": "Participation Ratio",
-        "channel_renyi2": "Rényi Rank (α=2)",
+        "channel_erank": "eRank (α=1, L1)",
+        "channel_vn_erank": "vN-eRank (α=1, L2²)",
+        "channel_stable_rank": "Stable Rank (α=∞, L2²)",
+        "channel_nuclear_rank": "Nuclear Rank (α=∞, L1)",
+        "channel_pr": "PR (α=2, L2²)",
+        "channel_renyi2": "Rényi-2 (α=2, L1)",
         "channel_numerical_rank_99": "Numerical Rank (99%)",
         "channel_elbow_rank": "Elbow Rank",
         "channel_opt_threshold": "Opt. Threshold (G&D)",
@@ -850,13 +827,14 @@ def plot_extended_metrics(df, L, figs_dir):
     ax = axes[1, 1]
     near_Tc = df[(df["T"] > 0.8 * Tc) & (df["T"] < 1.2 * Tc)]
     corr_cols = [
-        "channel_erank", "channel_stable_rank", "channel_nuclear_rank",
-        "channel_pr", "channel_renyi2", "channel_numerical_rank_99",
-        "channel_elbow_rank", "channel_opt_threshold",
+        "channel_erank", "channel_vn_erank", "channel_stable_rank",
+        "channel_nuclear_rank", "channel_pr", "channel_renyi2",
+        "channel_numerical_rank_99", "channel_elbow_rank",
+        "channel_opt_threshold",
     ]
     corr_labels = [
-        "eRank", "sRank", "nRank", "PR", "Rényi₂", "NumRk₉₉",
-        "Elbow", "Opt.Thr",
+        "eRank", "vN-eR", "sRank", "nRank", "PR", "Rényi₂",
+        "NumRk₉₉", "Elbow", "Opt.Thr",
     ]
     available_cols = [c for c in corr_cols if c in near_Tc.columns]
     available_labels = [corr_labels[corr_cols.index(c)] for c in available_cols]
@@ -886,13 +864,260 @@ def plot_extended_metrics(df, L, figs_dir):
                 transform=ax.transAxes, ha="center", va="center")
         ax.set_title("Metric Correlations near $T_c$")
 
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
     fig.suptitle(
-        f"Extended Rank Metrics: Nature Physics 2024 ($L={L}$, $T_c \\approx {Tc:.3f}$)",
+        f"Extended Rank Metrics: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14, fontweight="bold",
     )
     plt.tight_layout()
 
     path = Path(figs_dir) / "extended_rank_metrics.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_unified_framework(df, L, figs_dir, Tc=None, q=2):
+    """
+    3×2 figure for the unified Rényi-normalization framework metrics:
+      [0,0] vN-eRank (α=1, L2²) vs T per layer
+      [0,1] eRank vs vN-eRank scatter colored by T/Tc
+      [1,0] Shannon entropy H(p) and von Neumann entropy S_vN vs T
+      [1,1] Entropy gap: H(p) - S_vN vs T (norm sensitivity)
+      [2,0] Spectral Gap Ratio (max & k=3) vs T per layer
+      [2,1] Rank gap ΔR = eRank - vN-eRank vs T per layer
+    """
+    if "channel_vn_erank" not in df.columns:
+        return None
+
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
+
+    layers = sorted(df["layer"].unique(), key=_layer_sort_key)
+    n_layers = len(layers)
+    colors = LAYER_CMAP(np.linspace(0.15, 0.85, n_layers))
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+
+    # ── [0,0] vN-eRank vs T per layer ──
+    ax = axes[0, 0]
+    for ci, layer in enumerate(layers):
+        ld = df[df["layer"] == layer].sort_values("T")
+        ax.plot(
+            ld["T"], ld["channel_vn_erank"],
+            "o-", color=colors[ci], markersize=3, linewidth=1.2,
+            label=_layer_label(layer), alpha=0.85,
+        )
+    ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("vN-eRank $\\exp(S_{\\mathrm{vN}})$")
+    ax.set_title("von Neumann Effective Rank ($\\alpha=1$, $L^2$ norm)")
+    ax.set_xscale("log")
+    ax.legend(fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.15)
+
+    # ── [0,1] eRank vs vN-eRank scatter colored by T/Tc ──
+    ax = axes[0, 1]
+    sc = ax.scatter(
+        df["channel_erank"], df["channel_vn_erank"],
+        c=df["T_over_Tc"], cmap="coolwarm", s=15, alpha=0.7,
+        edgecolors="none", vmin=0.5, vmax=2.0,
+    )
+    plt.colorbar(sc, ax=ax, label="$T / T_c$")
+    # Reference line: eRank = vN-eRank (equality for uniform spectrum)
+    lim_max = max(df["channel_erank"].max(), df["channel_vn_erank"].max()) * 1.05
+    ax.plot([1, lim_max], [1, lim_max], "k--", alpha=0.3, lw=0.8, label="$y = x$")
+    ax.set_xlabel("eRank ($\\alpha=1$, $L^1$)")
+    ax.set_ylabel("vN-eRank ($\\alpha=1$, $L^2$)")
+    ax.set_title("eRank vs vN-eRank (norm comparison)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.15)
+
+    # ── [1,0] Raw entropies vs T (layer-averaged) ──
+    ax = axes[1, 0]
+    if "channel_H_shannon" in df.columns and "channel_S_vN" in df.columns:
+        avg_H = df.groupby("T")["channel_H_shannon"].mean().sort_index()
+        avg_SvN = df.groupby("T")["channel_S_vN"].mean().sort_index()
+        T_arr = avg_H.index.values
+
+        ax.plot(T_arr, avg_H.values, "b-o", markersize=3, linewidth=1.5,
+                label="$H(p)$ (Shannon, $L^1$)")
+        ax.plot(T_arr, avg_SvN.values, "r-s", markersize=3, linewidth=1.5,
+                label="$S_{\\mathrm{vN}}$ (von Neumann, $L^2$)")
+        ax.axvline(Tc, color="gray", ls="--", alpha=0.4, lw=0.8)
+        ax.set_xlabel("Temperature $T$")
+        ax.set_ylabel("Entropy (nats)")
+        ax.set_title("Raw Spectral Entropies (layer-averaged)")
+        ax.set_xscale("log")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.15)
+    else:
+        ax.set_visible(False)
+
+    # ── [1,1] Entropy gap: H(p) - S_vN vs T ──
+    ax = axes[1, 1]
+    if "channel_H_shannon" in df.columns and "channel_S_vN" in df.columns:
+        avg_gap = (
+            df.groupby("T")["channel_H_shannon"].mean()
+            - df.groupby("T")["channel_S_vN"].mean()
+        ).sort_index()
+        T_arr = avg_gap.index.values
+
+        ax.plot(T_arr, avg_gap.values, "g-D", markersize=3, linewidth=1.5,
+                label="$\\Delta H = H(p) - S_{\\mathrm{vN}}$")
+        ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+        ax.axhline(0, color="gray", ls=":", alpha=0.3)
+        ax.set_xlabel("Temperature $T$")
+        ax.set_ylabel("$\\Delta H$ (nats)")
+        ax.set_title("Entropy Gap: $L^1$ vs $L^2$ Normalization")
+        ax.set_xscale("log")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.15)
+    else:
+        ax.set_visible(False)
+
+    # ── [2,0] Spectral Gap Ratio vs T per layer ──
+    ax = axes[2, 0]
+    if "channel_sgr_max" in df.columns:
+        for ci, layer in enumerate(layers):
+            ld = df[df["layer"] == layer].sort_values("T")
+            ax.plot(
+                ld["T"], ld["channel_sgr_max"],
+                "o-", color=colors[ci], markersize=3, linewidth=1.2,
+                label=_layer_label(layer), alpha=0.85,
+            )
+        ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+        ax.set_xlabel("Temperature $T$")
+        ax.set_ylabel("SGR (max gap)")
+        ax.set_title("Spectral Gap Ratio (max over $k$)")
+        ax.set_xscale("log")
+        ax.legend(fontsize=6, ncol=2)
+        ax.grid(True, alpha=0.15)
+    else:
+        ax.set_visible(False)
+
+    # ── [2,1] Rank gap ΔR = eRank - vN-eRank vs T per layer ──
+    ax = axes[2, 1]
+    for ci, layer in enumerate(layers):
+        ld = df[df["layer"] == layer].sort_values("T")
+        delta_r = ld["channel_erank"].values - ld["channel_vn_erank"].values
+        ax.plot(
+            ld["T"].values, delta_r,
+            "o-", color=colors[ci], markersize=3, linewidth=1.2,
+            label=_layer_label(layer), alpha=0.85,
+        )
+    ax.axvline(Tc, color="red", ls="--", alpha=0.4, lw=0.8)
+    ax.axhline(0, color="gray", ls=":", alpha=0.3)
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("$\\Delta R$ = eRank $-$ vN-eRank")
+    ax.set_title("Norm Gap: $L^1$ vs $L^2$ Rank")
+    ax.set_xscale("log")
+    ax.legend(fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.15)
+
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    fig.suptitle(
+        f"Unified Rényi-Normalization Framework: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
+        fontsize=14, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    path = Path(figs_dir) / "unified_framework_metrics.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# CFT relevant operator counts per q-state model
+CFT_OPERATOR_COUNT = {2: 3, 3: 6, 4: 8}
+
+
+def plot_mp_outliers(df, L, figs_dir, Tc=None, q=2):
+    """
+    Marchenko-Pastur outlier count vs temperature.
+
+    SVs exceeding the BBP threshold are RMT outliers — genuine signal
+    components.  At Tc the count should match the number of relevant
+    CFT operators: 3 (Ising), 6 (3-Potts), 8 (4-Potts).
+
+    Left:  per-layer MP outlier count vs T
+    Right: layer-averaged MP outlier count vs T
+
+    Args:
+        df: DataFrame from run_analysis() with 'channel_mp_outliers' column.
+        L: lattice size.
+        figs_dir: output directory for the figure.
+        Tc: critical temperature (auto-detected if None).
+        q: number of states (2=Ising, 3/4=Potts).
+
+    Returns:
+        Path to saved figure, or None if the column is missing.
+    """
+    if "channel_mp_outliers" not in df.columns:
+        return None
+
+    if Tc is None:
+        from vatd_exact_partition import CRITICAL_TEMPERATURE
+        Tc = CRITICAL_TEMPERATURE
+
+    layers = sorted(df["layer"].unique(), key=_layer_sort_key)
+    n_layers = len(layers)
+    colors = LAYER_CMAP(np.linspace(0.15, 0.85, n_layers))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ── Left: per-layer MP outlier count vs T ──
+    ax = axes[0]
+    for ci, layer in enumerate(layers):
+        ld = df[df["layer"] == layer].sort_values("T")
+        ax.plot(
+            ld["T"], ld["channel_mp_outliers"],
+            "o-", color=colors[ci], markersize=3, linewidth=1.2,
+            label=_layer_label(layer), alpha=0.85,
+        )
+    ax.axvline(Tc, color="red", ls="--", alpha=0.5, lw=1.0,
+               label=f"$T_c = {Tc:.3f}$")
+    n_cft = CFT_OPERATOR_COUNT.get(q)
+    if n_cft is not None:
+        ax.axhline(n_cft, color="green", ls=":", alpha=0.6, lw=1.5,
+                    label=f"CFT prediction ({n_cft} operators)")
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("MP Outlier Count (integer)")
+    ax.set_title("Per-Layer MP Outlier Count")
+    ax.set_xscale("log")
+    ax.legend(fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.15)
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    # ── Right: layer-averaged MP outlier count vs T ──
+    ax = axes[1]
+    avg_outliers = df.groupby("T")["channel_mp_outliers"].mean().sort_index()
+    T_arr = avg_outliers.index.values
+    outlier_arr = avg_outliers.values
+
+    ax.plot(T_arr, outlier_arr, "b-o", markersize=4, linewidth=2,
+            label="Avg MP Outlier Count")
+    ax.axvline(Tc, color="red", ls="--", alpha=0.5, lw=1.0,
+               label=f"$T_c = {Tc:.3f}$")
+    if n_cft is not None:
+        ax.axhline(n_cft, color="green", ls=":", alpha=0.6, lw=1.5,
+                    label=f"CFT: {n_cft} relevant operators")
+    ax.set_xlabel("Temperature $T$")
+    ax.set_ylabel("MP Outlier Count (layer-averaged)")
+    ax.set_title("Layer-Averaged MP Outlier Count")
+    ax.set_xscale("log")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.15)
+
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    fig.suptitle(
+        f"RMT Spectral Unfolding: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
+        fontsize=14, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    path = Path(figs_dir) / "mp_outlier_count.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -934,10 +1159,8 @@ def main():
     args = parser.parse_args()
 
     console = Console()
-    Tc = CRITICAL_TEMPERATURE
 
     console.print("[bold green]Low-Rank Analysis of PixelCNN Representations[/bold green]")
-    console.print(f"Critical Temperature: $T_c$ = {Tc:.4f}")
 
     # ── Replot mode: skip sampling, just regenerate plots ──
     if args.replot:
@@ -949,29 +1172,41 @@ def main():
         console.print(f"[yellow]Replot mode:[/yellow] reading {csv_path}")
         df = pd.read_csv(csv_path)
 
-        # Infer L from group config
+        # Infer L and q from group config
         config_path = csv_path.parent / "config.yaml"
+        q = 2
         if config_path.exists():
             from config import RunConfig
             config = RunConfig.from_yaml(str(config_path))
             L = config.net_config.get("size", 16)
             if not isinstance(L, int):
                 L = L[0]
+            q = config.net_config.get("category", 2)
         else:
             L = 16
+
+        Tc, _ = get_critical_temperature_from_q(q)
 
         figs_dir = Path(f"figs/{csv_path.parent.name}")
         figs_dir.mkdir(parents=True, exist_ok=True)
 
-        fig_path = plot_rank_vs_temperature(df, L, figs_dir)
+        fig_path = plot_rank_vs_temperature(df, L, figs_dir, Tc=Tc, q=q)
         console.print(f"[green]Main plot:[/green] {fig_path}")
 
-        fig_path = plot_derank_dt(df, L, figs_dir)
+        fig_path = plot_derank_dt(df, L, figs_dir, Tc=Tc, q=q)
         console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
-        ext_path = plot_extended_metrics(df, L, figs_dir)
+        ext_path = plot_extended_metrics(df, L, figs_dir, Tc=Tc, q=q)
         if ext_path:
             console.print(f"[green]Extended metrics plot:[/green] {ext_path}")
+
+        uni_path = plot_unified_framework(df, L, figs_dir, Tc=Tc, q=q)
+        if uni_path:
+            console.print(f"[green]Unified framework plot:[/green] {uni_path}")
+
+        mp_path = plot_mp_outliers(df, L, figs_dir, Tc=Tc, q=q)
+        if mp_path:
+            console.print(f"[green]MP outlier plot:[/green] {mp_path}")
 
         console.print("[bold green]Replot complete.[/bold green]")
         return
@@ -987,17 +1222,26 @@ def main():
     model = model.to(device)
     model.eval()
 
+    # Determine model type and critical temperature
+    Tc, q = get_critical_temperature(config)
+    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    console.print(f"Model type: {model_label}")
+    console.print(f"Critical Temperature: Tc = {Tc:.4f}")
+
     # Use pure PyTorch for MHC fusion (avoids mHC.cu CUDA kernel issues)
     if hasattr(model, 'use_pytorch_mhc'):
         model.use_pytorch_mhc()
 
     L = model.size[0]
-    num_layers = len(model.masked_conv.hidden_convs)
+    if hasattr(model, 'backbone'):
+        num_layers = len(model.backbone.blocks)
+        arch_info = f"Transformer blocks: {num_layers}, d_model: {model.hparams.get('d_model', '?')}"
+    else:
+        num_layers = len(model.masked_conv.hidden_convs)
+        arch_info = f"Residual blocks: {num_layers}, Hidden channels: {model.masked_conv.hidden_channels}"
     num_params = sum(p.numel() for p in model.parameters())
     console.print(
-        f"Lattice: {L}x{L}, Params: {num_params:,}, "
-        f"Residual blocks: {num_layers}, "
-        f"Hidden channels: {model.masked_conv.hidden_channels}"
+        f"Lattice: {L}x{L}, Params: {num_params:,}, {arch_info}"
     )
 
     # ── Output directories ──
@@ -1008,7 +1252,6 @@ def main():
     # ── Temperature grid ──
     mode_tag = "full"
     if args.critical:
-        Tc = CRITICAL_TEMPERATURE
         # Dense uniform grid: smooth finite differences for d(eRank)/dT
         temps = np.linspace(0.5 * Tc, 2.0 * Tc, 60)
         batch_size, n_batches = args.batch_size, args.n_batches
@@ -1019,12 +1262,12 @@ def main():
             f"batch={batch_size}, {n_batches} batches[/magenta]"
         )
     elif args.quick:
-        temps = temperature_grid(T_min=0.8, T_max=6.0, n_coarse=12, n_critical=8)
+        temps = temperature_grid(T_min=0.8, T_max=6.0, n_coarse=12, n_critical=8, Tc=Tc)
         batch_size, n_batches = 100, 2
         mode_tag = "quick"
         console.print("[yellow]Quick mode: 20 temps, batch=100, 2 batches[/yellow]")
     else:
-        temps = temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15)
+        temps = temperature_grid(T_min=0.5, T_max=10.0, n_coarse=25, n_critical=15, Tc=Tc)
         batch_size, n_batches = args.batch_size, args.n_batches
 
     console.print(
@@ -1035,7 +1278,7 @@ def main():
 
     # ── Phase 1: Rank analysis ──
     console.print("\n[bold cyan]Phase 1: Effective rank analysis[/bold cyan]")
-    df = run_analysis(model, temps, device, batch_size, n_batches, console)
+    df = run_analysis(model, temps, device, batch_size, n_batches, console, Tc=Tc)
 
     csv_suffix = f"_{mode_tag}" if mode_tag != "full" else ""
     csv_path = output_dir / f"rank_analysis{csv_suffix}_{seed}.csv"
@@ -1045,16 +1288,24 @@ def main():
     # ── Phase 2: Plots ──
     console.print("\n[bold cyan]Phase 2: Generating plots[/bold cyan]")
 
-    fig_path = plot_derank_dt(df, L, figs_dir, suffix=f"_{mode_tag}" if mode_tag != "full" else "")
+    fig_path = plot_derank_dt(df, L, figs_dir, suffix=f"_{mode_tag}" if mode_tag != "full" else "", Tc=Tc, q=q)
     console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
-    ext_path = plot_extended_metrics(df, L, figs_dir)
+    ext_path = plot_extended_metrics(df, L, figs_dir, Tc=Tc, q=q)
     if ext_path:
         console.print(f"[green]Extended metrics plot:[/green] {ext_path}")
 
+    uni_path = plot_unified_framework(df, L, figs_dir, Tc=Tc, q=q)
+    if uni_path:
+        console.print(f"[green]Unified framework plot:[/green] {uni_path}")
+
+    mp_path = plot_mp_outliers(df, L, figs_dir, Tc=Tc, q=q)
+    if mp_path:
+        console.print(f"[green]MP outlier plot:[/green] {mp_path}")
+
     if mode_tag != "critical":
         # Full/quick mode: also generate 3x2 overview and scree plots
-        fig_path = plot_rank_vs_temperature(df, L, figs_dir)
+        fig_path = plot_rank_vs_temperature(df, L, figs_dir, Tc=Tc, q=q)
         console.print(f"[green]Main plot:[/green] {fig_path}")
 
         # Select 3 representative temperatures for scree plots
@@ -1070,6 +1321,7 @@ def main():
 
         fig_path = plot_singular_value_spectra(
             model, selected_T, device, batch_size, n_batches, L, figs_dir, console,
+            Tc=Tc,
         )
         console.print(f"[green]Scree plot:[/green] {fig_path}")
 
@@ -1099,17 +1351,19 @@ def main():
         near_df = df[df["T"] == T_nearest_Tc]
         console.print(f"T = {T_nearest_Tc:.4f} (T/Tc = {T_nearest_Tc / Tc:.4f})")
         console.print(
-            f"{'Layer':>10s}  {'Rényi₂':>8s}  {'NumRk99':>8s}  "
-            f"{'nRank':>7s}  {'Elbow':>6s}  {'OptThr':>7s}"
+            f"{'Layer':>10s}  {'eRank':>8s}  {'vN-eR':>8s}  {'Rényi₂':>8s}  "
+            f"{'nRank':>7s}  {'sRank':>7s}  {'OptThr':>7s}"
         )
-        console.print("-" * 56)
+        console.print("-" * 68)
         for layer in sorted(near_df["layer"].unique(), key=_layer_sort_key):
             row = near_df[near_df["layer"] == layer].iloc[0]
+            vn_erank = row.get('channel_vn_erank', float('nan'))
             console.print(
-                f"{_layer_label(layer):>10s}  {row['channel_renyi2']:>8.2f}  "
-                f"{int(row['channel_numerical_rank_99']):>8d}  "
+                f"{_layer_label(layer):>10s}  {row['channel_erank']:>8.2f}  "
+                f"{vn_erank:>8.2f}  "
+                f"{row['channel_renyi2']:>8.2f}  "
                 f"{row['channel_nuclear_rank']:>7.2f}"
-                f"  {int(row['channel_elbow_rank']):>6d}"
+                f"  {row['channel_stable_rank']:>7.2f}"
                 f"  {int(row['channel_opt_threshold']):>7d}"
             )
 
