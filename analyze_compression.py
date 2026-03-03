@@ -71,8 +71,8 @@ LAYER_CMAP = plt.cm.viridis
 RANK_CMAP = plt.cm.plasma
 
 
-def _is_spingpt(model):
-    """Detect SpinGPT (Transformer) vs PixelCNN architecture."""
+def _is_latticegpt(model):
+    """Detect LatticeGPT (Transformer) vs PixelCNN architecture."""
     return hasattr(model, 'backbone')
 
 
@@ -195,7 +195,7 @@ def truncate_model(model, rank_fraction):
     Handles Conv2d (with mask), Linear, and MultiheadAttention.
 
     Args:
-        model: DiscretePixelCNN or SpinGPT
+        model: DiscretePixelCNN or LatticeGPT
         rank_fraction: float in (0, 1] — fraction of singular values to keep
 
     Returns:
@@ -220,11 +220,11 @@ def truncate_block(model, block_idx, rank_fraction):
     most at which temperatures?
 
     Supports both PixelCNN (masked_conv.hidden_convs) and
-    SpinGPT (backbone.blocks).
+    LatticeGPT (backbone.blocks).
     """
     model_copy = copy.deepcopy(model)
 
-    if _is_spingpt(model_copy):
+    if _is_latticegpt(model_copy):
         block = model_copy.backbone.blocks[block_idx]
     else:
         block = model_copy.masked_conv.hidden_convs[block_idx]
@@ -245,7 +245,7 @@ def generate_samples(model, temperatures, batch_size, device, q=2, console=None)
     Generate samples from the full model at each temperature.
 
     Args:
-        model: DiscretePixelCNN or SpinGPT
+        model: DiscretePixelCNN or LatticeGPT
         temperatures: array of temperature values
         batch_size: samples per temperature
         device: torch device
@@ -449,7 +449,7 @@ def run_compression_analysis(
             "\n[bold cyan]Step 4: Per-block sensitivity analysis "
             f"(rank_frac={PER_LAYER_RANK_FRACTION})[/bold cyan]"
         )
-        if _is_spingpt(model):
+        if _is_latticegpt(model):
             num_blocks = len(model.backbone.blocks)
         else:
             num_blocks = len(model.masked_conv.hidden_convs)
@@ -509,7 +509,7 @@ def _block_label(name):
     """Convert module name to human-readable label.
 
     PixelCNN: 'masked_conv.hidden_convs.3.0' → 'B3.1×1↓'
-    SpinGPT:  'backbone.blocks.0.adaln1.proj' → 'B0.AdaLN₁'
+    LatticeGPT:  'backbone.blocks.0.adaln1.proj' → 'B0.AdaLN₁'
     """
     parts = name.split(".")
     # ── PixelCNN patterns ──
@@ -527,7 +527,7 @@ def _block_label(name):
     elif "hidden_fcs" in name:
         idx = parts[2]
         return f"FC_{int(idx)+2}"
-    # ── SpinGPT patterns ──
+    # ── LatticeGPT patterns ──
     elif "backbone.blocks" in name:
         # Extract block index
         block_idx = parts[2]
@@ -570,7 +570,7 @@ def plot_weight_spectra(svd_info, figs_dir):
     }
 
     if not kxk_layers:
-        # SpinGPT fallback: FFN down-proj and Q-projection per block
+        # LatticeGPT fallback: FFN down-proj and Q-projection per block
         kxk_layers = {
             k: v
             for k, v in svd_info.items()
@@ -934,7 +934,7 @@ def main():
         model.use_pytorch_mhc()
 
     L = model.size[0]
-    if _is_spingpt(model):
+    if _is_latticegpt(model):
         num_layers = len(model.backbone.blocks)
         arch_info = f"Transformer blocks: {num_layers}, d_model: {model.hparams.get('d_model', '?')}"
     else:

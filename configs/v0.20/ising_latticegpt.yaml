@@ -1,21 +1,20 @@
-# v0.20 Spin-GPT: Autoregressive Transformer for 2D Ising Model (A100)
+# v0.20 LatticeGPT: Autoregressive Transformer for 2D Ising Model
 #
-# A100-optimized config: larger batch and full-size Transformer.
 # Tests architecture independence of the low-rank phenomenon.
 # Same VaTD training objective (REINFORCE + variational free energy),
 # but replaces the PixelCNN backbone with a causal Transformer.
 #
-# A100 has 40/80GB VRAM, allowing much larger batches.
-# KV-cache sampling reduces memory from O(L³) to O(L²).
-# batch_size × num_beta × accumulation_steps = 512 × 8 × 16 = 65,536 samples/epoch
+# Autoregressive sampling is O(L²) per token → much more VRAM than PixelCNN.
+# Use small batch (64) with more accumulation steps to compensate.
+# batch_size × num_beta × accumulation_steps = 64 × 8 × 32 = 16,384 samples/epoch
 
 project: Ising_VaTD_v0.20
 device: cuda:0
-net: model_transformer.SpinGPT
-optimizer: torch.optim.AdamW
+net: model_transformer.LatticeGPT
+optimizer: splus.SPlus
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 250
-batch_size: 512
+batch_size: 64
 seeds: [42]
 
 net_config:
@@ -25,19 +24,20 @@ net_config:
   category: 2  # Ising: {0,1} → {-1,+1}
 
   # Temperature sampling configuration
-  batch_size: 512
+  batch_size: 64
   num_beta: 8
   beta_min: 0.2
   beta_max: 1.0
 
   # Training Mode: Sequential with gradient accumulation
+  # More accum steps to compensate smaller batch
   training_mode: sequential
-  accumulation_steps: 16
+  accumulation_steps: 32
 
   # MCMC: DISABLED (pure REINFORCE)
   mcmc_enabled: false
 
-  # A100 CUDA backend
+  # CUDA backend
   cudnn_benchmark: true
 
   # 2-Phase Curriculum Learning
@@ -46,19 +46,16 @@ net_config:
   phase1_beta_max: 0.35
   phase2_epochs: 100
 
-  # Transformer architecture (full-size)
-  d_model: 192
-  n_heads: 6
-  n_layers: 6
-  d_ff: 768
+  # Transformer architecture
+  d_model: 128
+  n_heads: 4
+  n_layers: 4
+  d_ff: 512
   cond_dim: 64
   dropout: 0.0
 
   # 2D Periodic Relative Position Bias (PBC lattice topology)
   use_rel_pos_bias: true
-
-  # AMP (bfloat16 for A100 — REINFORCE-safe)
-  use_amp: true
 
   # Temperature-dependent Output Scaling (Parameter-free)
   logit_temp_scale: true
@@ -66,8 +63,9 @@ net_config:
   temp_scale_max: 2.0
 
 optimizer_config:
-  lr: 3.e-4
-  weight_decay: 1.e-2
+  lr: 1.e-1
+  eps: 1.e-10
+  #weight_decay: 1.e-2
 
 scheduler_config:
   upper_bound: 300

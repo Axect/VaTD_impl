@@ -1,5 +1,5 @@
 """
-Spin-GPT: Autoregressive Transformer for lattice spin systems.
+Lattice-GPT: Autoregressive Transformer for lattice spin systems.
 
 Replaces the PixelCNN backbone with a causal Transformer while keeping
 the same VaTD training objective (variational free energy minimization
@@ -230,11 +230,11 @@ class CausalTransformerBackbone(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────
-# SpinGPT: Full Model
+# LatticeGPT: Full Model
 # ──────────────────────────────────────────────────────────────
 
 
-class SpinGPT(nn.Module):
+class LatticeGPT(nn.Module):
     """
     Autoregressive Transformer for lattice spin systems.
 

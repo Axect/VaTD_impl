@@ -149,10 +149,10 @@ def collect_activations(model, samples, T_val, device):
 
     Dispatches to model-specific collector based on architecture:
       - PixelCNN: hooks on masked_conv.hidden_convs[i] and first_fc
-      - Transformer (SpinGPT): hooks on backbone.blocks[i] output
+      - Transformer (LatticeGPT): hooks on backbone.blocks[i] output
 
     Args:
-        model: DiscretePixelCNN or SpinGPT (eval mode)
+        model: DiscretePixelCNN or LatticeGPT (eval mode)
         samples: [B, 1, H, W] in physical representation
         T_val: scalar temperature
         device: torch device
@@ -198,7 +198,7 @@ def _collect_activations_pixelcnn(model, samples, T_val, device):
 
 def _collect_activations_transformer(model, samples, T_val, device):
     """
-    Transformer (SpinGPT): hooks on backbone.blocks[i] output.
+    Transformer (LatticeGPT): hooks on backbone.blocks[i] output.
 
     Captures [B, L, d_model] and reshapes to [B, d_model, H, W]
     for compatibility with the SVD analysis pipeline.
@@ -289,7 +289,7 @@ def run_analysis(model, temperatures, device, batch_size=200, n_batches=3, conso
         console = Console()
 
     if hasattr(model, 'backbone'):
-        # Transformer (SpinGPT): blocks in backbone
+        # Transformer (LatticeGPT): blocks in backbone
         num_layers = len(model.backbone.blocks)
     else:
         # PixelCNN: hidden conv blocks

@@ -1,4 +1,4 @@
-# v0.21 Spin-GPT: Model-Agnostic Improvements for Tc Accuracy (A100)
+# v0.21 LatticeGPT: Model-Agnostic Improvements for Tc Accuracy (A100)
 #
 # A100-optimized: larger batch, full-size Transformer.
 # Changes from v0.20:
@@ -12,7 +12,7 @@
 
 project: Ising_VaTD_v0.21
 device: cuda:0
-net: model_transformer.SpinGPT
+net: model_transformer.LatticeGPT
 optimizer: torch.optim.AdamW
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 300

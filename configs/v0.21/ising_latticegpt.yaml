@@ -1,4 +1,4 @@
-# v0.21 Spin-GPT: Model-Agnostic Improvements for Tc Accuracy
+# v0.21 LatticeGPT: Model-Agnostic Improvements for Tc Accuracy
 #
 # Changes from v0.20:
 # 1. Zero-variance effective action loss (alpha_zv)
@@ -11,7 +11,7 @@
 
 project: Ising_VaTD_v0.21
 device: cuda:0
-net: model_transformer.SpinGPT
+net: model_transformer.LatticeGPT
 optimizer: splus.SPlus
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 300
