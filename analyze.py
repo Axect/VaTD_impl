@@ -338,11 +338,14 @@ def compute_thermodynamic_quantities(
                 T_expanded = T_model.expand(mb_size)
 
                 # samples are fixed, but T_expanded carries gradient
-                log_prob_ad = model.log_prob(mb_samples, T=T_expanded)
-                loss_model = (log_prob_ad + beta_model * mb_energies.unsqueeze(-1)).mean()
+                # Use math SDPA backend to support double backward (second-order grad)
+                # Flash/efficient attention kernels don't implement second derivatives
+                with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                    log_prob_ad = model.log_prob(mb_samples, T=T_expanded)
+                    loss_model = (log_prob_ad + beta_model * mb_energies.unsqueeze(-1)).mean()
 
-                grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
-                grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
+                    grad_loss = torch.autograd.grad(loss_model, beta_model, create_graph=True)[0]
+                    grad2_loss = torch.autograd.grad(grad_loss, beta_model)[0]
 
                 # Accumulate weighted by mini-batch size
                 grad_loss_sum += grad_loss.item() * mb_size
