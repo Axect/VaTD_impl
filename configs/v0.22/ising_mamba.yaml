@@ -1,0 +1,78 @@
+# v0.22 LatticeMamba: SSM backbone for architecture-independent eRank analysis
+#
+# Replaces Transformer with Mamba (mambapy, pure PyTorch).
+# Key change: d_state=32 (not 16) per murder board recommendation.
+# Same VaTD training objective as LatticeGPT.
+#
+# batch_size × num_beta × accumulation_steps = 64 × 8 × 32 = 16,384 samples/epoch
+
+project: Ising_VaTD_v0.22
+device: cuda:0
+net: model_mamba.LatticeMamba
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 64
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+  category: 2  # Ising: {0,1} → {-1,+1}
+
+  # Temperature sampling configuration (expanded range)
+  batch_size: 64
+  num_beta: 8
+  beta_min: 0.1   # T_max = 10
+  beta_max: 2.0   # T_min = 0.5
+
+  # Training Mode: Sequential with gradient accumulation
+  training_mode: sequential
+  accumulation_steps: 32
+
+  # MCMC: DISABLED (pure REINFORCE + zero-variance loss)
+  mcmc_enabled: false
+
+  # CUDA backend
+  cudnn_benchmark: true
+
+  # Curriculum: DISABLED (replaced by adaptive sampling)
+  curriculum_enabled: false
+
+  # Mamba architecture (d_state=32 per murder board)
+  d_model: 128
+  n_layers: 4
+  d_state: 32
+  expand_factor: 2
+  d_conv: 4
+  cond_dim: 64
+  pscan: true   # parallel scan — requires ≥16GB VRAM
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+  # Zero-Variance Effective Action Loss
+  alpha_zv: 0.01
+
+  # Variance-Based Adaptive Temperature Sampling
+  adaptive_sampling_enabled: true
+  adaptive_sampling_warmup: 20
+  adaptive_sampling_num_bins: 32
+  adaptive_sampling_kappa: 1.0
+  adaptive_sampling_epsilon: 1.0e-6
+  adaptive_sampling_momentum: 0.95
+
+optimizer_config:
+  lr: 1.e-1
+  eps: 1.e-10
+
+scheduler_config:
+  upper_bound: 350
+  max_iter: 300
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

@@ -614,3 +614,7 @@ class LatticeGPT(nn.Module):
     def use_pytorch_mhc(self):
         """No-op for API compatibility with DiscretePixelCNN."""
         pass
+
+
+# Backward-compatible alias (configs saved as model_transformer.SpinGPT)
+SpinGPT = LatticeGPT
