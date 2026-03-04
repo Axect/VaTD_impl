@@ -1514,6 +1514,39 @@ def load_model(project, group_name, seed, weights_only=True):
         remapped[new_k] = v
     state_dict = remapped
 
+    # Remap legacy fused nn.MultiheadAttention → manual QKV projections
+    # Old: blocks.N.attn.in_proj_{weight,bias} [3*d, d] / [3*d]
+    #      blocks.N.attn.out_proj.{weight,bias}
+    # New: blocks.N.W_q.{weight,bias}, W_k, W_v, W_o
+    keys_to_delete = []
+    keys_to_add = {}
+    for k, v in state_dict.items():
+        if ".attn.in_proj_weight" in k:
+            prefix = k.replace(".attn.in_proj_weight", "")
+            d = v.shape[1]
+            keys_to_add[f"{prefix}.W_q.weight"] = v[:d]
+            keys_to_add[f"{prefix}.W_k.weight"] = v[d:2*d]
+            keys_to_add[f"{prefix}.W_v.weight"] = v[2*d:]
+            keys_to_delete.append(k)
+        elif ".attn.in_proj_bias" in k:
+            prefix = k.replace(".attn.in_proj_bias", "")
+            d = v.shape[0] // 3
+            keys_to_add[f"{prefix}.W_q.bias"] = v[:d]
+            keys_to_add[f"{prefix}.W_k.bias"] = v[d:2*d]
+            keys_to_add[f"{prefix}.W_v.bias"] = v[2*d:]
+            keys_to_delete.append(k)
+        elif ".attn.out_proj.weight" in k:
+            prefix = k.replace(".attn.out_proj.weight", "")
+            keys_to_add[f"{prefix}.W_o.weight"] = v
+            keys_to_delete.append(k)
+        elif ".attn.out_proj.bias" in k:
+            prefix = k.replace(".attn.out_proj.bias", "")
+            keys_to_add[f"{prefix}.W_o.bias"] = v
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        del state_dict[k]
+    state_dict.update(keys_to_add)
+
     model.load_state_dict(state_dict)
 
     return model, config

@@ -1,0 +1,69 @@
+# v0.23 LatticeGDN: Gated DeltaNet backbone (fallback / 4th witness)
+#
+# Alternative to GLA using delta-rule error correction + gating.
+# Same FLABackbone wrapper, different layer class.
+#
+# batch_size × num_beta × accumulation_steps = 64 × 8 × 32 = 16,384 samples/epoch
+
+project: Ising_VaTD_v0.23
+device: cuda:0
+net: model_fla.LatticeFLA
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 64
+seeds: [42]
+
+net_config:
+  size: 16
+  fix_first: 1
+  category: 2
+
+  batch_size: 64
+  num_beta: 8
+  beta_min: 0.1
+  beta_max: 2.0
+
+  training_mode: sequential
+  accumulation_steps: 32
+
+  mcmc_enabled: false
+  cudnn_benchmark: true
+  curriculum_enabled: false
+
+  # Gated DeltaNet layer
+  fla_layer: gated_deltanet
+  d_model: 128
+  n_layers: 4
+  num_heads: 4
+  head_dim: 32               # 128 / 4 heads
+  expand_v: 1.0
+  use_gate: true
+  use_short_conv: true
+  conv_size: 4
+  cond_dim: 64
+
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+  alpha_zv: 0.01
+
+  adaptive_sampling_enabled: true
+  adaptive_sampling_warmup: 20
+  adaptive_sampling_num_bins: 32
+  adaptive_sampling_kappa: 1.0
+  adaptive_sampling_epsilon: 1.0e-6
+  adaptive_sampling_momentum: 0.95
+
+optimizer_config:
+  lr: 1.e-1
+  eps: 1.e-10
+
+scheduler_config:
+  upper_bound: 350
+  max_iter: 300
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false
