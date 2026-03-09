@@ -1361,6 +1361,7 @@ def run(run_config: RunConfig, energy_fn, group_name=None, trial=None, pruner=No
                 group=group_name,
                 tags=tags,
                 config=run_config.gen_config(),
+                settings=wandb.Settings(init_timeout=300),
             )
 
             # Extract v0.11 training parameters from net_config

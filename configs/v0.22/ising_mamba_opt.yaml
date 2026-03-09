@@ -1,0 +1,52 @@
+study_name: LatticeMamba_TPE
+trials: 100
+seed: 42
+metric: val_loss
+direction: minimize
+
+sampler:
+  name: optuna.samplers.TPESampler
+
+pruner:
+  name: pruner.PFLPruner
+  kwargs:
+    n_startup_trials: 10
+    n_warmup_epochs: 3
+    top_k: 10
+    target_epoch: 10
+
+search_space:
+  net_config:
+    n_layers:
+      type: int
+      min: 2
+      max: 6
+    d_state:
+      type: categorical
+      choices: [16, 32, 64]
+    expand_factor:
+      type: categorical
+      choices: [2, 4]
+    d_conv:
+      type: categorical
+      choices: [4, 8]
+    cond_dim:
+      type: categorical
+      choices: [32, 64, 128]
+    alpha_zv:
+      type: float
+      min: 1.e-3
+      max: 1.e-1
+      log: true
+  optimizer_config:
+    lr:
+      type: float
+      min: 1.e-2
+      max: 1.e+0
+      log: true
+  scheduler_config:
+    infimum_lr:
+      type: float
+      min: 1.e-7
+      max: 1.e-4
+      log: true

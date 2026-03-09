@@ -1,0 +1,74 @@
+# v0.21 LatticeGPT - Best model (300 epochs)
+# TODO: Fill in best hyperparameters from HPO results
+# Run HPO: python main.py --run_config configs/v0.21/ising_latticegpt_run.yaml \
+#                         --optimize_config configs/v0.21/ising_latticegpt_opt.yaml \
+#                         --device cuda:0
+
+project: Ising_VaTD_v0.21
+device: cuda:0
+net: model_transformer.LatticeGPT
+optimizer: splus.SPlus
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 64
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 1
+  category: 2
+
+  # Temperature sampling
+  batch_size: 64
+  num_beta: 8
+  beta_min: 0.1
+  beta_max: 2.0
+
+  # Training Mode
+  training_mode: sequential
+  accumulation_steps: 32
+
+  mcmc_enabled: false
+  cudnn_benchmark: true
+  curriculum_enabled: false
+
+  # Transformer architecture (HPO best: trial 62, loss=-395.60)
+  d_model: 128
+  n_heads: 4
+  n_layers: 2
+  d_ff: 512
+  cond_dim: 32
+  dropout: 0.0
+
+  use_rel_pos_bias: true
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+  # Zero-Variance Effective Action Loss (HPO best)
+  alpha_zv: 0.057200976085883
+
+  # Variance-Based Adaptive Temperature Sampling
+  adaptive_sampling_enabled: true
+  adaptive_sampling_warmup: 20
+  adaptive_sampling_num_bins: 32
+  adaptive_sampling_kappa: 1.0
+  adaptive_sampling_epsilon: 1.0e-6
+  adaptive_sampling_momentum: 0.95
+
+# HPO best
+optimizer_config:
+  lr: 0.21234231083440927
+  eps: 1.e-10
+
+# HPO best (max_iter = epochs = 300)
+scheduler_config:
+  upper_bound: 350
+  max_iter: 300
+  infimum_lr: 1.4343559778292656e-07
+
+early_stopping_config:
+  enabled: false
