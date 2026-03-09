@@ -11,3 +11,4 @@ figs
 refs/
 wandb/
 __pycache__/
+outputs/
