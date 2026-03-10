@@ -1,8 +1,6 @@
 # v0.23 LatticeGLA - Best model (300 epochs)
-# TODO: Fill in best hyperparameters from HPO results
-# Run HPO: python main.py --run_config configs/v0.23/ising_gla_run.yaml \
-#                         --optimize_config configs/v0.23/ising_gla_opt.yaml \
-#                         --device cuda:0
+# Best trial value: -396.1869201660156
+# Source: runs/Ising_VaTD_v0.23_Opt/LatticeFLA_lr4e-2_e10_0409da[97]
 
 project: Ising_VaTD_v0.23
 device: cuda:0
@@ -33,18 +31,18 @@ net_config:
   cudnn_benchmark: true
   curriculum_enabled: false
 
-  # GLA architecture — REPLACE with HPO best params
+  # GLA architecture
   fla_layer: gla
   d_model: 128
-  n_layers: 4
-  num_heads: 4
+  n_layers: 6
+  num_heads: 8
   expand_k: 1.0
-  expand_v: 1.0
+  expand_v: 2.0
   use_short_conv: true
-  conv_size: 4
+  conv_size: 8
   cond_dim: 64
 
-  # GLA-specific — REPLACE with HPO best
+  # GLA-specific
   use_output_gate: true
   gate_low_rank_dim: 16
 
@@ -53,8 +51,8 @@ net_config:
   temp_scale_min: 0.1
   temp_scale_max: 2.0
 
-  # Zero-Variance Effective Action Loss — REPLACE with HPO best
-  alpha_zv: 0.01
+  # Zero-Variance Effective Action Loss
+  alpha_zv: 0.003471238714444483
 
   # Variance-Based Adaptive Temperature Sampling
   adaptive_sampling_enabled: true
@@ -64,16 +62,14 @@ net_config:
   adaptive_sampling_epsilon: 1.0e-6
   adaptive_sampling_momentum: 0.95
 
-# REPLACE with HPO best
 optimizer_config:
-  lr: 1.e-1
+  lr: 0.03874965373164518
   eps: 1.e-10
 
-# REPLACE with HPO best (max_iter = epochs = 300)
 scheduler_config:
   upper_bound: 350
   max_iter: 300
-  infimum_lr: 1.e-6
+  infimum_lr: 1.483332026983102e-06
 
 early_stopping_config:
   enabled: false
