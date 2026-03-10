@@ -1,6 +1,7 @@
 import os
 os.environ['VATD_NO_MHC'] = '1'  # Prevent mHC.cu CUDA extension from loading
 
+import math
 import torch
 
 import numpy as np
@@ -150,6 +151,9 @@ def test_model_ising(
 
             # Compute exact values
             exact_logz = exact_logZ(n=L, j=1.0, beta=torch.tensor(beta)).item()
+            # fix_first constrains first spin -> model sees Z_constrained = Z_full / 2
+            if hasattr(model, 'fix_first') and model.fix_first is not None:
+                exact_logz -= math.log(2.0)
             exact_loss = -exact_logz
 
             # Compute model log Z estimate

@@ -164,10 +164,40 @@ def logZ(n, j, beta):
     ).sum(0, keepdim=True)
     terms.append(term4)
 
-    # Combine all terms using logsumexp for numerical stability
+    # Combine: Z = (Z1 + sign_Z2 * |Z2| + Z3 + Z4) / 2
+    #
+    # The even-sinh sector (term2) has a sign that depends on temperature:
+    #   Z2 = prod_r 2*sinh(n/2 * gamma(2r))
+    # For r=0, the physical gamma_0 = 2*(K - K*) can be negative above Tc.
+    # Since arccosh returns |gamma|, we must restore the sign manually.
+    # Below Tc (K > K*): gamma_0 > 0, sinh > 0, Z2 > 0 → sign = +1
+    # Above Tc (K < K*): gamma_0 < 0, one sinh factor < 0, Z2 < 0 → sign = -1
+    # At Tc: gamma_0 = 0, Z2 = 0 → sign irrelevant
+    term1, term2, term3, term4 = terms
+    K = h(j, beta)
+    K_star = h_star(j, beta)
+    sign_Z2 = torch.where(K >= K_star,
+                           torch.tensor(1.0, dtype=beta.dtype),
+                           torch.tensor(-1.0, dtype=beta.dtype))
+
+    # Gather always-positive terms
+    pos_terms = torch.cat([term1, term3, term4], dim=0)
+    log_pos_sum = torch.logsumexp(pos_terms, dim=0)
+
+    # Add or subtract |Z2| depending on sign_Z2
+    # log(A + s*B) where A = sum of positive terms, s = ±1, B = |Z2|
+    if sign_Z2 > 0:
+        # log(A + B) = logsumexp(log_A, log_B)
+        log_combined = torch.logsumexp(
+            torch.stack([log_pos_sum, term2.squeeze()]), dim=0
+        )
+    else:
+        # log(A - B) = log(A) + log1p(-exp(log_B - log_A))
+        log_combined = log_pos_sum + torch.log1p(-torch.exp(term2.squeeze() - log_pos_sum))
+
     result = (
-        torch.logsumexp(torch.cat(terms, dim=0), dim=0)
-        - torch.log(torch.tensor(2.0))
+        log_combined
+        - torch.log(torch.tensor(2.0, dtype=beta.dtype))
         + 1 / 2 * n**2 * torch.log(2 * torch.sinh(2 * h(j, beta)))
     )
 
