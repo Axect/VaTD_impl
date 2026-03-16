@@ -333,6 +333,15 @@ class LatticeFLA(nn.Module):
         # ── Token embedding ──
         self.tok_embed = nn.Embedding(self.category, self._d_model)
 
+        # ── Circular embedding (optional, for clock model) ──
+        self.circular_embedding = hparams.get("circular_embedding", False)
+        if self.circular_embedding:
+            self.register_buffer(
+                "_circ_angles",
+                2.0 * torch.pi * torch.arange(self.category, dtype=torch.float32) / self.category
+            )
+            self.circ_proj = nn.Linear(2, self._d_model)
+
         # ── Learnable absolute positional embedding ──
         self.pos_embed = nn.Parameter(
             torch.randn(self.seq_len, self._d_model) * 0.02
@@ -364,6 +373,14 @@ class LatticeFLA(nn.Module):
     # ──────────────────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────────────────
+
+    def _embed_tokens(self, tokens):
+        """Embed tokens with optional circular structure for clock model."""
+        if self.circular_embedding:
+            angles = self._circ_angles[tokens]
+            circ = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+            return self.circ_proj(circ)
+        return self.tok_embed(tokens)
 
     def _compute_temp_scale(self, T: torch.Tensor):
         """
@@ -418,7 +435,7 @@ class LatticeFLA(nn.Module):
         B, L = tokens.shape
 
         # Embed tokens
-        tok_emb = self.tok_embed(tokens)  # [B, L, d_model]
+        tok_emb = self._embed_tokens(tokens)  # [B, L, d_model]
 
         # Shift right: position 0 gets zero embedding, position i gets embed(token[i-1])
         zero_start = torch.zeros(B, 1, tok_emb.shape[-1], device=tok_emb.device)
@@ -498,7 +515,7 @@ class LatticeFLA(nn.Module):
             if i == 0:
                 x_i = torch.zeros(batch_size, 1, self._d_model, device=self.device)
             else:
-                x_i = self.tok_embed(tokens[:, i - 1]).unsqueeze(1)  # [B, 1, d_model]
+                x_i = self._embed_tokens(tokens[:, i - 1]).unsqueeze(1)  # [B, 1, d_model]
 
             x_i = x_i + self.pos_embed[i]  # [B, 1, d_model] — broadcast add
 
@@ -511,7 +528,7 @@ class LatticeFLA(nn.Module):
             if i == 0:
                 x_i = torch.zeros(batch_size, 1, self._d_model, device=self.device)
             else:
-                x_i = self.tok_embed(tokens[:, i - 1]).unsqueeze(1)  # [B, 1, d_model]
+                x_i = self._embed_tokens(tokens[:, i - 1]).unsqueeze(1)  # [B, 1, d_model]
 
             x_i = x_i + self.pos_embed[i]  # [B, 1, d_model]
 

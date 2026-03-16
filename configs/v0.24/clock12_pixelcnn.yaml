@@ -1,0 +1,87 @@
+# v0.24 PixelCNN for 12-state Clock Model (smoke test)
+#
+# q=12 Clock model: E = -J * Σ cos(2π(s_i - s_j)/12)
+# BKT transition: T_BKT ≈ 0.88
+# CFT central charge: c = 1 (free boson)
+#
+# Smoke test configuration: smaller batch, fewer epochs.
+
+project: Ising_VaTD_v0.24
+device: cuda:0
+net: model.DiscretePixelCNN
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 100
+batch_size: 1024
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 0  # Fix first spin to state 0
+  category: 12  # 12-state clock
+  model_type: clock  # CRITICAL: routes to clock energy, not Potts
+
+  # Temperature sampling configuration
+  # T_BKT ≈ 0.88, β range [0.5, 2.5] covers T ∈ [0.4, 2.0]
+  batch_size: 1024
+  num_beta: 8
+  beta_min: 0.5
+  beta_max: 2.5
+
+  # Training Mode: Sequential with gradient accumulation
+  training_mode: sequential
+  accumulation_steps: 8
+
+  # MCMC: DISABLED (pure REINFORCE)
+  mcmc_enabled: false
+
+  # CUDA backend
+  cudnn_benchmark: true
+
+  # 2-Phase Curriculum Learning
+  # Phase 1: high-T only (β ≤ 0.7 → T ≥ 1.43, well above T_BKT ≈ 0.88)
+  curriculum_enabled: true
+  phase1_epochs: 20
+  phase1_beta_max: 0.7
+  phase2_epochs: 50
+
+  # Model architecture (4-layer Dilated ResNet)
+  kernel_size: 7
+  hidden_channels: 96
+  hidden_conv_layers: 4
+  hidden_kernel_size: 3
+  hidden_width: 128
+  hidden_fc_layers: 2
+
+  # Dilation pattern for exponential receptive field
+  dilation_pattern: [1, 2, 4, 8]
+
+  # Multi-scale skip connections
+  skip_connection_indices: [1, 3]
+
+  # Beta-Conditioned HC Fusion
+  use_mhc_fusion: true
+  mhc_config:
+    manifold_constraint: false
+    use_dynamic_h: true
+    aggregation: sum
+    beta_conditioned: true
+    beta_mlp_hidden: 32
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+optimizer_config:
+  lr: 1.e-3
+  weight_decay: 1.e-4
+
+scheduler_config:
+  upper_bound: 120
+  max_iter: 100
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

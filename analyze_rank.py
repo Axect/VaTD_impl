@@ -47,9 +47,13 @@ from util import select_project, select_group, select_seed, select_device, load_
 
 
 def get_critical_temperature(config):
-    """Determine critical temperature from model config (Ising or Potts)."""
+    """Determine critical temperature from model config (Ising, Potts, or Clock)."""
     net_config = config.net_config if hasattr(config, 'net_config') else {}
     q = net_config.get("category", 2)
+    model_type = net_config.get("model_type", "")
+    if model_type == "clock":
+        from clock import CLOCK_TC
+        return CLOCK_TC.get(q, 0.89), q
     return get_critical_temperature_from_q(q)
 
 
@@ -410,7 +414,7 @@ def _layer_label(name):
     return name.replace("layer_", "Block ").replace("final", "Final")
 
 
-def plot_rank_vs_temperature(df, L, figs_dir, Tc=None, q=2):
+def plot_rank_vs_temperature(df, L, figs_dir, Tc=None, q=2, model_type=""):
     """
     3×2 figure:
       [0,0] Channel effective rank vs T per layer
@@ -570,7 +574,12 @@ def plot_rank_vs_temperature(df, L, figs_dir, Tc=None, q=2):
         plt.colorbar(im, ax=ax, label="Effective Rank")
         ax.set_title("Channel eRank Heatmap")
 
-    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    if q == 2:
+        model_label = "2D Ising"
+    elif model_type == "clock":
+        model_label = f"{q}-state Clock"
+    else:
+        model_label = f"{q}-state Potts"
     fig.suptitle(
         f"Low-Rank Analysis: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14, fontweight="bold",
@@ -583,7 +592,7 @@ def plot_rank_vs_temperature(df, L, figs_dir, Tc=None, q=2):
     return path
 
 
-def plot_derank_dt(df, L, figs_dir, suffix="", Tc=None, q=2):
+def plot_derank_dt(df, L, figs_dir, suffix="", Tc=None, q=2, model_type=""):
     """
     Standalone figure comparing d(eRank)/dT with exact specific heat Cv.
 
@@ -726,7 +735,7 @@ def plot_singular_value_spectra(
     return path
 
 
-def plot_extended_metrics(df, L, figs_dir, Tc=None, q=2):
+def plot_extended_metrics(df, L, figs_dir, Tc=None, q=2, model_type=""):
     """
     2×2 figure for the Nature Physics 2024 extended rank metrics:
       [0,0] Rényi Rank (α=2) vs T per layer
@@ -864,7 +873,12 @@ def plot_extended_metrics(df, L, figs_dir, Tc=None, q=2):
                 transform=ax.transAxes, ha="center", va="center")
         ax.set_title("Metric Correlations near $T_c$")
 
-    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    if q == 2:
+        model_label = "2D Ising"
+    elif model_type == "clock":
+        model_label = f"{q}-state Clock"
+    else:
+        model_label = f"{q}-state Potts"
     fig.suptitle(
         f"Extended Rank Metrics: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14, fontweight="bold",
@@ -877,7 +891,7 @@ def plot_extended_metrics(df, L, figs_dir, Tc=None, q=2):
     return path
 
 
-def plot_unified_framework(df, L, figs_dir, Tc=None, q=2):
+def plot_unified_framework(df, L, figs_dir, Tc=None, q=2, model_type=""):
     """
     3×2 figure for the unified Rényi-normalization framework metrics:
       [0,0] vN-eRank (α=1, L2²) vs T per layer
@@ -1016,7 +1030,12 @@ def plot_unified_framework(df, L, figs_dir, Tc=None, q=2):
     ax.legend(fontsize=6, ncol=2)
     ax.grid(True, alpha=0.15)
 
-    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    if q == 2:
+        model_label = "2D Ising"
+    elif model_type == "clock":
+        model_label = f"{q}-state Clock"
+    else:
+        model_label = f"{q}-state Potts"
     fig.suptitle(
         f"Unified Rényi-Normalization Framework: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14, fontweight="bold",
@@ -1033,7 +1052,7 @@ def plot_unified_framework(df, L, figs_dir, Tc=None, q=2):
 CFT_OPERATOR_COUNT = {2: 3, 3: 6, 4: 8}
 
 
-def plot_mp_outliers(df, L, figs_dir, Tc=None, q=2):
+def plot_mp_outliers(df, L, figs_dir, Tc=None, q=2, model_type=""):
     """
     Marchenko-Pastur outlier count vs temperature.
 
@@ -1110,7 +1129,12 @@ def plot_mp_outliers(df, L, figs_dir, Tc=None, q=2):
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.15)
 
-    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    if q == 2:
+        model_label = "2D Ising"
+    elif model_type == "clock":
+        model_label = f"{q}-state Clock"
+    else:
+        model_label = f"{q}-state Potts"
     fig.suptitle(
         f"RMT Spectral Unfolding: {model_label} ($L={L}$, $T_c \\approx {Tc:.3f}$)",
         fontsize=14, fontweight="bold",
@@ -1175,6 +1199,7 @@ def main():
         # Infer L and q from group config
         config_path = csv_path.parent / "config.yaml"
         q = 2
+        model_type = ""
         if config_path.exists():
             from config import RunConfig
             config = RunConfig.from_yaml(str(config_path))
@@ -1182,29 +1207,34 @@ def main():
             if not isinstance(L, int):
                 L = L[0]
             q = config.net_config.get("category", 2)
+            model_type = config.net_config.get("model_type", "")
         else:
             L = 16
 
-        Tc, _ = get_critical_temperature_from_q(q)
+        if model_type == "clock":
+            from clock import CLOCK_TC
+            Tc = CLOCK_TC.get(q, 0.89)
+        else:
+            Tc, _ = get_critical_temperature_from_q(q)
 
         figs_dir = Path(f"figs/{csv_path.parent.name}")
         figs_dir.mkdir(parents=True, exist_ok=True)
 
-        fig_path = plot_rank_vs_temperature(df, L, figs_dir, Tc=Tc, q=q)
+        fig_path = plot_rank_vs_temperature(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
         console.print(f"[green]Main plot:[/green] {fig_path}")
 
-        fig_path = plot_derank_dt(df, L, figs_dir, Tc=Tc, q=q)
+        fig_path = plot_derank_dt(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
         console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
-        ext_path = plot_extended_metrics(df, L, figs_dir, Tc=Tc, q=q)
+        ext_path = plot_extended_metrics(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
         if ext_path:
             console.print(f"[green]Extended metrics plot:[/green] {ext_path}")
 
-        uni_path = plot_unified_framework(df, L, figs_dir, Tc=Tc, q=q)
+        uni_path = plot_unified_framework(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
         if uni_path:
             console.print(f"[green]Unified framework plot:[/green] {uni_path}")
 
-        mp_path = plot_mp_outliers(df, L, figs_dir, Tc=Tc, q=q)
+        mp_path = plot_mp_outliers(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
         if mp_path:
             console.print(f"[green]MP outlier plot:[/green] {mp_path}")
 
@@ -1223,8 +1253,15 @@ def main():
     model.eval()
 
     # Determine model type and critical temperature
+    net_config = config.net_config if hasattr(config, 'net_config') else {}
+    model_type = net_config.get("model_type", "")
     Tc, q = get_critical_temperature(config)
-    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    if q == 2:
+        model_label = "2D Ising"
+    elif model_type == "clock":
+        model_label = f"{q}-state Clock"
+    else:
+        model_label = f"{q}-state Potts"
     console.print(f"Model type: {model_label}")
     console.print(f"Critical Temperature: Tc = {Tc:.4f}")
 
@@ -1288,24 +1325,24 @@ def main():
     # ── Phase 2: Plots ──
     console.print("\n[bold cyan]Phase 2: Generating plots[/bold cyan]")
 
-    fig_path = plot_derank_dt(df, L, figs_dir, suffix=f"_{mode_tag}" if mode_tag != "full" else "", Tc=Tc, q=q)
+    fig_path = plot_derank_dt(df, L, figs_dir, suffix=f"_{mode_tag}" if mode_tag != "full" else "", Tc=Tc, q=q, model_type=model_type)
     console.print(f"[green]d(eRank)/dT plot:[/green] {fig_path}")
 
-    ext_path = plot_extended_metrics(df, L, figs_dir, Tc=Tc, q=q)
+    ext_path = plot_extended_metrics(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
     if ext_path:
         console.print(f"[green]Extended metrics plot:[/green] {ext_path}")
 
-    uni_path = plot_unified_framework(df, L, figs_dir, Tc=Tc, q=q)
+    uni_path = plot_unified_framework(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
     if uni_path:
         console.print(f"[green]Unified framework plot:[/green] {uni_path}")
 
-    mp_path = plot_mp_outliers(df, L, figs_dir, Tc=Tc, q=q)
+    mp_path = plot_mp_outliers(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
     if mp_path:
         console.print(f"[green]MP outlier plot:[/green] {mp_path}")
 
     if mode_tag != "critical":
         # Full/quick mode: also generate 3x2 overview and scree plots
-        fig_path = plot_rank_vs_temperature(df, L, figs_dir, Tc=Tc, q=q)
+        fig_path = plot_rank_vs_temperature(df, L, figs_dir, Tc=Tc, q=q, model_type=model_type)
         console.print(f"[green]Main plot:[/green] {fig_path}")
 
         # Select 3 representative temperatures for scree plots

@@ -283,7 +283,7 @@ def run_entanglement_analysis(
 # ──────────────────────────────────────────────────────────────
 
 
-def plot_entanglement_entropy(df, L, figs_dir, q=2, Tc=None):
+def plot_entanglement_entropy(df, L, figs_dir, q=2, Tc=None, model_type=""):
     """
     Publication figure for entanglement entropy (Result 2).
 
@@ -374,7 +374,7 @@ def plot_entanglement_entropy(df, L, figs_dir, q=2, Tc=None):
     ax2.grid(True, alpha=0.15)
     ax2.set_ylim(-0.5, max(3.0, 2 * c_exact if c_exact else 3.0))
 
-    model_label = "Ising" if q == 2 else f"{q}-Potts"
+    model_label = "Ising" if q == 2 else (f"{q}-Clock" if model_type == "clock" else f"{q}-Potts")
     fig.suptitle(
         f"Neural Entanglement Entropy: {model_label} ($L={L}$)",
         fontsize=14, fontweight="bold",
@@ -420,8 +420,15 @@ def main():
     model = model.to(device)
     model.eval()
 
+    net_config = config.net_config if hasattr(config, 'net_config') else {}
+    model_type = net_config.get("model_type", "")
     Tc, q = get_critical_temperature(config)
-    model_label = "2D Ising" if q == 2 else f"{q}-state Potts"
+    if q == 2:
+        model_label = "2D Ising"
+    elif model_type == "clock":
+        model_label = f"{q}-state Clock"
+    else:
+        model_label = f"{q}-state Potts"
     console.print(f"Model type: {model_label}, Tc = {Tc:.4f}")
 
     if hasattr(model, 'use_pytorch_mhc'):
@@ -462,7 +469,7 @@ def main():
     figs_dir = Path(f"figs/{group_name}")
     figs_dir.mkdir(parents=True, exist_ok=True)
 
-    fig_path = plot_entanglement_entropy(df, L, figs_dir, q=q, Tc=Tc)
+    fig_path = plot_entanglement_entropy(df, L, figs_dir, q=q, Tc=Tc, model_type=model_type)
     console.print(f"[green]Entanglement plot:[/green] {fig_path}")
 
     # Summary

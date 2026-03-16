@@ -31,6 +31,7 @@ from rich.console import Console
 import argparse
 
 from potts_exact_partition import POTTS_TC
+from clock import CLOCK_TC
 
 
 # ──────────────────────────────────────────────────────────────
@@ -194,8 +195,8 @@ def bootstrap_exponent(df, Tc, side="both", n_bootstrap=1000, t_min=0.05, t_max=
 # ──────────────────────────────────────────────────────────────
 
 
-MODEL_COLORS = {2: "#1f77b4", 3: "#ff7f0e", 4: "#2ca02c"}
-MODEL_LABELS = {2: "Ising ($q=2$)", 3: "3-Potts ($q=3$)", 4: "4-Potts ($q=4$)"}
+MODEL_COLORS = {2: "#1f77b4", 3: "#ff7f0e", 4: "#2ca02c", 12: "#d62728", 36: "#9467bd"}
+MODEL_LABELS = {2: "Ising ($q=2$)", 3: "3-Potts ($q=3$)", 4: "4-Potts ($q=4$)", 12: "12-Clock ($q=12$)", 36: "36-Clock ($q=36$)"}
 
 
 def plot_rank_exponent(results_dict, figs_dir):
@@ -340,8 +341,12 @@ def main():
             console.print(f"[red]CSV not found:[/red] {csv_path}")
             continue
 
-        Tc = POTTS_TC[q]
-        console.print(f"\n[bold]{MODEL_LABELS[q]}:[/bold] Tc = {Tc:.4f}")
+        if q in POTTS_TC:
+            Tc = POTTS_TC[q]
+        else:
+            Tc = CLOCK_TC.get(q, 0.89)
+        model_label = MODEL_LABELS.get(q, f"{q}-state model")
+        console.print(f"\n[bold]{model_label}:[/bold] Tc = {Tc:.4f}")
 
         df = pd.read_csv(csv_path)
         console.print(f"  Loaded {len(df)} rows, {df['T'].nunique()} temperatures")

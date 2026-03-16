@@ -25,6 +25,11 @@ def is_potts_model(net_config: dict) -> bool:
     return net_config.get("category", 2) > 2
 
 
+def is_clock_model(net_config: dict) -> bool:
+    """Check if the model is for q-state clock model (cosine interaction)."""
+    return net_config.get("model_type", "") == "clock"
+
+
 def create_adjacency_matrix(L, d=2):
     """
     Create adjacency matrix for a d-dimensional hypercube lattice with periodic boundary conditions.
@@ -191,9 +196,10 @@ def main():
     num_beta = net_config.get("num_beta", 8)
     fix_first = net_config.get("fix_first", None)
 
-    # Detect model type (XY vs Potts vs Ising)
+    # Detect model type (XY vs Clock vs Potts vs Ising)
     use_xy = is_xy_model(base_config.net)
-    use_potts = is_potts_model(net_config)
+    use_clock = is_clock_model(net_config)
+    use_potts = is_potts_model(net_config) and not use_clock
 
     if use_xy:
         # XY Model: continuous angles
@@ -229,6 +235,42 @@ def main():
         # Attach validation betas (no exact logZ for XY)
         energy_fn.fixed_val_betas = fixed_val_betas.tolist()
         energy_fn.exact_logz_values = None  # No exact solution for XY
+        print()
+
+    elif use_clock:
+        # q-state Clock Model: discrete cosine interaction
+        q = net_config["category"]
+        from clock import create_clock_energy_fn, CLOCK_TC
+        from util import generate_fixed_betas
+
+        energy_fn = create_clock_energy_fn(L=L, q=q, d=2, device=base_config.device)
+        T_BKT = CLOCK_TC.get(q, 0.89)
+
+        # Validation beta range
+        val_beta_min = 0.3
+        val_beta_max = 3.0
+        val_num_beta = 8
+        fixed_val_betas = generate_fixed_betas(val_beta_min, val_beta_max, val_num_beta)
+
+        print(f"\n[{q}-state Clock Model] No exact partition function (BKT-like transition)")
+        print(f"Training beta range: [{train_beta_min:.3f}, {train_beta_max:.3f}]")
+        print(f"Validation beta range: [{val_beta_min:.3f}, {val_beta_max:.3f}]")
+        print(f"BKT transition: T_BKT ≈ {T_BKT:.3f} (β_BKT ≈ {1.0/T_BKT:.3f})")
+
+        # Try to load MCMC reference data if available
+        import os
+        ref_path = f"refs/clock{q}_L{L}.pt"
+        if os.path.exists(ref_path):
+            mcmc_ref = torch.load(ref_path)
+            energy_fn.mcmc_reference = mcmc_ref
+            print(f"Loaded MCMC reference data from {ref_path}")
+        else:
+            energy_fn.mcmc_reference = None
+            print(f"No MCMC reference data at {ref_path} (run generate_clock_reference.py)")
+
+        energy_fn.fixed_val_betas = fixed_val_betas.tolist()
+        energy_fn.exact_logz_values = None
+        energy_fn.critical_temperature = T_BKT
         print()
 
     elif use_potts:

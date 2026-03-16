@@ -1,0 +1,93 @@
+# v0.24 LatticeGPT for 36-state Clock Model
+#
+# q=36 Clock model: E = -J * Σ cos(2π(s_i - s_j)/36)
+# BKT transition: T_BKT ≈ 0.89 (essentially XY limit)
+# CFT central charge: c = 1 (free boson)
+#
+# Based on v0.21 LatticeGPT best (Ising HPO trial 62).
+# Key adaptations:
+#   - category=36, model_type=clock → cosine energy, not Potts
+#   - circular_embedding=true → (cos,sin) projection preserves Z_q topology
+#   - fix_first=0 (clock state 0), beta range [0.5, 3.0]
+#   - Adaptive sampling for automatic focus on BKT region
+
+project: Ising_VaTD_v0.24
+device: cuda:0
+net: model_transformer.LatticeGPT
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 512
+seeds: [42]
+
+net_config:
+  # Lattice configuration
+  size: 16
+  fix_first: 0           # Z_q symmetry breaking: fix first spin to state 0
+  category: 36            # 36-state clock (near XY limit)
+  model_type: clock       # CRITICAL: routes to clock energy, not Potts
+
+  # Temperature sampling configuration
+  # T_BKT ≈ 0.89, β range [0.5, 3.0] covers T ∈ [0.33, 2.0]
+  batch_size: 512
+  num_beta: 8
+  beta_min: 0.5
+  beta_max: 3.0
+
+  # Training Mode: Sequential with gradient accumulation
+  training_mode: sequential
+  accumulation_steps: 16
+
+  # MCMC: DISABLED (pure REINFORCE)
+  mcmc_enabled: false
+
+  # CUDA backend
+  cudnn_benchmark: true
+
+  # Curriculum: DISABLED (using adaptive sampling instead)
+  curriculum_enabled: false
+
+  # Transformer architecture (same as Ising HPO best)
+  d_model: 128
+  n_heads: 4
+  n_layers: 2
+  d_ff: 512
+  cond_dim: 32
+  dropout: 0.0
+
+  # Circular embedding for clock model topology
+  circular_embedding: true
+
+  # 2D Periodic Relative Position Bias
+  use_rel_pos_bias: true
+
+  # AMP (bfloat16)
+  use_amp: true
+
+  # Temperature-dependent Output Scaling
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+  # Zero-Variance Effective Action Loss
+  alpha_zv: 0.05
+
+  # Variance-Based Adaptive Temperature Sampling
+  adaptive_sampling_enabled: true
+  adaptive_sampling_warmup: 20
+  adaptive_sampling_num_bins: 32
+  adaptive_sampling_kappa: 1.0
+  adaptive_sampling_epsilon: 1.0e-6
+  adaptive_sampling_momentum: 0.95
+
+optimizer_config:
+  lr: 3.e-4
+  weight_decay: 1.e-2
+
+scheduler_config:
+  upper_bound: 350
+  max_iter: 300
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

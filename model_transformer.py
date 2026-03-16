@@ -90,6 +90,9 @@ class CausalTransformerBlock(nn.Module):
     When ``attn_bias`` is provided, SDPA falls back to the math kernel
     (no FlashAttention); without bias, FlashAttention is used via
     ``is_causal=True``.
+
+    Set ``_capture_attention = True`` to store per-head attention weights
+    in ``_attention_weights`` (for analysis, not training).
     """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, cond_dim: int,
@@ -106,6 +109,10 @@ class CausalTransformerBlock(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
         self.attn_dropout = dropout
+
+        # Attention capture for analysis
+        self._capture_attention = False
+        self._attention_weights = None
 
         self.adaln2 = AdaLN(d_model, cond_dim)
         self.ffn = nn.Sequential(
@@ -154,7 +161,22 @@ class CausalTransformerBlock(nn.Module):
         # Compute attention
         drop_p = self.attn_dropout if self.training else 0.0
 
-        if past_kv is None and attn_bias is None:
+        if self._capture_attention and past_kv is None:
+            # Explicit attention computation for analysis
+            L_q, L_k = q.shape[2], k.shape[2]
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            # Causal mask
+            causal = torch.full(
+                (L_q, L_k), float('-inf'), device=q.device, dtype=q.dtype
+            )
+            causal = torch.triu(causal, diagonal=1)
+            scores = scores + causal.unsqueeze(0)  # broadcast over batch & heads
+            if attn_bias is not None:
+                scores = scores + attn_bias  # [n_heads, L, L]
+            attn_weights = torch.softmax(scores, dim=-1)  # [B, n_heads, L, L]
+            self._attention_weights = attn_weights.detach()
+            attn_out = torch.matmul(attn_weights, v)
+        elif past_kv is None and attn_bias is None:
             # Full sequence, no bias → FlashAttention via is_causal
             attn_out = _sdpa(q, k, v, is_causal=True, dropout_p=drop_p)
         else:
@@ -303,6 +325,15 @@ class LatticeGPT(nn.Module):
         # ── Token embedding ──
         self.tok_embed = nn.Embedding(self.category, self._d_model)
 
+        # ── Circular embedding (optional, for clock model) ──
+        self.circular_embedding = hparams.get("circular_embedding", False)
+        if self.circular_embedding:
+            self.register_buffer(
+                "_circ_angles",
+                2.0 * torch.pi * torch.arange(self.category, dtype=torch.float32) / self.category
+            )
+            self.circ_proj = nn.Linear(2, self._d_model)
+
         # ── 2D Relative Position Bias (optional, periodic for PBC) ──
         self.use_rel_pos_bias = hparams.get("use_rel_pos_bias", False)
         self.drop_abs_pos_when_rel = hparams.get("drop_abs_pos_when_rel", False)
@@ -362,6 +393,14 @@ class LatticeGPT(nn.Module):
         self.output_head = nn.Linear(self._d_model, self.category)
 
         self.to(device)
+
+    def _embed_tokens(self, tokens):
+        """Embed tokens with optional circular structure for clock model."""
+        if self.circular_embedding:
+            angles = self._circ_angles[tokens]  # [..., ]
+            circ = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)  # [..., 2]
+            return self.circ_proj(circ)  # [..., d_model]
+        return self.tok_embed(tokens)
 
     def _get_rel_pos_bias(self, query_len, kv_len=None):
         """
@@ -449,7 +488,7 @@ class LatticeGPT(nn.Module):
 
         # Shift right: prepend a learned "start" token (use zeros)
         # Position 0 gets zero embedding, position i gets token i-1
-        tok_emb = self.tok_embed(tokens)  # [B, L, d_model]
+        tok_emb = self._embed_tokens(tokens)  # [B, L, d_model]
         # Shift: drop last, prepend zeros
         zero_start = torch.zeros(B, 1, tok_emb.shape[-1], device=tok_emb.device)
         tok_emb = torch.cat([zero_start, tok_emb[:, :-1, :]], dim=1)  # [B, L, d_model]
@@ -523,7 +562,7 @@ class LatticeGPT(nn.Module):
             # Positions 0..start_pos-1 are fixed; build their shifted input
             # For pos 0: zero embedding, for pos k: embed(token[k-1])
             prefill_len = start_pos
-            tok_emb = self.tok_embed(tokens[:, :prefill_len])  # [B, prefill_len, d]
+            tok_emb = self._embed_tokens(tokens[:, :prefill_len])  # [B, prefill_len, d]
             zero_start = torch.zeros(batch_size, 1, self._d_model, device=self.device)
             if prefill_len > 1:
                 shifted = torch.cat([zero_start, tok_emb[:, :-1, :]], dim=1)
@@ -542,7 +581,7 @@ class LatticeGPT(nn.Module):
                 # First position: zero embedding
                 x_i = torch.zeros(batch_size, 1, self._d_model, device=self.device)
             else:
-                x_i = self.tok_embed(tokens[:, i-1]).unsqueeze(1)  # [B, 1, d_model]
+                x_i = self._embed_tokens(tokens[:, i-1]).unsqueeze(1)  # [B, 1, d_model]
 
             x_i = x_i + self.pos_embed[i:i+1]  # [B, 1, d_model]
 

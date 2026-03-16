@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for server
 
 from config import RunConfig
-from ising import swendsen_wang_update, mcmc_update  # MCMC methods
+from ising import swendsen_wang_update, mcmc_update as ising_mcmc_update  # MCMC methods
 
 import random
 import os
@@ -905,10 +905,19 @@ class Trainer:
                         # Shape: (num_beta * batch_size, 1, H, W)
                         total_buffer_size = num_beta * batch_size
                         H, W = self.model.size
-                        self.mcmc_buffer = torch.randint(
-                            0, 2, (total_buffer_size, 1, H, W), 
-                            device=self.device
-                        ).float() * 2 - 1
+                        # Determine model type for correct initialization
+                        model_type = getattr(self.energy_fn, 'model_type', 'ising')
+                        if model_type in ('clock', 'potts'):
+                            q = getattr(self.energy_fn, 'q', 2)
+                            self.mcmc_buffer = torch.randint(
+                                0, q, (total_buffer_size, 1, H, W),
+                                device=self.device
+                            ).float()
+                        else:
+                            self.mcmc_buffer = torch.randint(
+                                0, 2, (total_buffer_size, 1, H, W),
+                                device=self.device
+                            ).float() * 2 - 1
                         
                         # Fix first spin if needed
                         if self.model.fix_first is not None:
@@ -921,12 +930,28 @@ class Trainer:
                     # Update buffer with Swendsen-Wang
                     # We run this on the *persistent* buffer
                     fix_first_flag = (self.model.fix_first is not None)
-                    self.mcmc_buffer = mcmc_update(
-                        self.mcmc_buffer, T_buffer,
-                        n_sw_sweeps=self.mcmc_sw_sweeps,
-                        n_mh_steps=self.mcmc_mh_steps,
-                        fix_first=fix_first_flag
-                    )
+                    model_type = getattr(self.energy_fn, 'model_type', 'ising')
+                    if model_type == 'clock':
+                        from clock import mcmc_clock_update
+                        q = getattr(self.energy_fn, 'q', 36)
+                        self.mcmc_buffer = mcmc_clock_update(
+                            self.mcmc_buffer, T_buffer, q=q,
+                            fix_first=fix_first_flag
+                        )
+                    elif model_type == 'potts':
+                        from potts import mcmc_potts_update
+                        q = getattr(self.energy_fn, 'q', 3)
+                        self.mcmc_buffer = mcmc_potts_update(
+                            self.mcmc_buffer, T_buffer, q=q,
+                            fix_first=fix_first_flag
+                        )
+                    else:
+                        self.mcmc_buffer = ising_mcmc_update(
+                            self.mcmc_buffer, T_buffer,
+                            n_sw_sweeps=self.mcmc_sw_sweeps,
+                            n_mh_steps=self.mcmc_mh_steps,
+                            fix_first=fix_first_flag
+                        )
                     
                     # Get targets from buffer
                     mcmc_targets = self.mcmc_buffer.clone()

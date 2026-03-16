@@ -110,14 +110,18 @@ def load_per_layer_erank_min(csv_path, Tc):
 
 
 MODEL_COLORS = {
-    2: "#1f77b4",  # Blue for Ising
-    3: "#ff7f0e",  # Orange for 3-Potts
-    4: "#2ca02c",  # Green for 4-Potts
+    2: "#1f77b4",   # Blue for Ising
+    3: "#ff7f0e",   # Orange for 3-Potts
+    4: "#2ca02c",   # Green for 4-Potts
+    12: "#d62728",  # Red for 12-Clock
+    36: "#9467bd",  # Purple for 36-Clock
 }
 MODEL_LABELS = {
     2: "Ising ($q=2$)",
     3: "3-Potts ($q=3$)",
     4: "4-Potts ($q=4$)",
+    12: "12-Clock ($q=12$)",
+    36: "36-Clock ($q=36$)",
 }
 
 
