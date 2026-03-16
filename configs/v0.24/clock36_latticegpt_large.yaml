@@ -1,0 +1,74 @@
+# v0.24 LatticeGPT Large for 36-state Clock Model
+#
+# q=36 Clock model: E = -J * Σ cos(2π(s_i - s_j)/36)
+# BKT transition: T_BKT ≈ 0.89
+#
+# Larger architecture to improve high-T disordered phase learning.
+# Baseline (clock36_latticegpt.yaml): 2 layers, d=128, 474K params — poor at T>1.
+# This config: 4 layers, d=192, ~1.9M params — 4× capacity.
+#
+# batch=256, accum=32 → 256×8×32 = 65K effective samples/epoch (same throughput)
+
+project: Clock_VaTD_v0.24
+device: cuda:0
+net: model_transformer.LatticeGPT
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 256
+seeds: [42]
+
+net_config:
+  size: 16
+  fix_first: 0
+  category: 36
+  model_type: clock
+
+  batch_size: 256
+  num_beta: 8
+  beta_min: 0.5
+  beta_max: 3.0
+
+  training_mode: sequential
+  accumulation_steps: 32
+
+  mcmc_enabled: false
+  cudnn_benchmark: true
+  curriculum_enabled: false
+
+  # Larger Transformer: 4 layers, d_model=192
+  d_model: 192
+  n_heads: 6
+  n_layers: 4
+  d_ff: 768
+  cond_dim: 64
+  dropout: 0.0
+
+  circular_embedding: true
+  use_rel_pos_bias: true
+  use_amp: true
+
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+  alpha_zv: 0.05
+
+  adaptive_sampling_enabled: true
+  adaptive_sampling_warmup: 20
+  adaptive_sampling_num_bins: 32
+  adaptive_sampling_kappa: 1.0
+  adaptive_sampling_epsilon: 1.0e-6
+  adaptive_sampling_momentum: 0.95
+
+optimizer_config:
+  lr: 2.e-4
+  weight_decay: 1.e-2
+
+scheduler_config:
+  upper_bound: 350
+  max_iter: 300
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false
