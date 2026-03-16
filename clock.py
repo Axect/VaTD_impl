@@ -431,12 +431,17 @@ def compute_helicity_modulus(
     e_x = J * torch.cos(diff_x)  # (B, H, W)
     j_x = J * torch.sin(diff_x)  # (B, H, W)
 
-    # Average over sites and batch
-    e_x_mean = e_x.sum(dim=[-1, -2]).mean() / N  # scalar
-    j_x_sq_mean = (j_x ** 2).sum(dim=[-1, -2]).mean() / N  # scalar
+    # Per-site average of cosine term
+    e_x_mean = e_x.sum(dim=[-1, -2]).mean() / N  # (J/N)⟨Σ cos(Δθ)⟩
+
+    # Total current per sample, then variance
+    # Υ = (1/N)[⟨Σ e_x⟩ - β·Var(Σ j_x)]
+    # Key: (Σ sin)² not Σ sin², the former is the square of the total current
+    j_x_total = j_x.sum(dim=[-1, -2])  # (B,) total current per sample
+    j_x_total_sq = (j_x_total ** 2).mean()  # ⟨(Σ J·sin(Δθ))²⟩
 
     beta = 1.0 / T.mean()
-    upsilon = e_x_mean - beta * j_x_sq_mean * N  # extensive j_x² needs N factor
+    upsilon = e_x_mean - beta * j_x_total_sq / N
 
     return upsilon.item()
 
