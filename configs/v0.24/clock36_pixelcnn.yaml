@@ -12,7 +12,7 @@ net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
 scheduler: hyperbolic_lr.ExpHyperbolicLR
 epochs: 300
-batch_size: 2048
+batch_size: 512
 seeds: [42]
 
 net_config:
@@ -24,7 +24,7 @@ net_config:
 
   # Temperature sampling configuration
   # T_BKT ≈ 0.89, β range [0.5, 3.0] covers T ∈ [0.33, 2.0]
-  batch_size: 2048
+  batch_size: 512
   num_beta: 8
   beta_min: 0.5
   beta_max: 3.0
