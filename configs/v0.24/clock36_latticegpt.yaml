@@ -11,7 +11,7 @@
 #   - fix_first=0 (clock state 0), beta range [0.5, 3.0]
 #   - Adaptive sampling for automatic focus on BKT region
 
-project: Ising_VaTD_v0.24
+project: Clock_VaTD_v0.24
 device: cuda:0
 net: model_transformer.LatticeGPT
 optimizer: torch.optim.AdamW

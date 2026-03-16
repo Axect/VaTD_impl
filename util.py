@@ -70,21 +70,45 @@ def sign_log_transform(x):
     return sign * math.log10(1 + abs(x))
 
 
-def create_sample_grid(model, betas, n_samples=4, device="cpu"):
+def create_sample_grid(model, betas, n_samples=4, device="cpu", energy_fn=None):
     """
-    Generate and visualize Ising model samples at different temperatures.
+    Generate and visualize lattice model samples at different temperatures.
+
+    Automatically selects colormap based on model type:
+      - Ising (category=2): coolwarm (blue=−1, red=+1)
+      - Potts (category>2, no model_type): discrete qualitative (tab10/tab20)
+      - Clock (model_type="clock"): cyclic HSV colormap (angle → hue)
 
     Args:
-        model: DiscretePixelCNN model
+        model: autoregressive lattice model
         betas: tensor of beta values (1/T)
         n_samples: number of samples per temperature
         device: torch device
+        energy_fn: optional, used to detect model_type
 
     Returns:
         matplotlib figure
     """
     model.eval()
     n_temps = len(betas)
+
+    # Detect model type for visualization
+    model_type = getattr(energy_fn, 'model_type', None) if energy_fn else None
+    category = getattr(model, 'category', 2)
+
+    # Choose colormap and normalization
+    if model_type == "clock":
+        cmap = "hsv"
+        vmin, vmax = 0, category
+        title = f"{category}-Clock Samples (hue = angle)"
+    elif category > 2:
+        cmap = "tab10" if category <= 10 else "tab20"
+        vmin, vmax = 0, category - 1
+        title = f"{category}-Potts Samples"
+    else:
+        cmap = "coolwarm"
+        vmin, vmax = -1, 1
+        title = "Ising Samples (blue=−1, red=+1)"
 
     # Extra width for temperature labels
     fig, axes = plt.subplots(
@@ -103,7 +127,8 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu"):
 
             for j in range(n_samples):
                 sample = samples[j, 0].cpu().numpy()  # (H, W)
-                axes[i, j].imshow(sample, cmap="coolwarm", vmin=-1, vmax=1)
+                axes[i, j].imshow(sample, cmap=cmap, vmin=vmin, vmax=vmax,
+                                  interpolation="nearest")
                 axes[i, j].set_xticks([])
                 axes[i, j].set_yticks([])
 
@@ -118,7 +143,7 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu"):
                         labelpad=10,
                     )
 
-    plt.suptitle("Ising Samples (blue=−1, red=+1)", fontsize=12)
+    plt.suptitle(title, fontsize=12)
     plt.tight_layout()
     return fig
 
@@ -335,6 +360,9 @@ class Trainer:
             self.fixed_val_betas = generate_fixed_betas(
                 model.beta_min, model.beta_max, model.num_beta
             ).to(device)
+
+        # Store energy function reference (for MCMC dispatch and visualization)
+        self.energy_fn = energy_fn
 
         # Store exact partition function values for validation (if available)
         if energy_fn is not None:
@@ -1333,7 +1361,8 @@ class Trainer:
                     # Use a subset of validation betas for visualization
                     vis_betas = self.fixed_val_betas[::2]  # Every other beta
                     fig = create_sample_grid(
-                        self.model, vis_betas, n_samples=4, device=self.device
+                        self.model, vis_betas, n_samples=4, device=self.device,
+                        energy_fn=self.energy_fn,
                     )
                     log_dict["samples"] = wandb.Image(fig)
                     plt.close(fig)

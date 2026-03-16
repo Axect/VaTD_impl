@@ -6,7 +6,7 @@
 #
 # Smoke test configuration: smaller batch, fewer epochs.
 
-project: Ising_VaTD_v0.24
+project: Clock_VaTD_v0.24
 device: cuda:0
 net: model.DiscretePixelCNN
 optimizer: torch.optim.AdamW
