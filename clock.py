@@ -256,8 +256,9 @@ def overrelaxation_clock_update(
             new_angle = 2.0 * h_angle - current_angles
 
             # Snap to nearest clock state
-            new_state = torch.round(new_angle / angle_step) % q
-            new_state = new_state.long()
+            # Note: must use .long() before % to get Python-style modulo (non-negative)
+            # Float % uses fmod which gives negative results for negative inputs
+            new_state = torch.round(new_angle / angle_step).long() % q
 
             update_mask = mask & ~fixed_mask
             improved[:, 0] = torch.where(update_mask, new_state, spins)
@@ -353,35 +354,35 @@ def mcmc_clock_update(
     samples: torch.Tensor,
     T: torch.Tensor,
     q: int,
-    n_wolff_clusters: int = 5,
+    n_mh_steps: int = 5,
     n_or_sweeps: int = 2,
-    n_mh_steps: int = 0,
+    n_wolff_clusters: int = 0,
     fix_first: bool = True,
     J: float = 1.0,
 ) -> torch.Tensor:
     """
-    Combined MCMC update for the clock model: Wolff + overrelaxation + optional MH.
+    Combined MCMC update for the clock model: MH + overrelaxation + optional Wolff.
 
-    The recommended update sequence combines the non-local cluster moves of
-    Wolff (which eliminate critical slowing down) with microcanonical
-    overrelaxation (which efficiently explores constant-energy surfaces).
-    Optional MH steps provide exact detailed balance.
+    Primary: Metropolis-Hastings (checkerboard-parallel, reliable for all q).
+    Secondary: Overrelaxation (energy-preserving, accelerates mixing near equilibrium).
+    Optional: Wolff cluster (effective for small q but inefficient for large q
+    due to small clusters in random configurations).
 
     Args:
         samples: Input samples (B, 1, H, W) with values in {0, ..., q-1}
         T: Temperature values (B,)
         q: Number of clock states
-        n_wolff_clusters: Number of Wolff cluster updates per sample
+        n_mh_steps: Number of Metropolis-Hastings sweeps (primary)
         n_or_sweeps: Number of overrelaxation sweep pairs
-        n_mh_steps: Number of Metropolis-Hastings sweeps (0 = skip)
+        n_wolff_clusters: Number of Wolff cluster updates (0 = skip)
         fix_first: Whether to fix the first spin (0,0)
         J: Coupling constant
 
     Returns:
         Equilibrated samples (B, 1, H, W) with values in {0, ..., q-1}
     """
-    improved = wolff_clock_update(
-        samples, T, q, n_clusters=n_wolff_clusters, fix_first=fix_first, J=J
+    improved = metropolis_clock_update(
+        samples, T, q, n_steps=n_mh_steps, fix_first=fix_first, J=J
     )
 
     if n_or_sweeps > 0:
@@ -389,9 +390,9 @@ def mcmc_clock_update(
             improved, T, q, n_sweeps=n_or_sweeps, fix_first=fix_first, J=J
         )
 
-    if n_mh_steps > 0:
-        improved = metropolis_clock_update(
-            improved, T, q, n_steps=n_mh_steps, fix_first=fix_first, J=J
+    if n_wolff_clusters > 0:
+        improved = wolff_clock_update(
+            improved, T, q, n_clusters=n_wolff_clusters, fix_first=fix_first, J=J
         )
 
     return improved
