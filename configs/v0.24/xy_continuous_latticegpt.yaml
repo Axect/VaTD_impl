@@ -1,0 +1,79 @@
+# v0.24 ContinuousLatticeGPT for 2D XY Model
+#
+# Continuous angles θ ∈ [-π, π] with von Mises mixture output.
+# Energy: E = -J * Σ cos(θ_i - θ_j)
+# BKT transition: T_BKT ≈ 0.89
+#
+# No discretization artifact — faithful XY model representation.
+# Uses 8-component von Mises mixture per site for flexible density.
+
+project: XY_VaTD_v0.24
+device: cuda:0
+net: model_transformer.ContinuousLatticeGPT
+optimizer: torch.optim.AdamW
+scheduler: hyperbolic_lr.ExpHyperbolicLR
+epochs: 300
+batch_size: 256
+seeds: [42]
+
+net_config:
+  size: 16
+  fix_first: 0.0  # fix first spin angle to 0
+  category: continuous  # marker for XY routing
+
+  batch_size: 256
+  num_beta: 8
+  beta_min: 0.5
+  beta_max: 3.0
+
+  training_mode: sequential
+  accumulation_steps: 32
+
+  mcmc_enabled: false
+  cudnn_benchmark: true
+  curriculum_enabled: false
+
+  # Transformer architecture (same as GPT Large)
+  d_model: 192
+  n_heads: 6
+  n_layers: 4
+  d_ff: 768
+  cond_dim: 64
+  dropout: 0.0
+
+  # Von Mises mixture: 8 components per site
+  n_mix: 8
+
+  # 2D Periodic Relative Position Bias
+  use_rel_pos_bias: true
+
+  # AMP
+  use_amp: true
+
+  # Temperature-dependent concentration scaling
+  logit_temp_scale: true
+  temp_scale_min: 0.1
+  temp_scale_max: 2.0
+
+  # Zero-Variance Effective Action Loss
+  alpha_zv: 0.05
+
+  # Adaptive temperature sampling
+  adaptive_sampling_enabled: true
+  adaptive_sampling_warmup: 20
+  adaptive_sampling_num_bins: 32
+  adaptive_sampling_kappa: 1.0
+  adaptive_sampling_epsilon: 1.0e-6
+  adaptive_sampling_momentum: 0.95
+
+optimizer_config:
+  lr: 2.e-4
+  weight_decay: 1.e-2
+
+scheduler_config:
+  upper_bound: 350
+  max_iter: 300
+  infimum_lr: 1.e-6
+
+early_stopping_config:
+  enabled: false

@@ -21,6 +21,8 @@ Interface is identical to DiscretePixelCNN:
   log_prob(sample, T)   → [B, 1]
 """
 
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -657,3 +659,426 @@ class LatticeGPT(nn.Module):
 
 # Backward-compatible alias (configs saved as model_transformer.SpinGPT)
 SpinGPT = LatticeGPT
+
+
+# ──────────────────────────────────────────────────────────────
+# Von Mises Mixture utilities
+# ──────────────────────────────────────────────────────────────
+
+
+def _log_von_mises(theta, mu, kappa):
+    """
+    Log density of the von Mises distribution.
+
+    p(θ | μ, κ) = exp(κ cos(θ - μ)) / (2π I₀(κ))
+
+    Args:
+        theta: [...] angles
+        mu:    [...] mean directions
+        kappa: [...] concentrations (> 0)
+
+    Returns:
+        [...] log probabilities
+    """
+    return kappa * torch.cos(theta - mu) - math.log(2 * math.pi) - torch.log(torch.i0(kappa))
+
+
+def _sample_von_mises(mu, kappa, shape=None):
+    """
+    Sample from von Mises distribution using Best-Fisher algorithm.
+
+    Efficient rejection sampling that works well for all κ ≥ 0.
+
+    Args:
+        mu:    [...] mean directions
+        kappa: [...] concentrations
+        shape: optional output shape (defaults to mu.shape)
+
+    Returns:
+        [...] sampled angles in [-π, π]
+    """
+    if shape is None:
+        shape = mu.shape
+    device = mu.device
+
+    # Best-Fisher algorithm
+    tau = 1.0 + torch.sqrt(1.0 + 4.0 * kappa ** 2)
+    rho = (tau - torch.sqrt(2.0 * tau)) / (2.0 * kappa + 1e-8)
+    r = (1.0 + rho ** 2) / (2.0 * rho + 1e-8)
+
+    # Rejection sampling (vectorized with loop for rejects)
+    samples = torch.zeros(shape, device=device)
+    done = torch.zeros(shape, dtype=torch.bool, device=device)
+
+    for _ in range(100):  # max iterations
+        if done.all():
+            break
+
+        u1 = torch.rand(shape, device=device)
+        u2 = torch.rand(shape, device=device)
+
+        z = torch.cos(math.pi * u1)
+        f = (1.0 + r * z) / (r + z + 1e-8)
+        c = kappa * (r - f)
+
+        accept = (c * (2.0 - c) >= u2) | (torch.log(c / u2 + 1e-8) + 1.0 - c >= 0)
+        accept = accept & ~done
+
+        # Random sign
+        sign = torch.where(torch.rand(shape, device=device) < 0.5,
+                           torch.ones(shape, device=device),
+                           -torch.ones(shape, device=device))
+        theta = sign * torch.acos(f.clamp(-1, 1))
+
+        samples = torch.where(accept, theta + mu, samples)
+        done = done | accept
+
+    # Wrap to [-π, π]
+    samples = torch.remainder(samples + math.pi, 2 * math.pi) - math.pi
+    return samples
+
+
+# ──────────────────────────────────────────────────────────────
+# ContinuousLatticeGPT: Von Mises mixture output for XY model
+# ──────────────────────────────────────────────────────────────
+
+
+class ContinuousLatticeGPT(nn.Module):
+    """
+    Autoregressive Transformer for the 2D XY model with continuous angles.
+
+    Same Transformer backbone as LatticeGPT, but replaces the categorical
+    output head with a von Mises mixture distribution:
+
+        p(θ_i | θ_{<i}, T) = Σ_k w_k · vM(θ_i | μ_k, κ_k)
+
+    where vM is the von Mises density and K is the number of mixture
+    components (hparam `n_mix`).
+
+    Output head maps d_model → 3K values per position:
+        - K log-weights (softmax → mixture weights)
+        - K mean angles μ_k (unconstrained → atan2 for circular output)
+        - K log-concentrations (softplus → κ_k > 0)
+
+    Input: (cos θ, sin θ) → Linear(2, d_model) — natural circular embedding.
+
+    Interface:
+        sample(batch_size, T) → [B, 1, H, W]   angles in [-π, π]
+        log_prob(sample, T)   → [B, 1]
+    """
+
+    def __init__(self, hparams: dict, device: str = "cpu"):
+        super().__init__()
+        self.hparams = hparams
+        self.device = device
+
+        # ── Lattice configuration ──
+        size = hparams["size"]
+        if isinstance(size, int):
+            self.size = (size, size)
+        else:
+            self.size = tuple(size)
+        H, W = self.size
+        self.seq_len = H * W
+
+        self.channel = 1
+        self.category = "continuous"  # marker for routing
+
+        # fix_first: angle value to fix first spin (default 0.0)
+        self.fix_first = hparams.get("fix_first", 0.0)
+        self.batch_size = hparams["batch_size"]
+        self.num_beta = hparams["num_beta"]
+        self.beta_min = hparams["beta_min"]
+        self.beta_max = hparams["beta_max"]
+
+        # No state mapping needed — angles are already physical
+        self.mapping = lambda x: x
+        self.reverse_mapping = lambda x: x
+
+        # ── Training settings ──
+        self.curriculum_enabled = hparams.get("curriculum_enabled", False)
+        self.curriculum_warmup_epochs = hparams.get("curriculum_warmup_epochs", 50)
+        self.curriculum_start_beta_max = hparams.get(
+            "curriculum_start_beta_max", self.beta_min * 1.5
+        )
+        self.phase1_epochs = hparams.get("phase1_epochs", 50)
+        self.phase1_beta_max = hparams.get("phase1_beta_max", 0.35)
+        self.phase2_epochs = hparams.get("phase2_epochs", 100)
+
+        self.logit_temp_scale = hparams.get("logit_temp_scale", False)
+        self.temp_scale_min = hparams.get("temp_scale_min", 0.1)
+        self.temp_scale_max = hparams.get("temp_scale_max", 2.0)
+
+        # ── Transformer hyperparameters ──
+        self._d_model = hparams.get("d_model", 192)
+        n_heads = hparams.get("n_heads", 6)
+        n_layers = hparams.get("n_layers", 4)
+        d_ff = hparams.get("d_ff", 768)
+        cond_dim = hparams.get("cond_dim", 64)
+        dropout = hparams.get("dropout", 0.0)
+
+        # ── Von Mises mixture parameters ──
+        self.n_mix = hparams.get("n_mix", 8)  # mixture components
+
+        # ── Input embedding: (cos θ, sin θ) → d_model ──
+        self.input_proj = nn.Linear(2, self._d_model)
+
+        # ── Position embeddings ──
+        self.use_rel_pos_bias = hparams.get("use_rel_pos_bias", False)
+        self.drop_abs_pos_when_rel = hparams.get("drop_abs_pos_when_rel", False)
+
+        if self.use_rel_pos_bias and self.drop_abs_pos_when_rel:
+            self.register_buffer(
+                "pos_embed", torch.zeros(self.seq_len, self._d_model)
+            )
+        else:
+            self.pos_embed = nn.Parameter(
+                torch.randn(self.seq_len, self._d_model) * 0.02
+            )
+
+        if self.use_rel_pos_bias:
+            positions = torch.arange(self.seq_len)
+            row = positions // W
+            col = positions % W
+            abs_dr = (row.unsqueeze(0) - row.unsqueeze(1)).abs()
+            abs_dc = (col.unsqueeze(0) - col.unsqueeze(1)).abs()
+            periodic_dr = torch.min(abs_dr, H - abs_dr)
+            periodic_dc = torch.min(abs_dc, W - abs_dc)
+            max_dc = W // 2 + 1
+            rel_pos_index = periodic_dr * max_dc + periodic_dc
+            self.register_buffer("rel_pos_index", rel_pos_index)
+
+            num_rel_pos = (H // 2 + 1) * (W // 2 + 1)
+            self.rel_pos_bias_table = nn.Parameter(
+                torch.zeros(n_heads, num_rel_pos)
+            )
+            nn.init.trunc_normal_(self.rel_pos_bias_table, std=0.02)
+
+        # ── Temperature conditioning MLP ──
+        self.temp_mlp = nn.Sequential(
+            nn.Linear(1, cond_dim),
+            nn.GELU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+
+        # ── Transformer backbone (shared with LatticeGPT) ──
+        self.backbone = CausalTransformerBackbone(
+            d_model=self._d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            d_ff=d_ff,
+            cond_dim=cond_dim,
+            dropout=dropout,
+        )
+
+        # ── Von Mises mixture output head ──
+        # 3 * n_mix values per position: log_weights, mu_cos+mu_sin, log_kappa
+        self.mix_head = nn.Linear(self._d_model, 3 * self.n_mix)
+
+        self.to(device)
+
+    def _embed_angle(self, angles):
+        """
+        Embed continuous angles via (cos, sin) projection.
+
+        Args:
+            angles: [...] tensor of angles in [-π, π]
+        Returns:
+            [..., d_model] embedded representation
+        """
+        circ = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+        return self.input_proj(circ)
+
+    def _get_rel_pos_bias(self, query_len, kv_len=None):
+        """Compute relative position bias (same as LatticeGPT)."""
+        if not self.use_rel_pos_bias:
+            return None
+        if kv_len is None:
+            kv_len = query_len
+        if query_len == self.seq_len and kv_len == self.seq_len:
+            idx = self.rel_pos_index
+        else:
+            start_q = kv_len - query_len
+            idx = self.rel_pos_index[start_q:kv_len, :kv_len]
+        bias = self.rel_pos_bias_table[:, idx.reshape(-1)]
+        bias = bias.reshape(-1, query_len, kv_len)
+        return bias
+
+    def _compute_temp_scale(self, T):
+        """Temperature-dependent scaling for concentration parameters."""
+        if not self.logit_temp_scale:
+            return 1.0
+        if T.dim() == 1:
+            T = T.unsqueeze(1)
+        scale = 1.0 / T
+        scale = scale.clamp(min=self.temp_scale_min, max=self.temp_scale_max)
+        return scale.unsqueeze(-1)  # [B, 1, 1]
+
+    def _get_cond(self, T):
+        """Compute conditioning vector from temperature."""
+        if T.dim() == 1:
+            T = T.unsqueeze(1)
+        return self.temp_mlp(T)
+
+    def _decode_mix_params(self, raw, temp_scale=1.0):
+        """
+        Decode raw output into von Mises mixture parameters.
+
+        Args:
+            raw: [..., 3*K] raw output from mix_head
+            temp_scale: scalar or [..., 1] temperature scaling
+
+        Returns:
+            log_weights: [..., K] log mixture weights
+            mu:          [..., K] mean angles in [-π, π]
+            kappa:       [..., K] concentrations (> 0)
+        """
+        K = self.n_mix
+        log_w = raw[..., :K]                         # [..., K]
+        mu_raw = raw[..., K:2*K]                     # [..., K]
+        log_kappa = raw[..., 2*K:3*K]                # [..., K]
+
+        log_weights = F.log_softmax(log_w, dim=-1)
+        mu = math.pi * torch.tanh(mu_raw)            # → [-π, π]
+        kappa = F.softplus(log_kappa) * temp_scale    # > 0, scaled by 1/T
+
+        return log_weights, mu, kappa
+
+    def _forward_params(self, angles, T):
+        """
+        Compute per-position mixture parameters from angle sequence.
+
+        Shift-right: position i receives angle i-1.
+
+        Args:
+            angles: [B, L] angles in [-π, π]
+            T:      [B] temperature
+
+        Returns:
+            log_weights: [B, L, K]
+            mu:          [B, L, K]
+            kappa:       [B, L, K]
+        """
+        B, L = angles.shape
+
+        # Embed and shift right
+        emb = self._embed_angle(angles)  # [B, L, d_model]
+        zero_start = torch.zeros(B, 1, self._d_model, device=angles.device)
+        emb = torch.cat([zero_start, emb[:, :-1, :]], dim=1)
+
+        x = emb + self.pos_embed[:L]
+        cond = self._get_cond(T)
+        attn_bias = self._get_rel_pos_bias(L)
+
+        x, _ = self.backbone(x, cond, attn_bias=attn_bias)
+        raw = self.mix_head(x)  # [B, L, 3K]
+
+        temp_scale = self._compute_temp_scale(T)
+        return self._decode_mix_params(raw, temp_scale)
+
+    @torch.no_grad()
+    def sample(self, batch_size=None, T=None):
+        """
+        Autoregressive sampling with KV-cache.
+
+        Returns:
+            [B, 1, H, W] angles in [-π, π]
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        H, W = self.size
+        L = self.seq_len
+
+        angles = torch.zeros(batch_size, L, device=self.device)
+
+        # Fix first spin
+        if self.fix_first is not None:
+            angles[:, 0] = float(self.fix_first)
+
+        if T is None:
+            T = torch.ones(batch_size, device=self.device)
+        T = T.to(self.device)
+
+        cond = self._get_cond(T)
+        temp_scale = self._compute_temp_scale(T)
+
+        start_pos = 1 if self.fix_first is not None else 0
+
+        # Prefill fixed positions
+        if start_pos > 0:
+            prefill_len = start_pos
+            emb = self._embed_angle(angles[:, :prefill_len])
+            zero_start = torch.zeros(batch_size, 1, self._d_model, device=self.device)
+            if prefill_len > 1:
+                shifted = torch.cat([zero_start, emb[:, :-1, :]], dim=1)
+            else:
+                shifted = zero_start
+            x = shifted + self.pos_embed[:prefill_len]
+            prefill_bias = self._get_rel_pos_bias(prefill_len)
+            _, past_kvs = self.backbone(x, cond, attn_bias=prefill_bias)
+        else:
+            past_kvs = None
+
+        # Incremental decoding
+        for i in range(start_pos, L):
+            if i == 0:
+                x_i = torch.zeros(batch_size, 1, self._d_model, device=self.device)
+            else:
+                x_i = self._embed_angle(angles[:, i-1]).unsqueeze(1)
+
+            x_i = x_i + self.pos_embed[i:i+1]
+            incr_bias = self._get_rel_pos_bias(query_len=1, kv_len=i + 1)
+
+            out_i, past_kvs = self.backbone(x_i, cond, past_kvs=past_kvs, attn_bias=incr_bias)
+            raw_i = self.mix_head(out_i.squeeze(1))  # [B, 3K]
+
+            # temp_scale may be [B, 1, 1] from training path; squeeze for per-token
+            ts = temp_scale.squeeze(-1) if isinstance(temp_scale, torch.Tensor) else temp_scale
+            log_weights, mu, kappa = self._decode_mix_params(raw_i, ts)
+
+            # Sample mixture component: log_weights [B, K], mu [B, K], kappa [B, K]
+            comp = torch.multinomial(torch.exp(log_weights), 1)  # [B, 1]
+            mu_k = mu.gather(-1, comp).squeeze(-1)               # [B]
+            kappa_k = kappa.gather(-1, comp).squeeze(-1)          # [B]
+
+            # Sample angle from selected von Mises
+            angles[:, i] = _sample_von_mises(mu_k, kappa_k)
+
+        return angles.reshape(batch_size, 1, H, W)
+
+    def log_prob(self, sample, T=None):
+        """
+        Compute log probability of continuous angle samples.
+
+        Args:
+            sample: [B, 1, H, W] angles in [-π, π]
+            T:      [B] temperature
+
+        Returns:
+            [B, 1] total log probability
+        """
+        B = sample.shape[0]
+        angles = sample.reshape(B, -1)  # [B, L]
+
+        if T is None:
+            T = torch.ones(B, device=self.device)
+        T = T.to(self.device)
+
+        log_weights, mu, kappa = self._forward_params(angles, T)
+        # log_weights: [B, L, K], mu: [B, L, K], kappa: [B, L, K]
+
+        # Compute log p(θ_i) = logsumexp_k [log w_k + log vM(θ_i | μ_k, κ_k)]
+        theta = angles.unsqueeze(-1)  # [B, L, 1]
+        log_components = log_weights + _log_von_mises(theta, mu, kappa)  # [B, L, K]
+        log_p = torch.logsumexp(log_components, dim=-1)  # [B, L]
+
+        # Exclude fix_first position
+        if self.fix_first is not None:
+            log_p = log_p[:, 1:]
+
+        return log_p.sum(dim=-1, keepdim=True)  # [B, 1]
+
+    def use_pytorch_mhc(self):
+        """No-op for API compatibility."""
+        pass
