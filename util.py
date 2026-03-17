@@ -107,14 +107,45 @@ def _plot_clock_sample(ax, sample, q):
     ax.set_yticks([])
 
 
+def _plot_xy_sample(ax, sample):
+    """
+    Draw a continuous XY model sample as arrows on a colored background.
+
+    Args:
+        ax: matplotlib Axes
+        sample: (H, W) numpy array with angles in [-π, π]
+    """
+    H, W = sample.shape
+    angles = sample  # already in radians
+
+    # Background: normalize angles to [0, 1] for HSV colormap
+    ax.imshow((angles + np.pi) / (2.0 * np.pi), cmap="hsv", vmin=0, vmax=1,
+              interpolation="nearest", origin="upper")
+
+    # Arrow overlay
+    y, x = np.mgrid[0:H, 0:W]
+    u = np.cos(angles)
+    v = -np.sin(angles)  # flipped for image coords
+
+    ax.quiver(x, y, u, v, pivot="middle", scale=1.2 * max(H, W),
+              width=0.015, headwidth=3, headlength=3,
+              color="white", edgecolor="black", linewidth=0.3, alpha=0.85)
+
+    ax.set_xlim(-0.5, W - 0.5)
+    ax.set_ylim(H - 0.5, -0.5)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
 def create_sample_grid(model, betas, n_samples=4, device="cpu", energy_fn=None):
     """
     Generate and visualize lattice model samples at different temperatures.
 
     Visualization by model type:
       - Ising (category=2): coolwarm heatmap (blue=−1, red=+1)
-      - Potts (category>2): discrete qualitative colormap (tab10/tab20)
+      - Potts (integer category>2): discrete qualitative colormap (tab10/tab20)
       - Clock (model_type="clock"): HSV background + arrow overlay (quiver)
+      - XY (model_type="xy" or category="continuous"): continuous angle arrows
 
     Args:
         model: autoregressive lattice model
@@ -133,9 +164,10 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu", energy_fn=None):
     model_type = getattr(energy_fn, 'model_type', None) if energy_fn else None
     category = getattr(model, 'category', 2)
     is_clock = (model_type == "clock")
+    is_xy = (model_type == "xy") or (category == "continuous")
 
-    # Figure sizing: clock needs larger cells for arrows
-    cell_size = 2.5 if is_clock else 2.0
+    # Figure sizing: arrow plots need larger cells
+    cell_size = 2.5 if (is_clock or is_xy) else 2.0
     fig, axes = plt.subplots(
         n_temps, n_samples,
         figsize=(n_samples * cell_size + 0.8, n_temps * cell_size),
@@ -155,9 +187,11 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu", energy_fn=None):
                 sample = samples[j, 0].cpu().numpy()  # (H, W)
                 ax = axes[i, j]
 
-                if is_clock:
+                if is_xy:
+                    _plot_xy_sample(ax, sample)
+                elif is_clock:
                     _plot_clock_sample(ax, sample, category)
-                elif category > 2:
+                elif isinstance(category, int) and category > 2:
                     cmap = "tab10" if category <= 10 else "tab20"
                     ax.imshow(sample, cmap=cmap, vmin=0, vmax=category - 1,
                               interpolation="nearest")
@@ -179,9 +213,11 @@ def create_sample_grid(model, betas, n_samples=4, device="cpu", energy_fn=None):
                         labelpad=10,
                     )
 
-    if is_clock:
+    if is_xy:
+        title = "XY Samples (arrow = spin direction)"
+    elif is_clock:
         title = f"{category}-Clock Samples (arrow = spin direction)"
-    elif category > 2:
+    elif isinstance(category, int) and category > 2:
         title = f"{category}-Potts Samples"
     else:
         title = "Ising Samples (blue=−1, red=+1)"
