@@ -22,7 +22,8 @@ def is_xy_model(net_name: str) -> bool:
 
 def is_potts_model(net_config: dict) -> bool:
     """Check if the model is for q-state Potts (q > 2)."""
-    return net_config.get("category", 2) > 2
+    cat = net_config.get("category", 2)
+    return isinstance(cat, int) and cat > 2
 
 
 def is_clock_model(net_config: dict) -> bool:
